@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+moneyfast.db
+*.db
+.claude/
+.env
