@@ -5,3 +5,8 @@ moneyfast.db
 *.db
 .claude/
 .env
+
+# logs locales
+server.log
+server_err.log
+*.log

@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Numeric, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -10,7 +10,8 @@ from app.core.database import Base
 class LoanSettings(Base):
     __tablename__ = "loan_settings"
 
-    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), unique=True, index=True)
     minimum_principal: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("10000.00"))
     maximum_principal: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("50000.00"))
     default_interest_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("10.00"))
@@ -25,3 +26,5 @@ class LoanSettings(Base):
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
     )
+
+    company = relationship("Company")

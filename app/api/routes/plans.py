@@ -1,31 +1,19 @@
-from decimal import Decimal
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, require_superadmin
+from app.models.company import Company
 from app.models.plan import Plan
 from app.models.user import User
 from app.schemas.plan import PlanCreate, PlanRead
+from app.services.plan_limits import seed_default_plans
 
 router = APIRouter()
 
 
 def _seed_defaults(db: Session) -> None:
-    existing = db.scalars(select(Plan)).all()
-    if existing:
-        return
-
-    defaults = [
-        Plan(name="Gratis", customer_limit=5, loan_limit=5, user_limit=1, monthly_price_usd=Decimal("0.00")),
-        Plan(name="Basico", customer_limit=100, loan_limit=100, user_limit=3, monthly_price_usd=Decimal("17.99")),
-        Plan(name="Estandar", customer_limit=200, loan_limit=200, user_limit=5, monthly_price_usd=Decimal("29.99")),
-        Plan(name="Pro", customer_limit=500, loan_limit=500, user_limit=10, monthly_price_usd=Decimal("49.99")),
-        Plan(name="Empresarial", customer_limit=0, loan_limit=0, user_limit=0, monthly_price_usd=Decimal("79.99")),
-    ]
-    db.add_all(defaults)
-    db.commit()
+    seed_default_plans(db)
 
 
 @router.get("", response_model=list[PlanRead])
@@ -49,13 +37,14 @@ def list_plans(
 def create_plan(
     payload: PlanCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    _: User = Depends(require_superadmin),
 ) -> Plan:
     existing = db.scalar(select(Plan).where(Plan.name == payload.name.strip()))
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un plan con ese nombre.")
 
-    plan = Plan(**payload.model_dump(), name=payload.name.strip())
+    plan = Plan(**payload.model_dump())
+    plan.name = payload.name.strip()
     db.add(plan)
     db.commit()
     db.refresh(plan)
@@ -67,7 +56,7 @@ def update_plan(
     plan_id: int,
     payload: PlanCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    _: User = Depends(require_superadmin),
 ) -> Plan:
     plan = db.get(Plan, plan_id)
     if plan is None:
@@ -83,3 +72,27 @@ def update_plan(
     db.commit()
     db.refresh(plan)
     return plan
+
+
+@router.delete("/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_plan(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_superadmin),
+) -> None:
+    """Delete a plan only if no company is using it (otherwise deactivate it)."""
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+
+    in_use = db.scalar(
+        select(func.count()).select_from(Company).where(Company.plan_id == plan_id)
+    ) or 0
+    if in_use > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="El plan está en uso por una o más empresas. Desactívalo en vez de borrarlo.",
+        )
+
+    db.delete(plan)
+    db.commit()

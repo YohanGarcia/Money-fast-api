@@ -1,41 +1,42 @@
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_company_id, get_db, require_admin_manager
 from app.models.print_settings import PrintSettings
-from app.models.user import User
 from app.schemas.print_settings import PrintSettingsRead, PrintSettingsUpdate
 
 router = APIRouter()
 
 
-def get_or_create_settings(db: Session) -> PrintSettings:
-    settings = db.get(PrintSettings, 1)
-    if settings is None:
-        settings = PrintSettings(id=1)
-        db.add(settings)
+def get_or_create(db: Session, company_id: int) -> PrintSettings:
+    s = db.scalar(select(PrintSettings).where(PrintSettings.company_id == company_id))
+    if s is None:
+        s = PrintSettings(company_id=company_id)
+        db.add(s)
         db.commit()
-        db.refresh(settings)
-    return settings
+        db.refresh(s)
+    return s
 
 
 @router.get("", response_model=PrintSettingsRead)
 def read_print_settings(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    company_id: int = Depends(get_company_id),
 ) -> PrintSettings:
-    return get_or_create_settings(db)
+    return get_or_create(db, company_id)
 
 
 @router.put("", response_model=PrintSettingsRead)
 def update_print_settings(
     payload: PrintSettingsUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    company_id: int = Depends(get_company_id),
+    _=Depends(require_admin_manager),
 ) -> PrintSettings:
-    settings = get_or_create_settings(db)
+    s = get_or_create(db, company_id)
     for key, value in payload.model_dump().items():
-        setattr(settings, key, value)
+        setattr(s, key, value)
     db.commit()
-    db.refresh(settings)
-    return settings
+    db.refresh(s)
+    return s

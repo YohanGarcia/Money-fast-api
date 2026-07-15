@@ -10,6 +10,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     role: UserRole = UserRole.manager
+    branch_id: int | None = None
 
 
 class UserUpdate(BaseModel):
@@ -18,6 +19,7 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8, max_length=128)
     role: UserRole = UserRole.manager
     is_active: bool = True
+    branch_id: int | None = None
 
 
 class UserRead(BaseModel):
@@ -28,4 +30,7 @@ class UserRead(BaseModel):
     email: EmailStr
     role: UserRole
     is_active: bool
+    company_id: int | None = None
+    branch_id: int | None = None
+    branch_name: str | None = None
     created_at: datetime

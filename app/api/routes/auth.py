@@ -18,20 +18,24 @@ from app.core.security import (
     verify_password,
     verify_token_hash,
 )
+from app.models.company import Company
 from app.models.password_reset import PasswordResetCode
 from app.models.session import UserSession
-from app.models.user import User
+from app.models.user import User, UserRole
+from app.services.email_service import send_reset_code_email
+from app.services.plan_limits import get_free_plan
 from app.schemas.auth import (
     LoginInput,
     PasswordResetRequestInput,
     PasswordResetRequestOutput,
     RefreshInput,
+    RegisterInput,
     ResetPasswordInput,
     TokenPair,
     VerifyResetCodeInput,
     VerifyResetCodeOutput,
 )
-from app.schemas.user import UserCreate, UserRead
+from app.schemas.user import UserRead
 
 router = APIRouter()
 
@@ -41,16 +45,31 @@ def _utc_now_naive() -> datetime:
 
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
-    existing = db.scalar(select(User).where(User.email == payload.email.lower()))
+def register(payload: RegisterInput, db: Session = Depends(get_db)) -> User:
+    """Self-service onboarding.
+
+    Creates a new company and its owner. The owner is always an ``admin`` of the
+    new company — the role can never be chosen by the client. Additional users
+    (managers, collectors) are created afterwards from the authenticated
+    ``POST /users`` endpoint by that admin.
+    """
+    email = payload.email.lower().strip()
+    existing = db.scalar(select(User).where(User.email == email))
     if existing:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
+    company_name = (payload.company_name or payload.full_name).strip()
+    free_plan = get_free_plan(db)
+    company = Company(name=company_name, plan_id=free_plan.id if free_plan else None)
+    db.add(company)
+    db.flush()
+
     user = User(
-        full_name=payload.full_name,
-        email=payload.email.lower(),
+        full_name=payload.full_name.strip(),
+        email=email,
         password_hash=get_password_hash(payload.password),
-        role=payload.role,
+        role=UserRole.admin,
+        company_id=company.id,
     )
     db.add(user)
     db.commit()
@@ -175,11 +194,18 @@ def request_password_reset(
     db.add(reset_code)
     db.commit()
 
-    return PasswordResetRequestOutput(
-        message=generic_message,
-        email=user.email,
-        debug_code=raw_code if settings.show_password_reset_debug_code else None,
-    )
+    smtp_configured = bool(settings.smtp_host and settings.smtp_user and settings.smtp_password)
+    try:
+        send_reset_code_email(user.email, raw_code)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo enviar el correo: {exc}",
+        ) from exc
+
+    # Expose the code only in development when there is no real email delivery.
+    debug_code = raw_code if (not settings.is_production and not smtp_configured) else None
+    return PasswordResetRequestOutput(message=generic_message, email=user.email, debug_code=debug_code)
 
 
 @router.post("/verify-reset-code", response_model=VerifyResetCodeOutput)

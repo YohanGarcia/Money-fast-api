@@ -17,4 +17,5 @@ class PlanRead(PlanCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    paypal_plan_id: str | None = None
     created_at: datetime
