@@ -58,7 +58,7 @@ def register(payload: RegisterInput, db: Session = Depends(get_db)) -> User:
     if existing:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
-    company_name = (payload.company_name or payload.full_name).strip()
+    company_name = payload.company_name
     free_plan = get_free_plan(db)
     company = Company(name=company_name, plan_id=free_plan.id if free_plan else None)
     db.add(company)
