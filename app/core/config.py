@@ -67,5 +67,14 @@ class Settings(BaseSettings):
                 raise ValueError("SECRET_KEY debe tener al menos 32 caracteres en produccion.")
         return value
 
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_database_url(cls, value: str) -> str:
+        # Hosting providers supply URLs without an explicit SQLAlchemy driver.
+        for prefix in ("postgres://", "postgresql://", "postgresql+psycopg2://"):
+            if value.startswith(prefix):
+                return "postgresql+psycopg://" + value[len(prefix):]
+        return value
+
 
 settings = Settings()
