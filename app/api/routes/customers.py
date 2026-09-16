@@ -2,12 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.services import cash_service
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
 from app.models.route import Route
 from app.models.user import User, UserRole
 from app.schemas.customer import CustomerCreate, CustomerRead, CustomerUpdate
 from app.services.plan_limits import enforce_can_create
+from app.services.customer_profile import check_identity, commit_customer, legacy_references, document_key, identity_for_update
 
 router = APIRouter()
 
@@ -55,13 +57,16 @@ def list_customers(
         .order_by(Customer.full_name)
     )
     # Collectors only see the customers assigned to them (their portfolio).
+    if current_user.role == UserRole.cashier:
+        statement = statement.where(Customer.id.in_(cash_service.customer_ids(db, current_user)))
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
 
     customers = db.scalars(statement).all()
     if q:
         term = q.lower()
-        customers = [c for c in customers if term in c.full_name.lower()]
+        customers = [c for c in customers if term in c.full_name.lower() or
+                     (document_key(q) and document_key(q) in (document_key(c.document_id) or ""))]
     return list(customers)
 
 
@@ -77,6 +82,9 @@ def create_customer(
         db, payload.route_id, payload.assigned_collector_id, company_id
     )
     data = payload.model_dump(exclude={"assigned_collector_id", "route_id"})
+    data["document_key"] = check_identity(db, company_id, payload.document_id)
+    if "references" not in payload.model_fields_set:
+        data["references"] = legacy_references(payload.notes)
     customer = Customer(
         **data,
         created_by_id=current_user.id,
@@ -85,9 +93,7 @@ def create_customer(
         assigned_collector_id=collector_id,
     )
     db.add(customer)
-    db.commit()
-    db.refresh(customer)
-    return customer
+    return commit_customer(db, customer)
 
 
 def _get_scoped_customer(
@@ -98,6 +104,8 @@ def _get_scoped_customer(
         .where(Customer.id == customer_id, Customer.company_id == company_id)
         .options(selectinload(Customer.assigned_collector), selectinload(Customer.route))
     )
+    if current_user.role == UserRole.cashier:
+        statement = statement.where(Customer.id.in_(cash_service.customer_ids(db, current_user)))
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
     customer = db.scalar(statement)
@@ -130,14 +138,26 @@ def update_customer(
     if customer is None:
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
 
+    if payload.version != customer.version:
+        raise HTTPException(409, "La ficha cambió. Recarga antes de guardar.")
+    customer.document_key = identity_for_update(db, company_id,
+        payload.document_id if "document_id" in payload.model_fields_set else customer.document_id, customer)
     route_id, collector_id = _resolve_route_and_collector(
-        db, payload.route_id, payload.assigned_collector_id, company_id
+        db, payload.route_id if "route_id" in payload.model_fields_set else customer.route_id,
+        payload.assigned_collector_id if "assigned_collector_id" in payload.model_fields_set else customer.assigned_collector_id, company_id
     )
-    for field, value in payload.model_dump(exclude={"assigned_collector_id", "route_id"}).items():
+    for field, value in payload.model_dump(exclude={"assigned_collector_id", "route_id", "version"}, exclude_unset=True).items():
         setattr(customer, field, value)
+    if cash_service.enabled(db, company_id):
+        collector_branch = db.get(User, collector_id).branch_id if collector_id else None
+        route_branch = db.get(Route, route_id).branch_id if route_id else None
+        if collector_id and not collector_branch:
+            raise HTTPException(409, 'Asigna una sucursal al cobrador antes de asignarle clientes.')
+        if route_branch and collector_branch and route_branch != collector_branch:
+            raise HTTPException(409, 'La ruta y el cobrador deben pertenecer a la misma sucursal.')
+        # Only the current portfolio changes. Payment custody stays on its recorded branch and collector.
+        customer.cash_branch_id = route_branch or collector_branch or customer.cash_branch_id
     customer.route_id = route_id
     customer.assigned_collector_id = collector_id
 
-    db.commit()
-    db.refresh(customer)
-    return customer
+    return commit_customer(db, customer)

@@ -1,4 +1,6 @@
 from datetime import datetime
+from typing import Literal
+from app.schemas.cash import Proof
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -7,6 +9,12 @@ from app.models.payment import PaymentType
 
 
 class PaymentCreate(BaseModel):
+    method: Literal['cash','transfer'] | None = None
+    origin: Literal['field','counter'] | None = None
+    branch_id: int | None = None
+    idempotency_key: str | None = Field(default=None, min_length=12, max_length=80)
+    bank_destination: str | None = Field(default=None, max_length=160)
+    proof: Proof | None = None
     loan_id: int
     payment_type: PaymentType | None = None
     amount: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
@@ -54,3 +62,8 @@ class PaymentRead(BaseModel):
     paid_at: datetime
     reference_code: str | None
     collector_name: str | None = None
+    method: str | None = None
+    origin: str | None = None
+    branch_id: int | None = None
+    cash_state: str = 'historical'
+    status: str = 'confirmed'

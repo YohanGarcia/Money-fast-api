@@ -47,6 +47,7 @@ class LoanRead(BaseModel):
 
     id: int
     customer_id: int
+    cash_branch_id: int | None = None
     created_by_id: int
     principal_amount: Decimal
     interest_rate: Decimal

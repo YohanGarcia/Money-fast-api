@@ -29,6 +29,10 @@ class Payment(Base):
     late_fee_applied: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey('branches.id'), nullable=True, index=True)
+    method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    origin: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    cash_state: Mapped[str] = mapped_column(String(20), default='historical', server_default='historical')
     reference_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     loan = relationship("Loan", back_populates="payments")

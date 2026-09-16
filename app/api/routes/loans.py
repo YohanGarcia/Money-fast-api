@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.services import cash_service
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
 from app.models.loan import Loan, LoanStatus
@@ -28,13 +29,15 @@ def list_loans(
         .order_by(Loan.created_at.desc())
     )
     # Collectors only see loans of customers assigned to them.
+    if current_user.role == UserRole.cashier:
+        statement = statement.where(Loan.customer_id.in_(cash_service.customer_ids(db, current_user)))
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
     loans = list(db.scalars(statement).unique().all())
     if status_filter is not None:
         loans = [loan for loan in loans if loan.status.value == status_filter]
-    changed = any(refresh_loan_state(loan) for loan in loans)
-    if changed:
+    changed = any([refresh_loan_state(loan) for loan in loans])
+    if changed and not cash_service.enabled(db, company_id):
         db.commit()
     return loans
 
@@ -52,6 +55,9 @@ def add_loan(
     if customer is None:
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
 
+    cash_service.lock_company(db, company_id)
+    if cash_service.enabled(db, company_id):
+        raise HTTPException(409, "Con Caja habilitada, desembolsa una solicitud firmada desde Caja.")
     enforce_can_create(db, company_id, "loan")
     loan = create_loan(db=db, payload=payload, created_by_id=current_user.id)
     db.commit()
@@ -72,12 +78,14 @@ def get_loan(
         .where(Loan.id == loan_id, Customer.company_id == company_id)
         .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments))
     )
+    if current_user.role == UserRole.cashier:
+        statement = statement.where(Loan.customer_id.in_(cash_service.customer_ids(db, current_user)))
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
     loan = db.scalar(statement)
     if loan is None:
         raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
-    if refresh_loan_state(loan):
+    if refresh_loan_state(loan) and not cash_service.enabled(db, company_id):
         db.commit()
         db.refresh(loan)
     return loan

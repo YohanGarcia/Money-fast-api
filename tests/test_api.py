@@ -103,7 +103,7 @@ class MoneyFastApiTests(unittest.TestCase):
     def create_customer(self, headers: dict, name: str = "Juan Perez", collector_id: int | None = None) -> dict:
         payload = {
             "full_name": name,
-            "document_id": "001-0000000-1",
+            "document_id": f"001-{len(self.client.get('/api/v1/customers', headers=headers).json()):07d}-1",
             "phone": "8095550001",
             "address": "Calle Primera #10",
             "notes": "Cliente de prueba",
@@ -800,6 +800,377 @@ class MoneyFastApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
 
+
+    def application_fixture(self, headers, modality="unsecured"):
+        from app.schemas.loan_application import SECTIONS
+        values = {}
+        for section in SECTIONS:
+            for field in section["fields"]:
+                kind = field["kind"]
+                values[field["key"]] = (True if kind == "checkbox" else "2000-01-01" if kind == "date"
+                    else "1000" if kind == "money" else "6" if kind == "integer"
+                    else field["options"][0] if kind == "select" else "persona@example.com" if kind == "email" else "Ejemplo")
+        values.update(full_name="Solicitante de prueba", document_id="000-0000000-1", monthly_income="30000",
+            other_income="0", total_income="30000", requested_amount="12000", has_other_loans="No")
+        existing = self.client.get("/api/v1/customers?q=00000000001", headers=headers).json()
+        link = {"customer_id": existing[0]["id"], "customer_version": existing[0]["version"]} if existing else {"create_customer": True}
+        result = self.client.post("/api/v1/loan-applications", json={"modality": modality, "data": values, **link}, headers=headers)
+        self.assertEqual(result.status_code, 201, result.text)
+        return result.json()
+
+    def app_action(self, headers, application, action, **extra):
+        return self.client.post(f'/api/v1/loan-applications/{application["id"]}/transition',
+            headers=headers, json={"version": application["version"], "action": action, **extra})
+
+    def app_document(self, headers, application, category):
+        import base64
+        result = self.client.post(f'/api/v1/loan-applications/{application["id"]}/documents/{category}',
+            headers=headers, json={"version": application["version"], "filename": "documento.pdf",
+                "content_base64": base64.b64encode(b"%PDF-1.4\nTest fixture\n%%EOF").decode()})
+        self.assertEqual(result.status_code, 200, result.text)
+        application = result.json()
+        doc = next(d for d in application["documents"] if d["category"] == category)
+        result = self.client.post(f'/api/v1/loan-applications/{application["id"]}/documents/{doc["id"]}/review',
+            headers=headers, json={"version": application["version"], "verified": True})
+        self.assertEqual(result.status_code, 200, result.text)
+        return result.json()
+
+    def test_application_lifecycle_both_modalities(self):
+        from app.schemas.loan_application import DOCUMENTS
+        headers = self.owner_session()
+        for modality in ("unsecured", "secured"):
+            application = self.application_fixture(headers, modality)
+            response = self.app_action(headers, application, "disburse")
+            self.assertEqual(response.status_code, 409)
+            application = self.app_action(headers, application, "submit").json()
+            self.assertEqual(self.app_action(headers, application, "evaluate").status_code, 422)
+            for document in DOCUMENTS:
+                if document["required"] and (not document.get("secured") or modality == "secured"):
+                    application = self.app_document(headers, application, document["key"])
+            response = self.app_action(headers, application, "evaluate")
+            self.assertEqual(response.status_code, 200, response.text)
+            application = response.json()
+            self.assertIsNone(application["loan_id"])
+            response = self.app_action(headers, application, "approve", notes="Evaluación manual completada",
+                terms={"interest_rate": "10", "installment_count": 6})
+            self.assertEqual(response.status_code, 200, response.text)
+            application = response.json()
+            self.assertEqual(self.app_action(headers, application, "sign").status_code, 422)
+            application = self.app_document(headers, application, "contract")
+            application = self.app_action(headers, application, "sign").json()
+            from datetime import date, timedelta
+            response = self.app_action(headers, application, "disburse", first_payment_date=str(date.today() + timedelta(days=30)), disbursement_reference="REC-TEST")
+            self.assertEqual(response.status_code, 200, response.text)
+            paid_out = response.json()
+            self.assertEqual(paid_out["status"], "disbursed")
+            loan = self.client.get(f'/api/v1/loans/{paid_out["loan_id"]}', headers=headers).json()
+            self.assertEqual(loan["status"], "active")
+            self.assertEqual(len(loan["installments"]), 6)
+            self.assertEqual(self.app_action(headers, application, "disburse").status_code, 409)
+
+    def test_application_validation_and_edit_lock(self):
+        headers = self.owner_session()
+        self.assertEqual(self.client.post('/api/v1/loan-applications', headers=headers, json={"modality": "unsecured"}).status_code, 422)
+        self.assertEqual(self.client.post('/api/v1/loan-applications', headers=headers,
+            json={"modality": "fiador"}).status_code, 422)
+        application = self.application_fixture(headers, "secured")
+        self.assertEqual(self.client.put(f'/api/v1/loan-applications/{application["id"]}', headers=headers,
+            json={"modality": "secured", "version": application["version"], "data": {"requested_amount": "NaN"}}).status_code, 422)
+        application = self.app_action(headers, application, "submit").json()
+        self.assertEqual(self.client.put(f'/api/v1/loan-applications/{application["id"]}', headers=headers,
+            json={"modality": "secured", "version": application["version"], "data": application["data"]}).status_code, 409)
+        self.assertEqual(self.app_action(headers, application, "reject").status_code, 409)
+        result = self.app_action(headers, application, "return", notes="Corregir domicilio")
+        self.assertEqual(result.json()["status"], "draft")
+        edited = self.client.put(f'/api/v1/loan-applications/{application["id"]}', headers=headers,
+            json={"modality": "unsecured", "version": result.json()["version"], "data": application["data"], "customer_id": application["customer_id"], "customer_version": application["customer_version"]})
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertNotIn("collateral_value", edited.json()["data"])
+
+    def test_application_tenant_and_role_isolation(self):
+        headers = self.owner_session()
+        application = self.application_fixture(headers)
+        application = self.app_document(headers, application, "identity")
+        doc = application["documents"][0]
+        self.register_owner(email="other@example.com")
+        other = self.auth_headers(self.login(email="other@example.com")["access_token"])
+        path = f'/api/v1/loan-applications/{application["id"]}'
+        self.assertEqual(self.client.get(path, headers=other).status_code, 404)
+        self.assertEqual(self.client.get(path + f'/documents/{doc["id"]}/content', headers=other).status_code, 404)
+        self.assertEqual(self.client.get('/api/v1/loan-applications', headers=other).json(), [])
+        self.create_user(headers, "collector@example.com", "collector")
+        collector = self.auth_headers(self.login("collector@example.com", "workerpass123")["access_token"])
+        self.assertEqual(self.client.get(path, headers=collector).status_code, 403)
+        self.assertEqual(self.client.get('/api/v1/loan-applications/form', headers=collector).status_code, 403)
+
+    def test_application_file_validation_and_stale_update(self):
+        headers = self.owner_session()
+        application = self.application_fixture(headers)
+        path = f'/api/v1/loan-applications/{application["id"]}'
+        bad = self.client.post(path + '/documents/identity', headers=headers,
+            json={"version": application["version"], "filename": "archivo.html", "content_base64": "PGh0bWw+"})
+        self.assertEqual(bad.status_code, 422)
+        updated = self.app_document(headers, application, "identity")
+        stale = self.client.put(path, headers=headers, json={"version": application["version"], "modality": "unsecured", "data": application["data"]})
+        self.assertEqual(stale.status_code, 409)
+        self.assertTrue(updated["documents"][0]["verified"])
+
+    def test_application_print_and_conditional_validation(self):
+        headers = self.owner_session()
+        response = self.client.post('/api/v1/loan-applications', headers=headers,
+            json={"modality":"secured", "create_customer": True, "data":{"full_name":"<script>alert(1)</script>", "phone":"8095555555", "address":"Calle de prueba",
+                "collateral_owner":"Tercero", "has_other_loans":"Sí"}})
+        self.assertEqual(response.status_code, 201, response.text)
+        application = response.json()
+        result = self.app_action(headers, application, "submit")
+        self.assertEqual(result.status_code, 422)
+        self.assertIn("Nombre del propietario tercero", result.json()["detail"])
+        self.assertIn("Pago mensual de otros créditos", result.json()["detail"])
+        printed = self.client.get(f'/api/v1/loan-applications/{application["id"]}/print', headers=headers)
+        self.assertEqual(printed.status_code, 200, printed.text)
+        self.assertNotIn("<script>", printed.json()["html"])
+        self.assertIn("&lt;script&gt;", printed.json()["html"])
+        self.assertIn("Firma del solicitante", printed.json()["html"])
+        self.assertIn("CON GARANTÍA", printed.json()["html"])
+
+
+    def test_customer_profile_snapshot_and_atomic_sync(self):
+        headers = self.owner_session()
+        first = self.application_fixture(headers)
+        first = self.app_action(headers, first, "submit").json()
+        second = self.application_fixture(headers, "secured")
+        customer_id = first["customer_id"]
+        self.assertEqual(second["customer_id"], customer_id)
+        customer = self.client.get(f"/api/v1/customers/{customer_id}", headers=headers).json()
+        body = {**customer, "notes": "Notas que se conservan", "latitude": "18.500000", "longitude": "-69.900000"}
+        result = self.client.put(f"/api/v1/customers/{customer_id}", headers=headers, json=body)
+        self.assertEqual(result.status_code, 200, result.text)
+        customer = result.json()
+        values = {**second["data"], "phone": "8095559999", "email": "nuevo@example.com", "home_phone": "8095558888", "reference_name": "Referencia nueva"}
+        payload = dict(modality="secured", data=values, customer_id=customer_id, customer_version=customer["version"], version=second["version"])
+        updated = self.client.put(f'/api/v1/loan-applications/{second["id"]}', headers=headers, json=payload)
+        self.assertEqual(updated.status_code, 200, updated.text)
+        profile = self.client.get(f"/api/v1/customers/{customer_id}", headers=headers).json()
+        self.assertEqual(profile["phone"], "8095559999")
+        self.assertEqual(profile["email"], "nuevo@example.com")
+        self.assertEqual(profile["home_phone"], "8095558888")
+        self.assertEqual(profile["references"][0]["nombre"], "Referencia nueva")
+        self.assertEqual(profile["notes"], body["notes"])
+        self.assertEqual(profile["latitude"], "18.500000")
+        self.assertEqual(updated.json()["customer_version"], profile["version"])
+        self.assertEqual(self.client.get(f'/api/v1/loan-applications/{first["id"]}', headers=headers).json()["data"], first["data"])
+        self.assertEqual(len(self.client.get(f"/api/v1/loan-applications?customer_id={customer_id}", headers=headers).json()), 2)
+        self.assertEqual(len(self.client.get("/api/v1/customers", headers=headers).json()), 1)
+
+    def test_customer_profile_stale_draft_and_failed_commit_roll_back(self):
+        from unittest.mock import patch
+        from sqlalchemy.orm.exc import StaleDataError
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        customer = self.client.get(f'/api/v1/customers/{a["customer_id"]}', headers=headers).json()
+        path = f'/api/v1/loan-applications/{a["id"]}'
+        payload = dict(modality=a["modality"], data={**a["data"], "phone": "8095557777"}, customer_id=a["customer_id"], customer_version=a["customer_version"], version=a["version"])
+        with patch("sqlalchemy.orm.Session.commit", side_effect=StaleDataError("simulated concurrent application write")):
+            self.assertEqual(self.client.put(path, headers=headers, json=payload).status_code, 409)
+        self.assertEqual(self.client.get(f'/api/v1/customers/{a["customer_id"]}', headers=headers).json(), customer)
+        self.assertEqual(self.client.get(path, headers=headers).json(), a)
+        fresh = self.client.put(f'/api/v1/customers/{a["customer_id"]}', headers=headers, json={**customer, "phone": "8095556666"})
+        self.assertEqual(fresh.status_code, 200, fresh.text)
+        self.assertEqual(self.client.put(path, headers=headers, json=payload).status_code, 409)
+        self.assertEqual(self.client.put(f'/api/v1/customers/{a["customer_id"]}', headers=headers, json=customer).status_code, 409)
+        self.assertEqual(self.client.get(path, headers=headers).json(), a)
+        payload["customer_version"] = fresh.json()["version"]
+        self.assertEqual(self.client.put(path, headers=headers, json=payload).status_code, 200)
+
+    def test_customer_duplicate_identity_and_cross_company_links(self):
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        duplicate = {**a["data"], "document_id": "000 0000000 1"}
+        result = self.client.post('/api/v1/loan-applications', headers=headers, json={"modality": "unsecured", "data": duplicate, "create_customer": True})
+        self.assertEqual(result.status_code, 409, result.text)
+        self.assertEqual(len(self.client.get('/api/v1/loan-applications', headers=headers).json()), 1)
+        profile = self.client.get('/api/v1/customers?q=00000000001', headers=headers).json()[0]
+        self.assertEqual(profile["id"], a["customer_id"])
+        self.assertEqual(self.client.post('/api/v1/customers', headers=headers, json={**profile, "document_id": "00000000001"}).status_code, 409)
+        self.register_owner(email="second@example.com")
+        other = self.auth_headers(self.login(email="second@example.com")["access_token"])
+        result = self.client.post('/api/v1/loan-applications', headers=other, json={"modality": "unsecured", "data": a["data"], "customer_id": a["customer_id"], "customer_version": profile["version"]})
+        self.assertEqual(result.status_code, 404)
+        self.assertEqual(self.client.get(f'/api/v1/loan-applications?customer_id={a["customer_id"]}', headers=other).status_code, 404)
+        self.assertEqual(self.client.post('/api/v1/loan-applications', headers=other, json={"modality": "unsecured", "data": duplicate, "create_customer": True}).status_code, 201)
+
+    def test_application_customer_limit_and_invalid_create_leave_no_records(self):
+        from app.core.database import SessionLocal
+        from app.models.company import Company
+        from app.models.plan import Plan
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        with SessionLocal() as db:
+            company = db.query(Company).first()
+            plan = Plan(name="Un cliente", customer_limit=1, loan_limit=0, user_limit=0, monthly_price_usd=0)
+            db.add(plan); db.flush(); company.plan_id = plan.id; db.commit()
+        response = self.client.post('/api/v1/loan-applications', headers=headers, json={"modality": "unsecured", "data": {**a["data"], "document_id": "00000000002"}, "create_customer": True})
+        self.assertEqual(response.status_code, 402, response.text)
+        self.assertEqual(len(self.client.get('/api/v1/customers', headers=headers).json()), 1)
+        self.assertEqual(len(self.client.get('/api/v1/loan-applications', headers=headers).json()), 1)
+        self.assertEqual(self.client.post('/api/v1/loan-applications', headers=headers, json={"modality":"unsecured", "create_customer": True, "data":{"full_name":"Incompleto"}}).status_code, 422)
+        # Reusing the existing customer does not consume a new customer slot.
+        self.application_fixture(headers, "secured")
+
+    def test_legacy_unlinked_draft_requires_link_but_inflight_can_disburse(self):
+        from app.core.database import SessionLocal
+        from app.models.loan_application import LoanApplication
+        from datetime import date, timedelta
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        with SessionLocal() as db:
+            item = db.get(LoanApplication, a["id"])
+            item.customer_id = None; item.customer_version = None; db.commit()
+        legacy = self.client.get(f'/api/v1/loan-applications/{a["id"]}', headers=headers).json()
+        self.assertEqual(self.app_action(headers, legacy, "submit").status_code, 422)
+        linked = self.client.put(f'/api/v1/loan-applications/{a["id"]}', headers=headers, json={"modality":a["modality"], "data":a["data"], "version":legacy["version"], "customer_id":a["customer_id"], "customer_version":a["customer_version"]})
+        self.assertEqual(linked.status_code, 200, linked.text)
+        with SessionLocal() as db:
+            item = db.get(LoanApplication, a["id"])
+            item.customer_id = None; item.customer_version = None; item.status = "signed"
+            item.terms = {"interest_rate":"10", "installment_count":6, "late_fee_rate":"0", "grace_days":0}
+            db.commit()
+        legacy = self.client.get(f'/api/v1/loan-applications/{a["id"]}', headers=headers).json()
+        result = self.app_action(headers, legacy, "disburse", first_payment_date=str(date.today()+timedelta(days=30)), disbursement_reference="LEGACY-TEST")
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["customer_id"], a["customer_id"])
+        self.assertEqual(len(self.client.get('/api/v1/customers', headers=headers).json()), 1)
+
+    def test_customer_legacy_references_and_optional_contact_fields(self):
+        import json
+        headers = self.owner_session()
+        refs = [{"nombre":"Ana", "telefono":"8095555555", "cedula":"REF", "direccion":"Calle referencia"}]
+        values = {"full_name":"Cliente histórico", "phone":"8095552222", "address":"Calle Histórica", "notes":json.dumps(refs), "email":"cliente@example.com", "home_phone":"8095553333"}
+        result = self.client.post('/api/v1/customers', headers=headers, json=values)
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertEqual(result.json()["references"], refs)
+        self.assertEqual(result.json()["notes"], values["notes"])
+        self.assertEqual(result.json()["email"], values["email"])
+        self.assertEqual(result.json()["home_phone"], values["home_phone"])
+
+    def test_legacy_signed_customer_link_preserves_snapshot(self):
+        from app.core.database import SessionLocal
+        from app.models.loan_application import LoanApplication
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        with SessionLocal() as db:
+            item = db.get(LoanApplication, a["id"])
+            item.customer_id = None; item.customer_version = None; item.status = "signed"
+            db.commit()
+        path = f'/api/v1/loan-applications/{a["id"]}'
+        legacy = self.client.get(path, headers=headers).json()
+        wrong = self.create_customer(headers)
+        response = self.client.post(path + '/customer', headers=headers, json={"version":legacy["version"], "customer_id":wrong["id"], "customer_version":wrong["version"]})
+        self.assertEqual(response.status_code, 422)
+        response = self.client.post(path + '/customer', headers=headers, json={"version":legacy["version"], "customer_id":a["customer_id"], "customer_version":a["customer_version"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"], a["data"])
+        self.assertEqual(response.json()["status"], "signed")
+
+    def test_customer_profile_migration_preserves_legacy_records(self):
+        import importlib.util
+        import json
+        import sqlalchemy as sa
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        from unittest.mock import patch
+        path = Path(__file__).resolve().parents[1] / "alembic/versions/d9e0f1a2b3c4_customer_profiles.py"
+        spec = importlib.util.spec_from_file_location("customer_profile_migration", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        legacy_engine = sa.create_engine("sqlite://")
+        notes = json.dumps([{"nombre":"Referencia histórica", "telefono":"8095554444"}])
+        with legacy_engine.begin() as connection:
+            connection.execute(sa.text("CREATE TABLE customers (id INTEGER PRIMARY KEY, company_id INTEGER, document_id TEXT, notes TEXT)"))
+            connection.execute(sa.text("CREATE TABLE loan_applications (id INTEGER PRIMARY KEY, customer_id INTEGER, data TEXT)"))
+            connection.execute(sa.text("INSERT INTO customers VALUES (1, 1, '001-1', :notes), (2, 1, '0011', 'Notas libres'), (3, 2, '0011', NULL)"), {"notes":notes})
+            connection.execute(sa.text("INSERT INTO loan_applications VALUES (1, 1, 'snapshot original')"))
+            with patch.object(migration, "op", Operations(MigrationContext.configure(connection))):
+                migration.upgrade()
+            rows = connection.execute(sa.text('SELECT id, document_key, notes, "references", version FROM customers ORDER BY id')).mappings().all()
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([r["document_key"] for r in rows], [None, None, "0011"])
+            self.assertEqual(rows[0]["notes"], notes)
+            self.assertEqual(json.loads(rows[0]["references"])[0]["nombre"], "Referencia histórica")
+            self.assertEqual(rows[1]["notes"], "Notas libres")
+            app_row = connection.execute(sa.text("SELECT data, customer_version FROM loan_applications")).one()
+            self.assertEqual(tuple(app_row), ("snapshot original", 1))
+        legacy_engine.dispose()
+
+    def test_selected_legacy_duplicate_remains_usable_without_merging(self):
+        from app.core.database import SessionLocal
+        from app.models.customer import Customer
+        headers = self.owner_session()
+        a = self.application_fixture(headers)
+        with SessionLocal() as db:
+            original = db.get(Customer, a["customer_id"])
+            original.document_key = None
+            duplicate = Customer(company_id=original.company_id, created_by_id=original.created_by_id,
+                full_name="Otro registro histórico", document_id=original.document_id,
+                phone="8095550000", address="Otra dirección", document_key=None)
+            db.add(duplicate); db.commit()
+        profile = self.client.get(f'/api/v1/customers/{a["customer_id"]}', headers=headers).json()
+        response = self.client.put(f'/api/v1/loan-applications/{a["id"]}', headers=headers,
+            json={"modality":a["modality"], "data":{**a["data"], "phone":"8095551111"}, "version":a["version"], "customer_id":a["customer_id"], "customer_version":profile["version"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = self.client.get('/api/v1/customers?q=00000000001', headers=headers).json()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(next(r for r in rows if r["id"] != a["customer_id"])["phone"], "8095550000")
+        self.assertEqual(self.client.post('/api/v1/customers', headers=headers, json=profile).status_code, 409)
+
+
+    def test_settings_incomplete_profile_and_validation(self):
+        headers = self.owner_session()
+        response = self.client.get('/api/v1/company-settings', headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        original = response.json()
+        self.assertEqual(original['tax_id'], '')
+        invalid = {key: original[key] for key in ('name', 'tax_id', 'address', 'phone', 'currency_symbol')}
+        self.assertEqual(self.client.put('/api/v1/company-settings', headers=headers, json=invalid).status_code, 422)
+        valid = dict(name='  Empresa QA  ', tax_id='QA-123', address='Dirección de prueba', phone='8095550100', currency_symbol='RD$')
+        saved = self.client.put('/api/v1/company-settings', headers=headers, json=valid)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()['name'], 'Empresa QA')
+        self.assertEqual(self.client.put('/api/v1/company-settings', headers=headers, json={**valid, 'name': '   '}).status_code, 422)
+        self.assertEqual(self.client.get('/api/v1/company-settings', headers=headers).json()['name'], 'Empresa QA')
+
+    def test_settings_loan_print_and_branch_constraints(self):
+        headers = self.owner_session()
+        loan = self.client.get('/api/v1/loan-settings', headers=headers).json()
+        self.assertEqual(self.client.put('/api/v1/loan-settings', headers=headers, json=loan).status_code, 200)
+        self.assertEqual(self.client.put('/api/v1/loan-settings', headers=headers, json={**loan, 'maximum_principal': 0}).status_code, 422)
+        printed = self.client.get('/api/v1/print-settings', headers=headers).json()
+        self.assertEqual(self.client.put('/api/v1/print-settings', headers=headers, json={**printed, 'receipt_footer_text': '   '}).status_code, 422)
+        branch = dict(name='Sucursal QA', address='Calle de prueba', manager_name='Gerente QA', notary_name='Notario QA', phone='8095550100')
+        self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json={**branch, 'manager_name': '   '}).status_code, 422)
+        self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json=branch).status_code, 201)
+        self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json=branch).status_code, 409)
+
+    def test_cash_activation_allows_unassigned_staff_but_blocks_operations(self):
+        headers = self.owner_session()
+        users = [self.create_user(headers, role+'@example.com', 'collector') for role in ('collector', 'cashier')]
+        # Reproduce existing unassigned staff from before cashier onboarding rules.
+        from app.core.database import SessionLocal
+        from app.models.user import User
+        with SessionLocal() as db:
+            db.get(User, users[1]['id']).role = 'cashier'
+            db.commit()
+        branch = self.client.post('/api/v1/branches', headers=headers, json=dict(name='Caja Central', address='Calle prueba 1', manager_name='Gerente QA', notary_name='Notario QA', phone='8095550100')).json()
+        self.assertEqual(self.client.post('/api/v1/cash/activate', headers=headers, json={}).status_code, 422)
+        self.assertEqual(self.client.post('/api/v1/cash/setup', headers=headers, json=dict(branch_id=branch['id'], initial_balance='0', notes='Sin efectivo inicial')).status_code, 200)
+        pending = self.client.get('/api/v1/cash/config', headers=headers).json()['pending_users']
+        self.assertEqual({u['id'] for u in pending}, {u['id'] for u in users})
+        self.assertEqual(self.client.post('/api/v1/cash/activate', headers=headers, json={}).status_code, 200)
+        for role in ('collector', 'cashier'):
+            staff = self.auth_headers(self.login(role+'@example.com', 'workerpass123')['access_token'])
+            self.assertEqual(self.client.get('/api/v1/cash/config', headers=staff).json()['pending_users'], [])
+            result = self.client.post('/api/v1/cash/commands', headers=staff, json=dict(action='declare' if role=='collector' else 'open', branch_id=branch['id'], amount='0', idempotency_key='unassigned-'+role))
+            self.assertEqual(result.status_code, 403, result.text)
 
 if __name__ == "__main__":
     unittest.main()

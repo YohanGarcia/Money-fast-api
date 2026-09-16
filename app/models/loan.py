@@ -45,6 +45,7 @@ class Loan(Base):
     status: Mapped[LoanStatus] = mapped_column(SqlEnum(LoanStatus), default=LoanStatus.active)
     route_name: Mapped[str | None] = mapped_column(String(40), nullable=True)
     requires_promissory_note: Mapped[bool] = mapped_column(default=False)
+    cash_branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     customer = relationship("Customer", back_populates="loans")

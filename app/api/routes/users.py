@@ -202,8 +202,8 @@ def _validate_branch(db: Session, branch_id: int | None, company_id: int) -> int
     if branch_id is None:
         return None
     branch = db.scalar(select(Branch).where(Branch.id == branch_id, Branch.company_id == company_id))
-    if branch is None:
-        raise HTTPException(status_code=404, detail="La sucursal no existe.")
+    if branch is None or not branch.is_active:
+        raise HTTPException(status_code=404, detail="La sucursal no existe o está inactiva.")
     return branch.id
 
 
@@ -218,6 +218,12 @@ def create_user(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
+    from app.services.cash_service import enabled
+    if payload.role == UserRole.superadmin: raise HTTPException(403, 'No se permite crear superadministradores aquí.')
+    if (payload.role == UserRole.cashier or (enabled(db, company_id) and payload.role == UserRole.collector)) and not payload.branch_id:
+        raise HTTPException(422, 'Este rol requiere una sucursal.')
+    from app.services.cash_service import lock_company
+    lock_company(db, company_id)
     enforce_can_create(db, company_id, "user")
     user = User(
         full_name=payload.full_name.strip(),
@@ -249,6 +255,14 @@ def update_user(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
+    from app.services.cash_service import enabled, user_has_pending
+    from sqlalchemy import update
+    if payload.role == UserRole.superadmin: raise HTTPException(403, 'No se permite asignar superadministrador aquí.')
+    if (payload.role == UserRole.cashier or (enabled(db, company_id) and payload.role == UserRole.collector)) and not payload.branch_id:
+        raise HTTPException(422, 'Este rol requiere una sucursal.')
+    if payload.branch_id != user.branch_id or payload.role != user.role or not payload.is_active:
+        db.execute(update(User).where(User.id == user.id).values(full_name=User.full_name))
+        if user_has_pending(db, user): raise HTTPException(409, 'Resuelve los saldos, transferencias y entregas pendientes antes de cambiar este usuario.')
     user.full_name = payload.full_name.strip()
     user.email = payload.email.lower()
     user.role = payload.role

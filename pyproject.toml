@@ -14,6 +14,7 @@ dependencies = [
   "pwdlib[argon2]>=0.2.1",
   "sqlalchemy>=2.0.43",
   "uvicorn[standard]>=0.35.0",
+  "tzdata>=2026.3",
 ]
 
 [tool.uv]

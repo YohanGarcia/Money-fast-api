@@ -1,7 +1,7 @@
 from collections.abc import Generator
 from typing import Callable
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
@@ -56,6 +57,12 @@ def get_current_user(
     ):
         raise credentials_exception
 
+    if user.role == 'cashier':
+        path = request.url.path.removeprefix('/api/v1')
+        allowed = path.startswith('/cash/') or path in ('/auth/me','/auth/logout','/auth/refresh')
+        allowed = allowed or (request.method == 'GET' and (path == '/customers' or path.startswith('/customers/') or path == '/loans' or path.startswith('/loans/') or path == '/payments'))
+        allowed = allowed or (request.method == 'POST' and path == '/payments')
+        if not allowed: raise HTTPException(403, 'Esta operación no está disponible para el cajero.')
     return user
 
 

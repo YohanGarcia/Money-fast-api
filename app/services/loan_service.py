@@ -1,3 +1,4 @@
+from calendar import monthrange
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -24,7 +25,10 @@ def frequency_delta(start_date: date, frequency: PaymentFrequency, step: int) ->
         return start_date + timedelta(days=7 * step)
     if frequency == PaymentFrequency.biweekly:
         return start_date + timedelta(days=14 * step)
-    return start_date + timedelta(days=30 * step)
+    month_index = start_date.year * 12 + start_date.month - 1 + step
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    return date(year, month, min(start_date.day, monthrange(year, month)[1]))
 
 
 def refresh_loan_state(loan: Loan, now: datetime | None = None) -> bool:

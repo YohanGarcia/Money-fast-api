@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class PrintSettingsUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     enable_receipts: bool
     enable_promissory_note: bool
     show_tax_id: bool

@@ -8,6 +8,7 @@ from app.models.customer import Customer
 from app.models.route import Route
 from app.models.user import User, UserRole
 from app.schemas.route import RouteCreate, RouteRead, RouteStops, RouteUpdate
+from app.services import cash_service
 from app.services.route_service import order_stops_nearest_neighbor
 
 router = APIRouter()
@@ -135,6 +136,8 @@ def create_route(
 ) -> dict:
     collector_id = _validate_collector(db, payload.assigned_collector_id, company_id)
     branch_id = _validate_branch(db, payload.branch_id, company_id)
+    if cash_service.enabled(db,company_id) and collector_id and (not branch_id or db.get(User,collector_id).branch_id!=branch_id):
+        raise HTTPException(409,'Selecciona la sucursal del cobrador para esta ruta.')
     route = Route(
         name=payload.name.strip(),
         zone=payload.zone.strip(),
@@ -163,6 +166,10 @@ def update_route(
         raise HTTPException(status_code=404, detail="Ruta no encontrada.")
 
     new_collector_id = _validate_collector(db, payload.assigned_collector_id, company_id)
+    if cash_service.enabled(db,company_id) and new_collector_id and (not payload.branch_id or db.get(User,new_collector_id).branch_id!=payload.branch_id):
+        raise HTTPException(409,'La ruta y el cobrador deben pertenecer a la misma sucursal.')
+    if cash_service.enabled(db,company_id) and payload.branch_id:
+        db.execute(update(Customer).where(Customer.route_id==route.id).values(cash_branch_id=payload.branch_id))
     collector_changed = new_collector_id != route.assigned_collector_id
 
     route.name = payload.name.strip()

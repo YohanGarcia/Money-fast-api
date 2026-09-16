@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_company_id, get_db, require_admin
 from app.models.branch import Branch
+from app.models.cash import CashBox, CashSession, CashTransfer, CashDelivery
+from app.services import cash_service
 from app.models.route import Route
 from app.models.user import User
 from app.schemas.branch import BranchCreate, BranchRead, BranchUpdate
@@ -61,6 +63,10 @@ def update_branch(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe una sucursal con ese nombre.")
 
+    box = db.scalar(select(CashBox).where(CashBox.branch_id == branch_id))
+    if box and not payload.is_active:
+        if cash_service.active_session(db, box, False) or cash_service.pending(db, box)>0 or db.scalar(select(CashTransfer.id).where(CashTransfer.box_id==box.id,CashTransfer.state=='pending')) or db.scalar(select(CashDelivery.id).where(CashDelivery.box_id==box.id,CashDelivery.state=='pending')):
+            raise HTTPException(409, 'Cierra la jornada y resuelve entregas pendientes antes de desactivar la sucursal.')
     branch.name = payload.name.strip()
     branch.address = payload.address.strip()
     branch.manager_name = payload.manager_name.strip()
@@ -84,6 +90,8 @@ def delete_branch(
     if branch is None:
         raise HTTPException(status_code=404, detail="Sucursal no encontrada.")
 
+    if db.scalar(select(CashBox.id).where(CashBox.branch_id == branch_id)):
+        raise HTTPException(409, 'La sucursal conserva una caja y su historial; no se puede eliminar.')
     route_count = db.scalar(select(func.count()).select_from(Route).where(Route.branch_id == branch_id)) or 0
     user_count = db.scalar(select(func.count()).select_from(User).where(User.branch_id == branch_id)) or 0
     if route_count > 0 or user_count > 0:

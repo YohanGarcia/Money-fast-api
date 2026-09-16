@@ -13,6 +13,7 @@ class UserRole(str, Enum):
     admin      = "admin"
     manager    = "manager"
     collector  = "collector"
+    cashier = "cashier"
 
 
 class User(Base):

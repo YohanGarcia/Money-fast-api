@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class BranchCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     name: str = Field(min_length=2, max_length=140)
     address: str = Field(min_length=5, max_length=255)
     manager_name: str = Field(min_length=3, max_length=140)
