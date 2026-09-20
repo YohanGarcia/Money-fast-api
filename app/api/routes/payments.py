@@ -8,7 +8,6 @@ from app.models.loan import Loan
 from app.models.payment import Payment
 from app.models.user import User, UserRole
 from app.schemas.payment import PaymentCreate, PaymentRead
-from app.services.payment_service import apply_payment
 from app.services import cash_service
 from app.schemas.cash import CashPaymentResult
 from app.api.routes.cash import commit
@@ -50,23 +49,9 @@ def create_payment(
     company_id: int = Depends(get_company_id),
 ) -> Payment:
     cash_service.lock_company(db, company_id)
-    if cash_service.enabled(db, company_id):
-        return commit(db, lambda: cash_service.register_payment(db, current_user, payload))
-    if current_user.role == UserRole.cashier:
-        raise HTTPException(409, "Activa Caja antes de operar como cajero.")
-    statement = (
-        select(Loan)
-        .join(Loan.customer)
-        .where(Loan.id == payload.loan_id, Customer.company_id == company_id)
-    )
-    # A collector can only register payments for customers assigned to them.
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Customer.assigned_collector_id == current_user.id)
-    loan = db.scalar(statement)
-    if loan is None:
-        raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
-
-    payment = apply_payment(db=db, payload=payload, collected_by_id=current_user.id)
-    db.commit()
-    db.refresh(payment)
-    return payment
+    if not cash_service.enabled(db, company_id):
+        # Caja is the only way to register a payment. No role gets a bypass:
+        # until the company activates Caja for every active branch, no
+        # payment can be recorded at all.
+        raise HTTPException(409, "Activa Caja antes de registrar pagos.")
+    return commit(db, lambda: cash_service.register_payment(db, current_user, payload))
