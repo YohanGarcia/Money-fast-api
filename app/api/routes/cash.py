@@ -108,7 +108,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         historical_users={m.actor_id for m in movements}|{d.collector_id for d in deliveries}|{d.cashier_id for d in deliveries}
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
-        loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance)) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
+        loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
         data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],
           expected_opening=str(last.counted if last and last.state=='closed' else box.initial_balance),
           audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
@@ -179,11 +179,12 @@ def receipt(delivery_id:int,branch_id:int|None=None,db:Session=Depends(get_db),u
     return {'html':'<html><head><meta charset="utf-8"><title>Comprobante de entrega</title></head><body><h1>Comprobante ENT-'+str(d.id)+'</h1>'+''.join('<p><b>'+escape(k)+': </b>'+escape(str(v))+'</p>' for k,v in fields.items())+'</body></html>'}
 
 @router.get('/proof/{kind}/{target_id}')
-def proof(kind:str,target_id:int,branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+def proof(kind:str,target_id:int,branch_id:int|None=None,inline:bool=False,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
     box=svc.scope(db,user,branch_id)
     cls={'transfer':CashTransfer,'movement':CashMovement}.get(kind)
     if cls is None:svc.fail('Documento no encontrado.',404)
     row=db.get(cls,target_id)
     if not row or row.box_id!=box.id or (user.role=='collector' and (kind!='transfer' or row.collector_id!=user.id)):svc.fail('Documento no encontrado.',404)
     if not row.proof:svc.fail('Sin comprobante.',404)
-    return Response(base64.b64decode(row.proof['content_base64']),media_type=row.proof['media_type'],headers={'Content-Disposition':'attachment; filename="comprobante"','X-Content-Type-Options':'nosniff'})
+    disposition = 'inline' if inline else 'attachment'
+    return Response(base64.b64decode(row.proof['content_base64']),media_type=row.proof['media_type'],headers={'Content-Disposition':f'{disposition}; filename="comprobante"','X-Content-Type-Options':'nosniff'})
