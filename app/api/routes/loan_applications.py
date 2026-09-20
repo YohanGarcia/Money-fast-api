@@ -246,8 +246,13 @@ def transition(application_id: int, payload: TransitionInput,
         if action == "evaluate":
             required = {d["key"] for d in DOCUMENTS if d["required"] and (not d.get("secured") or item.modality == "secured")}
             verified = {d.category for d in item.documents if d.verified}
-            if not required.issubset(verified):
-                raise HTTPException(422, "Adjunta y verifica todos los documentos requeridos antes de evaluar.")
+            missing = required - verified
+            if missing:
+                labels = [d["label"] for d in DOCUMENTS if d["key"] in missing]
+                raise HTTPException(
+                    422,
+                    "Faltan documentos por adjuntar y verificar: " + ", ".join(labels) + ".",
+                )
         if action == "approve":
             if payload.terms is None or not payload.notes.strip():
                 raise HTTPException(422, "Registra la evaluación y las condiciones aprobadas.")

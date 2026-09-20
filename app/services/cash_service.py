@@ -348,7 +348,7 @@ def command(db,user,p):
         if bid is not None and bid!=box.branch_id: fail('La solicitud pertenece a otra sucursal.',403)
         if bid is None and user.role!='admin': fail('El administrador debe asignar la sucursal del cliente.')
         if not p.reference.strip() or not p.first_payment_date or p.first_payment_date<today(): fail('Indica referencia y primera fecha de pago válida.')
-        if p.method=='transfer' and not p.proof: fail('Adjunta el comprobante bancario del desembolso.')
+        if p.method in ('transfer','check') and not p.proof: fail('Adjunta el comprobante bancario del desembolso.')
         session=active_session(db,box)
         amount=Decimal(item.data['requested_amount'])
         if p.method=='cash' and session.balance<amount: fail('Efectivo insuficiente.',409)

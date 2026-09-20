@@ -16,6 +16,19 @@ class Customer(Base):
     document_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     phone: Mapped[str] = mapped_column(String(30))
     address: Mapped[str] = mapped_column(Text())
+    # Structured location, used to suggest a collection route by matching
+    # against Route.areas (RouteArea). All optional; address stays the
+    # free-text field shown/printed everywhere else.
+    sector: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    calle: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    barrio: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Additional structured address detail, captured by the registration
+    # form's address section. city holds the municipio value.
+    province: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    house_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    building: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    apartment: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    reference_note: Mapped[str | None] = mapped_column(Text(), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
     document_key: Mapped[str | None] = mapped_column(String(30), nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)

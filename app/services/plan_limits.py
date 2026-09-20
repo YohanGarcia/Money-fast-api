@@ -23,11 +23,9 @@ FREE_PLAN_NAME = "Gratis"
 _LABELS = {"customer": "clientes", "loan": "préstamos", "user": "usuarios"}
 
 _DEFAULT_PLANS = [
-    ("Gratis", 5, 5, 1, "0.00"),
-    ("Basico", 100, 100, 3, "17.99"),
-    ("Estandar", 200, 200, 5, "29.99"),
-    ("Pro", 500, 500, 10, "49.99"),
-    ("Empresarial", 0, 0, 0, "79.99"),
+    ("Gratis", 5, 5, 3, "0.00"),
+    ("Profesional", 200, 200, 10, "25.00"),
+    ("Ilimitado", 0, 0, 0, "49.99"),
 ]
 
 

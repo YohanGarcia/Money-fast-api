@@ -12,7 +12,7 @@ from app.models.print_settings import PrintSettings
 from app.models.loan_settings import LoanSettings
 from app.models.password_reset import PasswordResetCode
 from app.models.payment import Payment, PaymentType
-from app.models.route import Route
+from app.models.route import Route, RouteArea, RouteAreaType
 from app.models.session import UserSession
 from app.models.subscription import Subscription, SubscriptionStatus
 from app.models.user import User, UserRole
@@ -35,6 +35,8 @@ __all__ = [
     "PaymentFrequency",
     "PaymentType",
     "Route",
+    "RouteArea",
+    "RouteAreaType",
     "Subscription",
     "SubscriptionStatus",
     "User",

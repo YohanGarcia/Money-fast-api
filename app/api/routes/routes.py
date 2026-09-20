@@ -5,11 +5,18 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.branch import Branch
 from app.models.customer import Customer
-from app.models.route import Route
+from app.models.route import Route, RouteArea
 from app.models.user import User, UserRole
-from app.schemas.route import RouteCreate, RouteRead, RouteStops, RouteUpdate
+from app.schemas.route import (
+    RouteCreate,
+    RouteRead,
+    RouteStops,
+    RouteSuggestion,
+    RouteUpdate,
+)
 from app.services import cash_service
-from app.services.route_service import order_stops_nearest_neighbor
+from app.services.route_assignment import suggest_routes
+from app.services.route_service import loan_status_by_customer, order_stops_nearest_neighbor
 
 router = APIRouter()
 
@@ -42,6 +49,25 @@ def _customer_count(db: Session, route_id: int) -> int:
     ) or 0
 
 
+def _replace_areas(db: Session, route: Route, areas: list) -> None:
+    """Replace-all: clear the route's areas and insert the given ones."""
+    from app.services.route_assignment import normalize
+
+    db.execute(RouteArea.__table__.delete().where(RouteArea.route_id == route.id))
+    for area in areas:
+        name = area.name.strip()
+        if not name:
+            continue
+        db.add(
+            RouteArea(
+                route_id=route.id,
+                area_type=area.area_type.value,
+                name=name,
+                normalized_name=normalize(name),
+            )
+        )
+
+
 def _serialize(db: Session, route: Route) -> dict:
     return {
         "id": route.id,
@@ -55,6 +81,11 @@ def _serialize(db: Session, route: Route) -> dict:
         "collector_name": route.collector_name,
         "branch_name": route.branch_name,
         "customer_count": _customer_count(db, route.id),
+        "areas": [
+            {"id": a.id, "area_type": a.area_type, "name": a.name}
+            for a in sorted(route.areas, key=lambda a: a.name)
+        ],
+        "boundary": route.boundary or [],
         "created_at": route.created_at,
     }
 
@@ -96,6 +127,7 @@ def route_stops(
         raise HTTPException(status_code=404, detail="Ruta no encontrada.")
 
     customers = db.scalars(select(Customer).where(Customer.route_id == route_id)).all()
+    loan_status = loan_status_by_customer(db, [c.id for c in customers])
 
     located: list[dict] = []
     unlocated: list[dict] = []
@@ -106,13 +138,17 @@ def route_stops(
                 "lat": float(c.latitude), "lng": float(c.longitude),
             })
         else:
-            unlocated.append({"id": c.id, "full_name": c.full_name, "address": c.address})
+            unlocated.append({
+                "id": c.id, "full_name": c.full_name, "address": c.address,
+                "loan_status": loan_status.get(c.id),
+            })
 
     ordered = order_stops_nearest_neighbor(located)
     stops = [
         {
             "id": s["id"], "full_name": s["full_name"], "address": s["address"],
             "latitude": s["lat"], "longitude": s["lng"], "sequence": i + 1,
+            "loan_status": loan_status.get(s["id"]),
         }
         for i, s in enumerate(ordered)
     ]
@@ -145,9 +181,13 @@ def create_route(
         assigned_collector_id=collector_id,
         branch_id=branch_id,
         is_active=payload.is_active,
+        boundary=payload.boundary,
         company_id=company_id,
     )
     db.add(route)
+    db.commit()
+    db.refresh(route)
+    _replace_areas(db, route, payload.areas)
     db.commit()
     db.refresh(route)
     return _serialize(db, route)
@@ -178,6 +218,7 @@ def update_route(
     route.assigned_collector_id = new_collector_id
     route.branch_id = _validate_branch(db, payload.branch_id, company_id)
     route.is_active = payload.is_active
+    route.boundary = payload.boundary
 
     # Reassigning the route's collector reassigns the whole portfolio at once.
     if collector_changed:
@@ -187,6 +228,7 @@ def update_route(
             .values(assigned_collector_id=new_collector_id)
         )
 
+    _replace_areas(db, route, payload.areas)
     db.commit()
     db.refresh(route)
     return _serialize(db, route)
@@ -211,3 +253,42 @@ def delete_route(
 
     db.delete(route)
     db.commit()
+
+
+@router.get("/suggest", response_model=list[RouteSuggestion])
+def suggest_route_for_address(
+    sector: str | None = None,
+    calle: str | None = None,
+    barrio: str | None = None,
+    provincia: str | None = None,
+    municipio: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_manager),
+    company_id: int = Depends(get_company_id),
+) -> list[dict]:
+    """Suggest routes matching a sector/calle/barrio/provincia/municipio,
+    and/or whose drawn zone contains (lat, lng), for the client form to
+    offer as "¿usar esta ruta?" -- never assigns anything by itself."""
+    results = suggest_routes(
+        db,
+        company_id,
+        sector=sector,
+        calle=calle,
+        barrio=barrio,
+        provincia=provincia,
+        municipio=municipio,
+        lat=lat,
+        lng=lng,
+    )
+    return [
+        {
+            "route_id": r.route_id,
+            "route_name": r.route_name,
+            "zone": r.zone,
+            "matched_on": r.matched_on,
+            "score": r.score,
+        }
+        for r in results
+    ]

@@ -199,10 +199,19 @@ class MoneyFastApiTests(unittest.TestCase):
         )
         self.assertEqual(blocked.status_code, 402, blocked.text)
 
-        # Free plan allows 1 user (the admin already exists), so adding one is blocked.
+        # Free plan allows 3 users (the admin already counts as one), so two more
+        # succeed and the next one is blocked.
+        for i in range(2):
+            ok_user = self.client.post(
+                "/api/v1/users",
+                json={"full_name": f"Empleado {i}", "email": f"emp{i}@example.com",
+                      "password": "workerpass123", "role": "collector"},
+                headers=headers,
+            )
+            self.assertEqual(ok_user.status_code, 201, ok_user.text)
         blocked_user = self.client.post(
             "/api/v1/users",
-            json={"full_name": "Empleado", "email": "emp@example.com",
+            json={"full_name": "Empleado extra", "email": "empextra@example.com",
                   "password": "workerpass123", "role": "collector"},
             headers=headers,
         )
@@ -252,6 +261,7 @@ class MoneyFastApiTests(unittest.TestCase):
                 "full_name": "Attacker User",
                 "email": "attacker@example.com",
                 "password": "attackerpass123",
+                "company_name": "Attacker Co",
                 "role": "superadmin",
             },
         )
@@ -654,6 +664,89 @@ class MoneyFastApiTests(unittest.TestCase):
         self.assertEqual(body["unlocated"][0]["full_name"], "Sin GPS")
         # Sequence numbers are 1..N and each stop is located.
         self.assertEqual([s["sequence"] for s in body["stops"]], [1, 2, 3])
+
+    def test_route_areas_created_updated_and_suggested(self) -> None:
+        headers = self.owner_session()
+        collector = self.create_user(headers, "areas@example.com", "collector", "Cobrador Areas")
+        route = self.client.post(
+            "/api/v1/routes",
+            json={
+                "name": "Ruta Este",
+                "zone": "Este",
+                "assigned_collector_id": collector["id"],
+                "areas": [
+                    {"area_type": "sector", "name": "Sector A"},
+                    {"area_type": "calle", "name": "Calle 3"},
+                ],
+            },
+            headers=headers,
+        )
+        self.assertEqual(route.status_code, 201, route.text)
+        body = route.json()
+        self.assertEqual(len(body["areas"]), 2)
+        self.assertEqual({a["name"] for a in body["areas"]}, {"Sector A", "Calle 3"})
+
+        # Suggest-route matches case/whitespace-insensitively against a customer's
+        # sector/calle/barrio, without assigning anything by itself.
+        suggestion = self.client.get(
+            "/api/v1/routes/suggest",
+            params={"sector": "  sector a  ", "calle": "otra calle", "barrio": "Barrio X"},
+            headers=headers,
+        )
+        self.assertEqual(suggestion.status_code, 200, suggestion.text)
+        suggestions = suggestion.json()
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["route_id"], body["id"])
+        self.assertEqual(suggestions[0]["score"], 1)
+
+        # No match at all → empty suggestion list, never a guess.
+        none_matched = self.client.get(
+            "/api/v1/routes/suggest",
+            params={"sector": "Sector Z"},
+            headers=headers,
+        )
+        self.assertEqual(none_matched.json(), [])
+
+        # Updating a route's areas replaces the previous set entirely.
+        updated = self.client.put(
+            f"/api/v1/routes/{body['id']}",
+            json={
+                "name": "Ruta Este",
+                "zone": "Este",
+                "assigned_collector_id": collector["id"],
+                "areas": [{"area_type": "barrio", "name": "Barrio Nuevo"}],
+            },
+            headers=headers,
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual([a["name"] for a in updated.json()["areas"]], ["Barrio Nuevo"])
+
+    def test_route_stops_expose_loan_status(self) -> None:
+        headers = self.owner_session()
+        collector = self.create_user(headers, "stopsloan@example.com", "collector", "Cobrador Loan")
+        route = self.create_route(headers, "Ruta Cobro", collector_id=collector["id"])
+
+        with_loan = self.create_customer(headers, "Con Prestamo")
+        upd1 = self.client.put(
+            f"/api/v1/customers/{with_loan['id']}",
+            json={**with_loan, "route_id": route["id"], "version": with_loan["version"]},
+            headers=headers,
+        )
+        self.assertEqual(upd1.status_code, 200, upd1.text)
+        without_loan = self.create_customer(headers, "Sin Prestamo")
+        upd2 = self.client.put(
+            f"/api/v1/customers/{without_loan['id']}",
+            json={**without_loan, "route_id": route["id"], "version": without_loan["version"]},
+            headers=headers,
+        )
+        self.assertEqual(upd2.status_code, 200, upd2.text)
+        self.create_loan(headers, with_loan["id"])
+
+        resp = self.client.get(f"/api/v1/routes/{route['id']}/stops", headers=headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        unlocated_by_name = {u["full_name"]: u["loan_status"] for u in resp.json()["unlocated"]}
+        self.assertEqual(unlocated_by_name["Con Prestamo"], "active")
+        self.assertIsNone(unlocated_by_name["Sin Prestamo"])
 
     def test_live_location_update_and_list(self) -> None:
         headers = self.owner_session()

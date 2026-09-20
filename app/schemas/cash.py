@@ -33,7 +33,7 @@ class CashCommand(BaseModel):
     kind: Literal['contribution','expense','withdrawal','bank_deposit'] | None = None
     resolution: Literal['approve','return'] | None = None
     denominations: dict[str,StrictInt] = Field(default_factory=dict)
-    method: Literal['cash','transfer'] = 'cash'
+    method: Literal['cash','transfer','check'] = 'cash'
     proof: Proof | None = None
     first_payment_date: date | None = None
 

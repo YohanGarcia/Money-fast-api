@@ -17,6 +17,14 @@ class CustomerBase(BaseModel):
     document_id: str | None = Field(default=None, max_length=30)
     phone: str = Field(min_length=7, max_length=30)
     address: str = Field(min_length=5, max_length=255)
+    sector: str | None = Field(default=None, max_length=120)
+    calle: str | None = Field(default=None, max_length=120)
+    barrio: str | None = Field(default=None, max_length=120)
+    province: str | None = Field(default=None, max_length=120)
+    house_number: str | None = Field(default=None, max_length=60)
+    building: str | None = Field(default=None, max_length=160)
+    apartment: str | None = Field(default=None, max_length=60)
+    reference_note: str | None = None
     notes: str | None = None
     email: EmailStr | None = None
     home_phone: str | None = Field(default=None, max_length=30)
@@ -25,6 +33,26 @@ class CustomerBase(BaseModel):
     nationality: str | None = Field(default=None, max_length=160)
     city: str | None = Field(default=None, max_length=160)
     references: list[CustomerReference] = Field(default_factory=list, max_length=3)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def clean_email(cls, value):
+        """Normaliza el correo antes de validarlo con EmailStr.
+
+        Quita espacios y comas/punto y coma sobrantes al inicio/final (typeo común
+        al escribir o pegar el correo) y convierte "" en None. Si quedan varias
+        direcciones separadas por coma, se rechaza con un mensaje claro en vez del
+        mensaje técnico por defecto de pydantic.
+        """
+        if value is None:
+            return value
+        if isinstance(value, str):
+            value = value.strip().strip(",;").strip()
+            if value == "":
+                return None
+            if "," in value or ";" in value:
+                raise ValueError("Ingresa un solo correo electrónico, sin comas.")
+        return value
 
     @field_validator("birth_date")
     @classmethod

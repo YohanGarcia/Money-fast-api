@@ -213,10 +213,13 @@ class CashTests(unittest.TestCase):
     def test_cashier_counts_against_plan_limit(self):
         from app.models.company import Company
         from app.models.plan import Plan
-        from sqlalchemy import select
         with SessionLocal() as db:
             company=db.get(Company,self.users['cashier']['company_id'])
-            company.plan_id=db.scalar(select(Plan.id).where(Plan.name=='Basico'));db.commit()
+            # A plan of its own (rather than a named catalog plan, which can change)
+            # with a limit already met by the admin+manager+cashier+collector fixture.
+            tight_plan=Plan(name='Plan de prueba (límite de usuarios)',customer_limit=0,loan_limit=0,user_limit=3,monthly_price_usd='9.99')
+            db.add(tight_plan);db.flush()
+            company.plan_id=tight_plan.id;db.commit()
         self.req('/users',dict(full_name='Otra Cajera',email='extra@example.com',password='workerpass123',role='cashier',branch_id=self.branch),code=402)
 
     def test_midnight_and_inclusive_local_range(self):
