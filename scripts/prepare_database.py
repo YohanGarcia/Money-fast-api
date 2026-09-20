@@ -6,6 +6,15 @@ the last pre-cash migration avoids recreating ``companies`` while still
 applying the additive route and customer-location migrations.
 """
 
+import sys
+from pathlib import Path
+
+# ``python scripts/prepare_database.py`` puts only ``scripts/`` on sys.path.
+# Add the project root so imports work in Railway and local Windows runs.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
