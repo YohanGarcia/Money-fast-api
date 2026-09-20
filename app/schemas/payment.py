@@ -13,6 +13,7 @@ class PaymentCreate(BaseModel):
     origin: Literal['field','counter'] | None = None
     branch_id: int | None = None
     idempotency_key: str | None = Field(default=None, min_length=12, max_length=80)
+    bank_account_id: int | None = None
     bank_destination: str | None = Field(default=None, max_length=160)
     proof: Proof | None = None
     loan_id: int

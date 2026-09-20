@@ -17,6 +17,7 @@ from app.models.customer import Customer
 from app.models.loan import Loan
 from app.models.payment import Payment
 from app.models.loan_application import LoanApplication
+from app.models.bank_account import BankAccount
 from app.models.cash import *
 from app.schemas.cash import CashCommand, CashSetup
 from app.services import cash_service as svc
@@ -91,10 +92,12 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
     if mine:
         deliveries=[d for d in deliveries if d.collector_id==mine]
         transfers=[t for t in transfers if t.collector_id==mine]
+    bank_accounts=db.scalars(select(BankAccount).where(BankAccount.company_id==user.company_id,BankAccount.is_active==True).order_by(BankAccount.bank_name)).all()
     outstanding=svc.outstanding_rows(db,box,mine)
     totals={}
     for p,amount in outstanding: totals[p.collected_by_id]=totals.get(p.collected_by_id,svc.ZERO)+amount
     data=dict(branch_id=box.branch_id,branch_name=db.get(Branch,box.branch_id).name,
+        bank_accounts=[dict(id=a.id,bank_name=a.bank_name,account_number=a.account_number,account_holder=a.account_holder,label=a.label) for a in bank_accounts],
         pending=str(svc.pending(db,box,mine)),transfers_pending=str(sum((t.amount for t in transfers if t.state=='pending'),svc.ZERO)),
         deliveries=[{**enrich(d),'allocations':[dict(payment_id=a.payment_id,amount=str(a.amount)) for a in db.scalars(select(CashAllocation).where(CashAllocation.delivery_id==d.id)).all()]} for d in deliveries],transfers=[enrich(t) for t in transfers],
         payments=[{**enrich(p),'customer_name':db.get(Customer,db.get(Loan,p.loan_id).customer_id).full_name} for p in payments],

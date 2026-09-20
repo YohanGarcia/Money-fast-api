@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, update, func
 from app.models.cash import (CashConfig, CashBox, CashSession, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest)
+from app.models.bank_account import BankAccount
 from app.models.branch import Branch
 from app.models.user import User
 from app.models.customer import Customer
@@ -142,8 +143,10 @@ def register_payment(db,user,payload):
     if payload.amount is None: fail('Actualiza la app: registra un importe explícito.')
     session=active_session(db,box) if payload.origin=='counter' else None
     if payload.method=='transfer':
-        if not payload.reference_code or not payload.bank_destination or not payload.proof: fail('La transferencia requiere referencia, destino y comprobante.')
-        row=CashTransfer(box_id=box.id,collector_id=user.id,loan_id=loan.id,amount=payload.amount,reference=payload.reference_code,destination=payload.bank_destination,proof=payload.proof.model_dump(),payload=payload.model_dump(mode='json'))
+        if not payload.reference_code or not payload.bank_account_id or not payload.proof: fail('La transferencia requiere referencia, cuenta bancaria de destino y comprobante.')
+        account=db.get(BankAccount,payload.bank_account_id)
+        if not account or account.company_id!=user.company_id or not account.is_active: fail('Selecciona una cuenta bancaria activa de la empresa.')
+        row=CashTransfer(box_id=box.id,collector_id=user.id,loan_id=loan.id,amount=payload.amount,reference=payload.reference_code,destination=account.label,bank_account_id=account.id,proof=payload.proof.model_dump(),payload=payload.model_dump(mode='json'))
         db.add(row);db.flush()
         result=dict(transfer_id=row.id,status='pending',amount=str(row.amount),message='Transferencia pendiente de confirmación; aún no abona al préstamo.')
     else:

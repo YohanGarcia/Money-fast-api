@@ -94,6 +94,7 @@ class CashTransfer(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12,2))
     reference: Mapped[str] = mapped_column(String(160))
     destination: Mapped[str] = mapped_column(String(160))
+    bank_account_id: Mapped[int | None] = mapped_column(ForeignKey('bank_accounts.id'))
     proof: Mapped[dict] = mapped_column(JSON)
     payload: Mapped[dict] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(20), default='pending')

@@ -1,5 +1,6 @@
 from app.models.cash import CashConfig, CashBox, CashSession, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest
 from app.models.app_setting import AppSetting
+from app.models.bank_account import BankAccount
 from app.models.loan_application import LoanApplication, ApplicationDocument
 from app.models.company import Company
 from app.models.branch import Branch
@@ -19,6 +20,7 @@ from app.models.user import User, UserRole
 
 __all__ = [
     "AppSetting",
+    "BankAccount",
     "Branch",
     "Company",
     "CompanySettings",

@@ -44,6 +44,7 @@ class CashTests(unittest.TestCase):
         self.loan=self.create_loan(self.admin,self.customer['id'])
         for bid in (self.branch,self.other): self.req('/cash/setup',dict(branch_id=bid,initial_balance='1000',notes='Prueba inicial'))
         self.req('/cash/activate',{})
+        self.bank_account=self.req('/bank-accounts',dict(bank_name='Banco QA',account_number='1234567890',account_holder='Empresa QA'),code=201)
 
     def workspace(self,headers=None): return self.req(f'/cash/workspace?branch_id={self.branch}',headers=headers)
     def cmd(self,action,headers=None,code=200,**fields):
@@ -57,7 +58,7 @@ class CashTests(unittest.TestCase):
     def receive(self,did,amount='600'):
         return self.cmd('receive',headers=self.roles['cashier'],target_id=did,version=1,amount=amount,notes='Entrega parcial')
     def transfer(self):
-        return self.payment(method='transfer',reference_code='BANCO-QA',bank_destination='Cuenta pruebas 123',proof=dict(filename='test.pdf',media_type='application/pdf',content_base64=base64.b64encode(b'%PDF-1.4 test proof').decode()))
+        return self.payment(method='transfer',reference_code='BANCO-QA',bank_account_id=self.bank_account['id'],proof=dict(filename='test.pdf',media_type='application/pdf',content_base64=base64.b64encode(b'%PDF-1.4 test proof').decode()))
 
     def test_partial_delivery_does_not_pay_twice_and_carries(self):
         self.open(); p=self.payment(); d=self.delivery(); self.receive(d)
