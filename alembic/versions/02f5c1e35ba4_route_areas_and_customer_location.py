@@ -23,25 +23,35 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "route_areas",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("route_id", sa.Integer(), nullable=False),
-        sa.Column("area_type", sa.String(20), nullable=False),
-        sa.Column("name", sa.String(120), nullable=False),
-        sa.Column("normalized_name", sa.String(120), nullable=False),
-        sa.ForeignKeyConstraint(["route_id"], ["routes.id"]),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_route_areas_route_id", "route_areas", ["route_id"], unique=False)
-    op.create_index(
-        "ix_route_areas_normalized_name", "route_areas", ["normalized_name"], unique=False
-    )
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    tables = set(inspector.get_table_names())
+    if "route_areas" not in tables:
+        op.create_table(
+            "route_areas",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("route_id", sa.Integer(), nullable=False),
+            sa.Column("area_type", sa.String(20), nullable=False),
+            sa.Column("name", sa.String(120), nullable=False),
+            sa.Column("normalized_name", sa.String(120), nullable=False),
+            sa.ForeignKeyConstraint(["route_id"], ["routes.id"]),
+            sa.PrimaryKeyConstraint("id"),
+        )
+        inspector = sa.inspect(bind)
+    indexes = {index["name"] for index in inspector.get_indexes("route_areas")}
+    if "ix_route_areas_route_id" not in indexes:
+        op.create_index("ix_route_areas_route_id", "route_areas", ["route_id"], unique=False)
+    if "ix_route_areas_normalized_name" not in indexes:
+        op.create_index("ix_route_areas_normalized_name", "route_areas", ["normalized_name"], unique=False)
 
+    existing = {column["name"] for column in inspector.get_columns("customers")}
     with op.batch_alter_table("customers") as batch_op:
-        batch_op.add_column(sa.Column("sector", sa.String(120), nullable=True))
-        batch_op.add_column(sa.Column("calle", sa.String(120), nullable=True))
-        batch_op.add_column(sa.Column("barrio", sa.String(120), nullable=True))
+        if "sector" not in existing:
+            batch_op.add_column(sa.Column("sector", sa.String(120), nullable=True))
+        if "calle" not in existing:
+            batch_op.add_column(sa.Column("calle", sa.String(120), nullable=True))
+        if "barrio" not in existing:
+            batch_op.add_column(sa.Column("barrio", sa.String(120), nullable=True))
 
 
 def downgrade() -> None:

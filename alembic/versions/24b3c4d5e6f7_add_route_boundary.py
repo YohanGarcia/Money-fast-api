@@ -23,6 +23,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    existing = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("routes")}
+    if "boundary" in existing:
+        return
     with op.batch_alter_table("routes") as batch_op:
         batch_op.add_column(
             sa.Column("boundary", sa.JSON(), nullable=False, server_default="[]")
