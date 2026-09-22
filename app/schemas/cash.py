@@ -31,6 +31,7 @@ class CashCommand(BaseModel):
     notes: str = Field(default='', max_length=2000)
     reference: str = Field(default='', max_length=160)
     kind: Literal['contribution','expense','withdrawal','bank_deposit'] | None = None
+    capital: bool = False
     resolution: Literal['approve','return'] | None = None
     denominations: dict[str,StrictInt] = Field(default_factory=dict)
     method: Literal['cash','transfer','check'] = 'cash'

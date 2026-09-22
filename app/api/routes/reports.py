@@ -13,7 +13,8 @@ from app.models.cash import CashBox, CashSession
 from app.models.customer import Customer
 from app.models.loan import Loan, LoanStatus
 from app.models.payment import Payment
-from app.services import cash_service as svc
+from app.models.payroll import PayrollPayment
+from app.services import capital_service, cash_service as svc
 from app.services.xlsx import build_xlsx
 
 router = APIRouter()
@@ -48,6 +49,9 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
     desembolsado = sum((l.principal_amount for l in loans if low <= _aware(l.created_at) < high), ZERO)
     prestamos_nuevos = sum(1 for l in loans if low <= _aware(l.created_at) < high)
 
+    nomina_rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id)).all()
+    nomina_pagada = sum((p.amount for p in nomina_rows if low <= _aware(p.created_at) < high), ZERO)
+
     efectivo = None
     if svc.enabled(db, company_id):
         efectivo = ZERO
@@ -60,10 +64,11 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
             else:
                 efectivo += last.counted if last.counted is not None else last.balance
 
+    reserva = capital_service.balance(db, company_id)
     por_cobrar = cartera_capital + cartera_interes + cartera_mora
     ganancia_cobrada = interes_cobrado + mora_cobrada
     ganancia_proyectada = cartera_interes + cartera_mora
-    capital_en_negocio = (efectivo or ZERO) + cartera_capital
+    capital_en_negocio = reserva + (efectivo or ZERO) + cartera_capital
 
     def s(v: Decimal) -> str:
         return str(v.quantize(Decimal("0.01")))
@@ -71,6 +76,7 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
     return dict(
         start=str(start), end=str(end),
         caja_enabled=svc.enabled(db, company_id),
+        reserva_capital=s(reserva),
         efectivo_caja=None if efectivo is None else s(efectivo),
         cartera_capital=s(cartera_capital),
         cartera_interes=s(cartera_interes),
@@ -87,6 +93,7 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
         ganancia_proyectada=s(ganancia_proyectada),
         desembolsado=s(desembolsado),
         prestamos_nuevos=prestamos_nuevos,
+        nomina_pagada=s(nomina_pagada),
         pagos_periodo=len(period_pays),
     )
 
@@ -98,12 +105,13 @@ def _rows(d: dict) -> list[list]:
         ["Período", f'{d["start"]} a {d["end"]}'],
         [],
         ["Tu dinero ahora (foto actual)", "RD$"],
+        ["Reserva de capital (fuera de caja)", d["reserva_capital"]],
         ["Efectivo en caja", efectivo],
         ["En préstamos (capital en la calle)", d["cartera_capital"]],
         ["Interés por cobrar", d["cartera_interes"]],
         ["Mora por cobrar", d["cartera_mora"]],
         ["Total por cobrar (capital + interés + mora)", d["por_cobrar"]],
-        ["Capital en el negocio (efectivo + capital en la calle)", d["capital_en_negocio"]],
+        ["Capital en el negocio (reserva + efectivo + capital en la calle)", d["capital_en_negocio"]],
         ["Préstamos activos", d["prestamos_activos"]],
         ["Clientes con préstamo activo", d["clientes_activos"]],
         [],
@@ -115,6 +123,7 @@ def _rows(d: dict) -> list[list]:
         ["Ganancia cobrada (interés + mora)", d["ganancia_cobrada"]],
         ["Ganancia proyectada (interés + mora pendiente)", d["ganancia_proyectada"]],
         ["Desembolsado (capital colocado)", d["desembolsado"]],
+        ["Nómina pagada", d["nomina_pagada"]],
         ["Préstamos nuevos", d["prestamos_nuevos"]],
         ["Pagos registrados", d["pagos_periodo"]],
     ]

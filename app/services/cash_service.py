@@ -8,6 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, update, func
 from app.models.cash import (CashConfig, CashBox, CashSession, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest)
 from app.models.bank_account import BankAccount
+from app.models.capital import CapitalMovement
 from app.models.branch import Branch
 from app.models.user import User
 from app.models.customer import Customer
@@ -257,11 +258,17 @@ def command(db,user,p):
         row.cashier_id=user.id;row.confirmed_at=now();row.notes=p.notes
         result={'delivery_id':row.id,'state':row.state}
     elif action=='movement':
+        from app.services import capital_service
         session=active_session(db,box);check_version(session,p.version)
         if not p.kind or p.amount<=0 or not p.notes.strip(): fail('Indica tipo, importe positivo y concepto.')
         if p.kind=='bank_deposit' and not p.reference.strip(): fail('Indica la referencia del depósito.')
+        if p.capital and p.kind not in ('contribution','withdrawal'): fail('El movimiento con capital debe ser aporte (desde capital) o retiro (hacia capital).')
+        # capital -> caja needs enough reserve; checked before the cash entry so both stay consistent.
+        if p.capital and p.kind=='contribution' and p.amount>capital_service.balance(db,box.company_id): fail('El capital disponible no alcanza para este aporte a caja.',409)
         amount=p.amount if p.kind=='contribution' else -p.amount
         row=add_movement(db,box,session,user,p.kind,amount,p.notes,reference=p.reference,proof=p.proof.model_dump() if p.proof else None)
+        if p.capital:
+            capital_service.record(db,box.company_id,user.id,'to_cash' if p.kind=='contribution' else 'from_cash',p.amount,p.notes,cash_movement_id=row.id)
         result={'movement_id':row.id}
     elif action=='close':
         session=active_session(db,box);check_version(session,p.version)
@@ -308,6 +315,11 @@ def command(db,user,p):
         if db.scalar(select(CashMovement).where(CashMovement.reverses_id==original.id)): fail('Movimiento ya revertido.',409)
         session=active_session(db,box);check_version(session,p.version)
         row=add_movement(db,box,session,user,'reversal',-original.amount,p.notes,reverses_id=original.id,collector_id=original.collector_id)
+        cap=db.scalar(select(CapitalMovement).where(CapitalMovement.cash_movement_id==original.id))
+        if cap:
+            from app.services import capital_service
+            # Undo the capital side: a to_cash (capital->caja) is returned to capital, and vice versa.
+            capital_service.record(db,box.company_id,user.id,'from_cash' if cap.kind=='to_cash' else 'to_cash',cap.amount,'Reverso: '+p.notes,cash_movement_id=row.id)
         if original.delivery_id:
             delivery=db.get(CashDelivery,original.delivery_id)
             if db.get(User,delivery.collector_id).branch_id!=box.branch_id: fail('El cobrador cambió de sucursal; resuelve su asignación antes de revertir.')

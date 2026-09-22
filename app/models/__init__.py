@@ -1,6 +1,8 @@
 from app.models.cash import CashConfig, CashBox, CashSession, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest
 from app.models.app_setting import AppSetting
 from app.models.bank_account import BankAccount
+from app.models.capital import CapitalMovement
+from app.models.payroll import PayrollConfig, PayrollPayment
 from app.models.loan_application import LoanApplication, ApplicationDocument
 from app.models.company import Company
 from app.models.branch import Branch
@@ -16,11 +18,15 @@ from app.models.payment import Payment, PaymentType
 from app.models.route import Route, RouteArea, RouteAreaType
 from app.models.session import UserSession
 from app.models.subscription import Subscription, SubscriptionStatus
+from app.models.tour_progress import TourProgress, TourStatus
 from app.models.user import User, UserRole
 
 __all__ = [
     "AppSetting",
     "BankAccount",
+    "CapitalMovement",
+    "PayrollConfig",
+    "PayrollPayment",
     "Branch",
     "Company",
     "CompanySettings",
@@ -41,6 +47,8 @@ __all__ = [
     "RouteAreaType",
     "Subscription",
     "SubscriptionStatus",
+    "TourProgress",
+    "TourStatus",
     "User",
     "UserRole",
     "UserSession",

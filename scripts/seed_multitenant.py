@@ -2,6 +2,13 @@
 Seed script: crea empresa default, superadmin y asigna datos existentes.
 Uso: uv run python scripts/seed_multitenant.py
 """
+import sys
+from pathlib import Path
+
+# Al ejecutarse como "python scripts/seed_multitenant.py", Python solo pone la
+# carpeta scripts/ en el path; añadimos la raíz del proyecto para importar "app".
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from datetime import UTC, datetime
 
 from app.core.database import SessionLocal
