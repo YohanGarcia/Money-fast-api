@@ -1,5 +1,10 @@
-"""Capital reserve = money the owner has put in the business that is neither in a
-cash box nor lent out. Balance is the running sum of the ledger."""
+"""Ledger for capital outside cash custody.
+
+``balance()`` is the capital reserve (capital contable disponible), not the
+physical cash held by any branch. Cash custody is represented by cash boxes,
+sessions and movements. A custody handover may create exactly one linked
+capital movement, but it never creates a loan payment or financial revenue.
+"""
 from decimal import Decimal
 
 from fastapi import HTTPException

@@ -19,5 +19,6 @@ class CapitalMovement(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     notes: Mapped[str] = mapped_column(Text, default="")
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"))
+    # A physical custody movement can have at most one corresponding capital entry.
+    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))

@@ -1,4 +1,4 @@
-from app.models.cash import CashConfig, CashBox, CashSession, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest
+from app.models.cash import CashConfig, CashBox, CashSession, CashCustodyTransfer, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest
 from app.models.app_setting import AppSetting
 from app.models.bank_account import BankAccount
 from app.models.capital import CapitalMovement
@@ -24,6 +24,7 @@ from app.models.user import User, UserRole
 __all__ = [
     "AppSetting",
     "BankAccount",
+    "CashCustodyTransfer",
     "CapitalMovement",
     "PayrollConfig",
     "PayrollPayment",
