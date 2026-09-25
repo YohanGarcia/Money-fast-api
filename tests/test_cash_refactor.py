@@ -60,6 +60,54 @@ class CashRefactorTests(unittest.TestCase):
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
 
+    def test_finance_report_sums_each_cashier_and_excludes_confirmed_closes(self):
+        """Cash moves from session to reserve once, without disappearing or doubling."""
+        from app.services.cash_service import today
+
+        first = self.open_for('cashier', '800')
+        self.open_for('cashier2', '600')
+        path = f'/reports/finance?start={today()}&end={today()}'
+        report = self.req(path)
+        self.assertEqual(Decimal(report['efectivo_caja']), Decimal('1400.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('3600.00'))
+        self.assertEqual(Decimal(report['aportes_netos']), Decimal('5000.00'))
+        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('5000.00'))
+
+        pending = self.cmd('close', headers=self.roles['cashier'],
+                           version=first.get('version', 2),
+                           target_id=self.users['manager']['id'],
+                           denominations={'500': 1, '200': 1, '100': 1})
+        self.assertEqual(pending['state'], 'closing_transfer_pending')
+        before_confirmation = self.req(path)
+        self.assertEqual(Decimal(before_confirmation['efectivo_caja']), Decimal('1400.00'))
+        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('3600.00'))
+
+        with SessionLocal() as db:
+            version = db.get(CashSession, first['session_id']).version
+        self.cmd('confirm_closing_transfer', headers=self.roles['manager'],
+                 target_id=pending['transfer_id'], version=version, transfer_version=1,
+                 acceptance_id='finance-close-' + uuid.uuid4().hex,
+                 acceptance_method='authenticated_confirmation')
+        after = self.req(path)
+        self.assertEqual(Decimal(after['efectivo_caja']), Decimal('600.00'))
+        self.assertEqual(Decimal(after['reserva_capital']), Decimal('4400.00'))
+        self.assertEqual(Decimal(after['aportes_netos']), Decimal('5000.00'))
+        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('5000.00'))
+
+    def test_finance_report_uses_physical_count_for_unresolved_shortfall(self):
+        """A disputed closing difference must not be silently shown as actual cash."""
+        from app.services.cash_service import today
+
+        self.open_for('cashier', '900')
+        pending = self.cmd('close', headers=self.roles['cashier'],
+                           version=2, target_id=self.users['manager']['id'],
+                           denominations={'500': 1, '200': 1},
+                           notes='Awaiting shortfall resolution')
+        self.assertEqual(pending['state'], 'closing_review')
+        report = self.req(f'/reports/finance?start={today()}&end={today()}')
+        self.assertEqual(Decimal(report['efectivo_caja']), Decimal('700.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('4100.00'))
+
     def test_composed_transfer_is_pending_and_preserves_exact_amount(self):
         """A bank transfer with explicit split components does not credit the loan early."""
         loan = self.composed_loan
