@@ -1,5 +1,6 @@
 """Acceptance tests for independent custody and mandatory capital transfer."""
 
+import base64
 import unittest
 import uuid
 from decimal import Decimal
@@ -52,6 +53,34 @@ class CashRefactorTests(unittest.TestCase):
 
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
+
+    def test_composed_transfer_is_pending_and_preserves_exact_amount(self):
+        """A bank transfer with explicit split components does not credit the loan early."""
+        customer = self.create_customer(self.admin)
+        loan = self.create_loan(self.admin, customer['id'])
+        account = self.req('/bank-accounts', dict(
+            bank_name='Banco QA', account_number='1234567890',
+            account_holder='Empresa QA',
+        ), code=201)
+        body = dict(
+            loan_id=loan['id'], installment_amount='200.00',
+            principal_amount='50.00', interest_amount='0.00',
+            custom_amount='0.00', method='transfer', origin='field',
+            branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+            reference_code='COMP-QA', bank_account_id=account['id'],
+            proof=dict(filename='test.pdf', media_type='application/pdf',
+                       content_base64=base64.b64encode(b'%PDF-1.4 test proof').decode()),
+        )
+        pending = self.req('/payments', body, code=201)
+        self.assertEqual(pending['status'], 'pending')
+        self.assertEqual(Decimal(pending['amount']), Decimal('250.00'))
+        self.assertEqual(self.req('/payments'), [])
+        # Replaying the same request must not create another transfer.
+        self.assertEqual(self.req('/payments', body, code=201), pending)
+        self.cmd('confirm_transfer', target_id=pending['transfer_id'], version=1)
+        payments = self.req('/payments')
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(Decimal(payments[0]['amount']), Decimal('250.00'))
 
     def test_opening_is_independent_and_moves_capital_once(self):
         result = self.open_for(amount='0')
