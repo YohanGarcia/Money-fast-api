@@ -12,6 +12,7 @@ class PaymentCreate(BaseModel):
     method: Literal['cash','transfer'] | None = None
     origin: Literal['field','counter'] | None = None
     branch_id: int | None = None
+    session_id: int | None = Field(default=None, gt=0)
     idempotency_key: str | None = Field(default=None, min_length=12, max_length=80)
     bank_account_id: int | None = None
     bank_destination: str | None = Field(default=None, max_length=160)
