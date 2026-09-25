@@ -26,6 +26,22 @@ def balance(db, company_id) -> Decimal:
     return Decimal(plus) - Decimal(minus)
 
 
+
+def net_owner_contributions(db, company_id) -> Decimal:
+    """Net injections less owner withdrawals, NOT audited accounting equity.
+
+    Ordinary custody transfers between Capital and cashier sessions are
+    deliberately excluded, as are loan collections and expenses.
+    """
+    injected = db.scalar(select(func.coalesce(func.sum(CapitalMovement.amount), 0)).where(
+        CapitalMovement.company_id == company_id, CapitalMovement.kind == "injection"
+    )) or ZERO
+    withdrawn = db.scalar(select(func.coalesce(func.sum(CapitalMovement.amount), 0)).where(
+        CapitalMovement.company_id == company_id, CapitalMovement.kind == "withdrawal"
+    )) or ZERO
+    return Decimal(injected) - Decimal(withdrawn)
+
+
 def record(db, company_id, actor_id, kind, amount, notes="", cash_movement_id=None) -> CapitalMovement:
     if kind not in KINDS:
         raise HTTPException(422, "Tipo de movimiento de capital inválido.")
