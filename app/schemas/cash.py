@@ -24,6 +24,8 @@ class CashCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['open','confirm_opening','movement','declare','receive','receive_collector','reject_delivery','close','resolve','confirm_closing_transfer','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','confirm_surplus','reject_surplus']
     branch_id: int | None = None
+    session_id: int | None = Field(default=None, gt=0)
+    receiver_id: int | None = Field(default=None, gt=0)
     idempotency_key: str = Field(min_length=12, max_length=80)
     version: int | None = None
     transfer_version: int | None = None
