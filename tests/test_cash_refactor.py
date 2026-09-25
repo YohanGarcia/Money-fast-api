@@ -37,7 +37,8 @@ class CashRefactorTests(unittest.TestCase):
             self.roles[role] = self.auth_headers(self.login(email, 'workerpass123')['access_token'])
         # This test needs an existing loan before activating Caja; POST /loans
         # intentionally rejects legacy disbursements after activation.
-        if self._testMethodName == 'test_composed_transfer_is_pending_and_preserves_exact_amount':
+        if self._testMethodName in ('test_composed_transfer_is_pending_and_preserves_exact_amount',
+                                    'test_admin_counter_payment_requires_selected_session'):
             customer = self.create_customer(self.admin)
             self.composed_loan = self.create_loan(self.admin, customer['id'])
         self.req('/cash/setup', dict(branch_id=self.branch, initial_balance='0', notes='Configuración histórica'), code=200)
@@ -85,6 +86,77 @@ class CashRefactorTests(unittest.TestCase):
         payments = self.req('/payments')
         self.assertEqual(len(payments), 1)
         self.assertEqual(Decimal(payments[0]['amount']), Decimal('250.00'))
+
+    def test_admin_must_choose_cashier_session_when_two_are_open(self):
+        """Admin movements must never silently target the newest cashier."""
+        first = self.open_for('cashier', '800')
+        second = self.open_for('cashier2', '600')
+        # Both newly opened sessions are at version 2, so optimistic version
+        # validation alone cannot distinguish them.
+        self.cmd('movement', kind='expense', amount='100', notes='QA expense',
+                 version=2, code=409)
+        self.cmd('movement', kind='expense', amount='100', notes='QA expense',
+                 version=2, session_id=first['session_id'])
+        with SessionLocal() as db:
+            first_row = db.get(CashSession, first['session_id'])
+            second_row = db.get(CashSession, second['session_id'])
+            self.assertEqual(first_row.balance, Decimal('700.00'))
+            self.assertEqual(second_row.balance, Decimal('600.00'))
+
+    def test_admin_counter_payment_requires_selected_session(self):
+        """Even counter payments cannot enter the wrong cashier's cash balance."""
+        first = self.open_for('cashier', '800')
+        second = self.open_for('cashier2', '600')
+        request = dict(
+            loan_id=self.composed_loan['id'], payment_type='interest_only',
+            amount='100.00', method='cash', origin='counter',
+            branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+        )
+        self.req('/payments', request, code=409)
+        request['idempotency_key'] = str(uuid.uuid4())
+        request['session_id'] = first['session_id']
+        confirmed = self.req('/payments', request, code=201)
+        with SessionLocal() as db:
+            first_row = db.get(CashSession, first['session_id'])
+            second_row = db.get(CashSession, second['session_id'])
+            self.assertEqual(first_row.balance, Decimal('900.00'))
+            self.assertEqual(second_row.balance, Decimal('600.00'))
+            movement = db.query(CashMovement).filter(
+                CashMovement.payment_id == confirmed['id'],
+            ).one()
+            self.assertEqual(movement.session_id, first['session_id'])
+
+    def test_cashier_cannot_select_another_cashiers_session(self):
+        first = self.open_for('cashier', '800')
+        second = self.open_for('cashier2', '600')
+        self.cmd('movement', headers=self.roles['cashier'], kind='expense',
+                 amount='100', notes='Invalid cross-custody', version=2,
+                 session_id=second['session_id'], code=409)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(CashSession, first['session_id']).balance, Decimal('800.00'))
+            self.assertEqual(db.get(CashSession, second['session_id']).balance, Decimal('600.00'))
+
+    def test_resolving_shortfall_uses_explicit_physical_receiver(self):
+        opened = self.open_for('cashier', '900')
+        session_id = opened['session_id']
+        pending = self.cmd('close', headers=self.roles['cashier'],
+                           target_id=self.users['manager']['id'], version=2,
+                           denominations={'500': 1, '200': 1},
+                           notes='Shortfall under review')
+        self.assertEqual(pending['state'], 'closing_review')
+        with SessionLocal() as db:
+            version = db.get(CashSession, session_id).version
+        resolved = self.cmd('resolve', target_id=session_id, version=version,
+                            resolution='approve', receiver_id=self.users['manager']['id'],
+                            notes='Authorized shortfall')
+        self.assertEqual(resolved['state'], 'closing_transfer_pending')
+        with SessionLocal() as db:
+            transfer = db.query(CashCustodyTransfer).filter(
+                CashCustodyTransfer.session_id == session_id,
+                CashCustodyTransfer.kind == 'closing_capital',
+            ).one()
+            self.assertEqual(transfer.to_user_id, self.users['manager']['id'])
+            self.assertEqual(transfer.amount, Decimal('700.00'))
 
     def test_opening_is_independent_and_moves_capital_once(self):
         result = self.open_for(amount='0')
