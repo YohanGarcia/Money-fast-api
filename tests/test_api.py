@@ -1,9 +1,10 @@
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
-temp_db = Path(tempfile.gettempdir()) / "moneyfast_test_suite.db"
+temp_db = Path(tempfile.gettempdir()) / f"moneyfast_test_suite_{os.getpid()}.db"
 if temp_db.exists():
     temp_db.unlink()
 
@@ -91,10 +92,42 @@ class MoneyFastApiTests(unittest.TestCase):
         data = self.login()
         return self.auth_headers(data["access_token"])
 
+    def create_test_branch(self, headers: dict[str, str]) -> int:
+        response = self.client.post(
+            "/api/v1/branches",
+            json={
+                "name": "Central de pruebas",
+                "address": "Calle de pruebas 1",
+                "manager_name": "Gerente QA",
+                "notary_name": "Notario QA",
+                "phone": "8095555555",
+            },
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["id"]
+
+    def activate_cash_for_payments(self, headers: dict[str, str], branch_id: int | None = None) -> int:
+        """Set up and activate a test cash box only in tests that explicitly register payments."""
+        branch_id = branch_id or self.create_test_branch(headers)
+        response = self.client.post(
+            "/api/v1/cash/setup",
+            json={"branch_id": branch_id, "initial_balance": "0", "notes": "Caja de pruebas"},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/api/v1/cash/activate", json={}, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        return branch_id
+
     def create_user(self, headers: dict, email: str, role: str, name: str = "Empleado Uno") -> dict:
+        payload = {"full_name": name, "email": email, "password": "workerpass123", "role": role}
+        branch_id = getattr(self, "test_user_branch_id", None)
+        if branch_id is not None:
+            payload["branch_id"] = branch_id
         response = self.client.post(
             "/api/v1/users",
-            json={"full_name": name, "email": email, "password": "workerpass123", "role": role},
+            json=payload,
             headers=headers,
         )
         self.assertEqual(response.status_code, 201, response.text)
@@ -305,6 +338,7 @@ class MoneyFastApiTests(unittest.TestCase):
         headers = self.owner_session()
         customer = self.create_customer(headers)
         loan = self.create_loan(headers, customer["id"])
+        branch_id = self.activate_cash_for_payments(headers)
         self.assertEqual(loan["status"], "active")
 
         payment_response = self.client.post(
@@ -316,6 +350,10 @@ class MoneyFastApiTests(unittest.TestCase):
                 "interest_amount": "50.00",
                 "custom_amount": "0.00",
                 "notes": "Cobro mixto",
+                "method": "cash",
+                "origin": "field",
+                "branch_id": branch_id,
+                "idempotency_key": str(uuid.uuid4()),
             },
             headers=headers,
         )
@@ -335,9 +373,12 @@ class MoneyFastApiTests(unittest.TestCase):
         customer = self.create_customer(headers)
         loan = self.create_loan(headers, customer["id"])
 
+        branch_id = self.activate_cash_for_payments(headers)
         response = self.client.post(
             "/api/v1/payments",
-            json={"loan_id": loan["id"], "payment_type": "interest_only", "amount": "500.00"},
+            json={"loan_id": loan["id"], "payment_type": "interest_only", "amount": "500.00",
+                  "method": "cash", "origin": "field", "branch_id": branch_id,
+                  "idempotency_key": str(uuid.uuid4())},
             headers=headers,
         )
         self.assertEqual(response.status_code, 201, response.text)
@@ -354,9 +395,12 @@ class MoneyFastApiTests(unittest.TestCase):
         customer = self.create_customer(headers)
         loan = self.create_loan(headers, customer["id"])
 
+        branch_id = self.activate_cash_for_payments(headers)
         response = self.client.post(
             "/api/v1/payments",
-            json={"loan_id": loan["id"], "payment_type": "principal_only", "amount": "1000.00"},
+            json={"loan_id": loan["id"], "payment_type": "principal_only", "amount": "1000.00",
+                  "method": "cash", "origin": "field", "branch_id": branch_id,
+                  "idempotency_key": str(uuid.uuid4())},
             headers=headers,
         )
         self.assertEqual(response.status_code, 201, response.text)
@@ -383,6 +427,7 @@ class MoneyFastApiTests(unittest.TestCase):
     # ── collector (asesor) scoping ─────────────────────────────────────────
     def test_collector_only_sees_assigned_portfolio(self) -> None:
         headers = self.owner_session()
+        self.test_user_branch_id = self.create_test_branch(headers)
         col1 = self.create_user(headers, "col1@example.com", "collector", "Cobrador Uno")
         col2 = self.create_user(headers, "col2@example.com", "collector", "Cobrador Dos")
 
@@ -390,6 +435,7 @@ class MoneyFastApiTests(unittest.TestCase):
         cust2 = self.create_customer(headers, "Cliente Dos", collector_id=col2["id"])
         loan1 = self.create_loan(headers, cust1["id"])
         loan2 = self.create_loan(headers, cust2["id"])
+        self.activate_cash_for_payments(headers, self.test_user_branch_id)
 
         col1_headers = self.auth_headers(self.login("col1@example.com", "workerpass123")["access_token"])
 
@@ -408,7 +454,9 @@ class MoneyFastApiTests(unittest.TestCase):
         # Collector 1 can pay their own loan.
         ok = self.client.post(
             "/api/v1/payments",
-            json={"loan_id": loan1["id"], "payment_type": "interest_only", "amount": "100.00"},
+            json={"loan_id": loan1["id"], "payment_type": "interest_only", "amount": "100.00",
+                  "method": "cash", "origin": "field", "branch_id": self.test_user_branch_id,
+                  "idempotency_key": str(uuid.uuid4())},
             headers=col1_headers,
         )
         self.assertEqual(ok.status_code, 201, ok.text)
@@ -416,7 +464,9 @@ class MoneyFastApiTests(unittest.TestCase):
         # ...but cannot pay collector 2's loan.
         denied = self.client.post(
             "/api/v1/payments",
-            json={"loan_id": loan2["id"], "payment_type": "interest_only", "amount": "100.00"},
+            json={"loan_id": loan2["id"], "payment_type": "interest_only", "amount": "100.00",
+                  "method": "cash", "origin": "field", "branch_id": self.test_user_branch_id,
+                  "idempotency_key": str(uuid.uuid4())},
             headers=col1_headers,
         )
         self.assertEqual(denied.status_code, 404, denied.text)

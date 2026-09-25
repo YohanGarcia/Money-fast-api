@@ -209,13 +209,18 @@ def register_payment(db,user,payload):
     loan=db.get(Loan,payload.loan_id)
     if not loan: fail('Préstamo no encontrado.',404)
     ensure_customer(db,user,loan,box)
-    if payload.amount is None: fail('Actualiza la app: registra un importe explícito.')
+    # An explicit component breakdown is also an exact amount: preserve composed payments.
+    payment_amount = payload.amount if payload.amount is not None else (
+        payload.installment_amount + payload.principal_amount + payload.interest_amount + payload.custom_amount
+    )
+    if payment_amount <= ZERO or payment_amount > Decimal('9999999999.99'):
+        fail('El importe total debe ser positivo y no superar el límite monetario.')
     session=active_session(db,box,cashier_id=user.id if user.role=='cashier' else None) if payload.origin=='counter' else None
     if payload.method=='transfer':
         if not payload.reference_code or not payload.bank_account_id or not payload.proof: fail('La transferencia requiere referencia, cuenta bancaria de destino y comprobante.')
         account=db.get(BankAccount,payload.bank_account_id)
         if not account or account.company_id!=user.company_id or not account.is_active: fail('Selecciona una cuenta bancaria activa de la empresa.')
-        row=CashTransfer(box_id=box.id,collector_id=user.id,loan_id=loan.id,amount=payload.amount,reference=payload.reference_code,destination=account.label,bank_account_id=account.id,proof=payload.proof.model_dump(),payload=payload.model_dump(mode='json'))
+        row=CashTransfer(box_id=box.id,collector_id=user.id,loan_id=loan.id,amount=payment_amount,reference=payload.reference_code,destination=account.label,bank_account_id=account.id,proof=payload.proof.model_dump(),payload=payload.model_dump(mode='json'))
         db.add(row);db.flush()
         result=dict(transfer_id=row.id,status='pending',amount=str(row.amount),message='Transferencia pendiente de confirmación; aún no abona al préstamo.')
     else:
