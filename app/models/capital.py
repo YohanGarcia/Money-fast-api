@@ -3,7 +3,7 @@ and transfers to/from Caja. All amounts RD$."""
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -11,6 +11,7 @@ from app.core.database import Base
 
 class CapitalMovement(Base):
     __tablename__ = "capital_movements"
+    __table_args__ = (UniqueConstraint("cash_movement_id", name="uq_capital_movements_cash_movement_id"),)
 
     # injection / from_cash add to the reserve; withdrawal / to_cash subtract from it.
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -20,5 +21,5 @@ class CapitalMovement(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     # A physical custody movement can have at most one corresponding capital entry.
-    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"), unique=True)
+    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
