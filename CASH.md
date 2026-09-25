@@ -59,3 +59,6 @@ El transporte actual de eventos es en memoria y requiere **un único proceso/wor
 
 La sección Entregas permite seleccionar un cobrador, revisar sus cobros pendientes y recibir efectivo directamente con receive_collector. Si hay entregas declaradas pendientes, se exige recibirlas primero. La recepción directa valida sucursal, jornada, versión e idempotencia, distribuye el efectivo a los cobros más antiguos y no vuelve a abonar al préstamo. Una recepción parcial exige motivo y conserva el resto pendiente.
 
+
+## Selección de jornada con varios cajeros
+Cuando hay varias jornadas abiertas en una misma sucursal, un administrador debe enviar `session_id` en los comandos que operan efectivo y en los pagos de ventanilla. Si omite el identificador, la API devuelve 409 en lugar de elegir la última jornada arbitrariamente. Los cajeros solo pueden seleccionar su propia jornada; el administrador puede operar sin `session_id` cuando existe una única jornada abierta. Para resolver un cierre con diferencia, `target_id` identifica la jornada y `receiver_id` identifica por separado al responsable de recibir físicamente el efectivo.
