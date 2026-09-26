@@ -37,10 +37,39 @@ class CashSession(Base):
     denominations: Mapped[dict] = mapped_column(JSON, default=dict)
     notes: Mapped[str] = mapped_column(Text, default='')
     opened_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    cashier_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', name='fk_cash_sessions_cashier_id'), nullable=True, index=True)
     closed_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     resolved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(default=1)
+
+
+class CashCustodyTransfer(Base):
+    """Physical custody handover, distinct from loan-bank transfers."""
+    __tablename__ = 'cash_custody_transfers'
+    __table_args__ = (UniqueConstraint('acceptance_id'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey('companies.id'), index=True)
+    box_id: Mapped[int] = mapped_column(ForeignKey('cash_boxes.id'), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey('cash_sessions.id'), index=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    from_user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    to_user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    state: Mapped[str] = mapped_column(String(30), default='pending')
+    acceptance_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    acceptance_method: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    accepted_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Link identifiers are intentionally application-level links: adding database
+    # FKs in both directions would create a cyclic dependency between the three
+    # ledger tables and complicate portable SQLite/PostgreSQL migrations.
+    cash_movement_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    capital_movement_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    notes: Mapped[str] = mapped_column(Text, default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     version: Mapped[int] = mapped_column(default=1)
 
 class CashDelivery(Base):
@@ -79,6 +108,7 @@ class CashMovement(Base):
     payment_id: Mapped[int | None] = mapped_column(ForeignKey('payments.id'))
     loan_id: Mapped[int | None] = mapped_column(ForeignKey('loans.id'))
     delivery_id: Mapped[int | None] = mapped_column(ForeignKey('cash_deliveries.id'))
+    custody_transfer_id: Mapped[int | None] = mapped_column(ForeignKey('cash_custody_transfers.id', name='fk_cash_movements_custody_transfer_id'), nullable=True)
     reverses_id: Mapped[int | None] = mapped_column(ForeignKey('cash_movements.id'), unique=True)
     notes: Mapped[str] = mapped_column(Text)
     reference: Mapped[str] = mapped_column(String(160), default='')

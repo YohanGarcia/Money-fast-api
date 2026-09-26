@@ -1,43 +1,69 @@
-"""Prepare a database created before Alembic was enabled, then migrate it.
+"""Prepare a new or verified legacy MoneyFast database and migrate it.
 
-Early MoneyFast deployments used SQLAlchemy ``create_all`` and therefore have
-all their tables but no ``alembic_version`` row.  Stamping that database at
-the last pre-cash migration avoids recreating ``companies`` while still
-applying the additive route and customer-location migrations.
+The original Alembic root migration assumes tables created before Alembic
+existed. Do not run the historical migration chain on an empty database.
+
+Fresh database: create the *current* model schema, then stamp current head.
+Verified unversioned legacy database: retain the existing baseline migration.
+Versioned database: run pending Alembic migrations normally.
 """
 
 import sys
 from pathlib import Path
 
-# ``python scripts/prepare_database.py`` puts only ``scripts/`` on sys.path.
-# Add the project root so imports work in Railway and local Windows runs.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import app.models  # noqa: F401; register all tables before create_all
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
 
-from app.core.database import engine
+from app.core.database import Base, engine
 
 
 LEGACY_BASELINE = "e0f1a2b3c4d5"
+# The legacy baseline includes Caja, so a pre-Alembic database missing these
+# tables is NOT safely equivalent to that revision.
+LEGACY_REQUIRED_TABLES = {
+    "companies", "plans", "branches", "users", "customers", "loans",
+    "payments", "cash_boxes", "cash_sessions", "cash_movements",
+}
 
 
 def main() -> None:
     with engine.connect() as connection:
-        inspector = inspect(connection)
-        tables = set(inspector.get_table_names())
-        has_alembic_version = "alembic_version" in tables
-        has_existing_schema = "companies" in tables
+        tables = set(inspect(connection).get_table_names())
 
-    config = Config("alembic.ini")
-    if has_existing_schema and not has_alembic_version:
-        print(f"Existing schema detected; stamping legacy baseline {LEGACY_BASELINE}.")
+    config = Config(str(ROOT / "alembic.ini"))
+    if not tables:
+        print("Empty database detected; creating the current MoneyFast model schema.")
+        Base.metadata.create_all(bind=engine)
+        # The new schema was created from the models currently shipped with
+        # this release. Stamping records that fact; it does not replay history.
+        command.stamp(config, "head")
+        print("Fresh database initialized and stamped at the current Alembic head.")
+        return
+
+    if "alembic_version" not in tables:
+        missing = LEGACY_REQUIRED_TABLES - tables
+        if missing:
+            raise RuntimeError(
+                "An unversioned, partially initialized or unsupported legacy "
+                "database was detected. Refusing an unsafe Alembic stamp. "
+                "Missing expected baseline tables: " + ", ".join(sorted(missing))
+            )
+        print(f"Existing legacy schema detected; stamping baseline {LEGACY_BASELINE}.")
         command.stamp(config, LEGACY_BASELINE)
+    elif tables == {"alembic_version"}:
+        raise RuntimeError(
+            "Only alembic_version exists; database is incomplete. "
+            "Inspect and repair it before proceeding."
+        )
 
     command.upgrade(config, "head")
+    print("Database migrated to the current Alembic head.")
 
 
 if __name__ == "__main__":

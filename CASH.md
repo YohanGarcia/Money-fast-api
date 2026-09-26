@@ -6,9 +6,9 @@ Implementación en API, web (`/cash`) y Expo (`Mi jornada`). Moneda RD$; zona ho
 
 1. Ejecutar `alembic upgrade head` con respaldo previo.
 2. Crear las sucursales en Configuración y asignar sucursal a todos los cobradores y cajeros activos.
-3. En Caja, configurar el saldo inicial de cada sucursal activa. Es dinero físico verificado, no la suma de pagos históricos.
+3. En Caja, configurar la sucursal. El saldo inicial histórico se conserva por compatibilidad, pero no determina la apertura de una jornada.
 4. Habilitar Caja. Desde ese momento los cobros necesitan medio, origen, sucursal y clave de idempotencia. Las aplicaciones antiguas reciben un mensaje de actualización.
-5. Abrir la jornada con el efectivo contado. Una diferencia requiere resolución del administrador.
+5. El encargado entrega el fondo desde Capital y el cajero confirma la recepción mediante aceptación autenticada. La apertura es independiente del cierre anterior y admite cero.
 
 Los pagos anteriores permanecen históricos y no generan automáticamente deuda del cobrador. El Cajero cuenta como usuario del plan y trabaja desde la web. Gerencia consulta su sucursal; cobradores consultan y declaran sus propias entregas en Expo.
 
@@ -19,7 +19,7 @@ Los pagos anteriores permanecen históricos y no generan automáticamente deuda 
 - Recepción: Caja confirma el importe contado y distribuye la entrega entre los cobros más antiguos, incluso parcialmente. El faltante sigue pendiente y exige motivo.
 - Ventanilla: abona al préstamo e ingresa a la jornada abierta en una transacción.
 - Transferencia: requiere referencia, destino y PDF/JPG/PNG de hasta 5 MB. Solo la confirmación de Caja aplica el abono; no modifica efectivo físico.
-- Cuadre: apertura + entradas − salidas. Un cierre exacto es inmediato; con diferencia queda bloqueado para revisión del administrador. Los pendientes del cobrador se arrastran aparte.
+- Cuadre: apertura + entradas − salidas. Un cierre exacto o una diferencia autorizada pasa a `closing_transfer_pending`; el encargado receptor confirma físicamente la entrega del 100 % del efectivo cuadrado a Capital. Solo entonces la jornada queda `closed`. Los pendientes del cobrador se arrastran aparte.
 - Desembolso: la solicitud debe estar firmada y vinculada. Préstamo, cuotas, transición y movimiento se guardan juntos. El desembolso bancario registra un movimiento de efectivo cero; su importe está en el préstamo vinculado y en la auditoría de la solicitud. Ambos medios se operan dentro de una jornada abierta.
 
 ## Correcciones y trazabilidad
@@ -33,6 +33,12 @@ El historial admite fecha inclusiva local, día, semana desde lunes, mes, sucurs
 ## Transacciones
 
 Las escrituras de Caja bloquean su fila de sucursal antes de consultar saldos. Versiones evitan sobrescritura de jornadas, entregas, transferencias y solicitudes. Las claves de idempotencia se conservan para reintentos; reutilizar una clave con otro contenido produce 409. Cualquier fallo revierte también cuotas y aplicaciones de entrega. Un importe mayor al saldo aplicable se rechaza sin cambios parciales.
+
+La transferencia física de cierre se registra en `CashCustodyTransfer`, separada del asiento de Capital. El asiento `from_cash` se crea una sola vez y queda vinculado al movimiento de custodia; un fallo deja la jornada pendiente, sin cierre parcial ni asiento financiero.
+
+## Tesorería y capital
+
+El saldo de Capital es la reserva contable disponible fuera de las cajas. El saldo de una jornada es efectivo físico bajo custodia del cajero. La entrega de apertura registra `to_cash` y reduce Capital; la entrega total de cierre registra `from_cash` y aumenta Capital. Ninguna de estas transferencias crea un pago de préstamo ni ingresos financieros.
 
 ## Validación
 
@@ -53,3 +59,9 @@ El transporte actual de eventos es en memoria y requiere **un único proceso/wor
 
 La sección Entregas permite seleccionar un cobrador, revisar sus cobros pendientes y recibir efectivo directamente con receive_collector. Si hay entregas declaradas pendientes, se exige recibirlas primero. La recepción directa valida sucursal, jornada, versión e idempotencia, distribuye el efectivo a los cobros más antiguos y no vuelve a abonar al préstamo. Una recepción parcial exige motivo y conserva el resto pendiente.
 
+
+## Selección de jornada con varios cajeros
+Cuando hay varias jornadas abiertas en una misma sucursal, un administrador debe enviar `session_id` en los comandos que operan efectivo y en los pagos de ventanilla. Si omite el identificador, la API devuelve 409 en lugar de elegir la última jornada arbitrariamente. Los cajeros solo pueden seleccionar su propia jornada; el administrador puede operar sin `session_id` cuando existe una única jornada abierta. Para resolver un cierre con diferencia, `target_id` identifica la jornada y `receiver_id` identifica por separado al responsable de recibir físicamente el efectivo.
+
+## Reportes financieros: custodia y Capital
+El reporte de finanzas suma el dinero de **todas** las jornadas individuales abiertas o pendientes de resolución/transferencia. En los cierres pendientes usa el conteo físico registrado. Excluye aperturas todavía no aceptadas y jornadas ya cerradas, para evitar contabilizar simultáneamente efectivo en Caja y la misma transferencia recibida en Capital. `reserva_capital` es la reserva operativa central; no debe interpretarse como patrimonio neto ni beneficio contable. `aportes_netos` muestra solo inyecciones menos retiros directos, sin incluir traspasos internos. El campo histórico `ganancia_cobrada` continúa siendo ingresos financieros **brutos** por interés y mora, sin descontar nómina ni otros gastos.

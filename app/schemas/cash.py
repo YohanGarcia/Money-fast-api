@@ -22,10 +22,13 @@ class Proof(BaseModel):
 
 class CashCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['open','movement','declare','receive','receive_collector','reject_delivery','close','resolve','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','confirm_surplus','reject_surplus']
+    action: Literal['open','confirm_opening','movement','declare','receive','receive_collector','reject_delivery','close','resolve','confirm_closing_transfer','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','confirm_surplus','reject_surplus']
     branch_id: int | None = None
+    session_id: int | None = Field(default=None, gt=0)
+    receiver_id: int | None = Field(default=None, gt=0)
     idempotency_key: str = Field(min_length=12, max_length=80)
     version: int | None = None
+    transfer_version: int | None = None
     target_id: int | None = None
     amount: Decimal = Field(default=Decimal('0'), ge=0, max_digits=12, decimal_places=2)
     notes: str = Field(default='', max_length=2000)
@@ -37,6 +40,8 @@ class CashCommand(BaseModel):
     method: Literal['cash','transfer','check'] = 'cash'
     proof: Proof | None = None
     first_payment_date: date | None = None
+    acceptance_id: str | None = Field(default=None, min_length=12, max_length=80)
+    acceptance_method: Literal['authenticated_confirmation'] | None = None
 
 class CashSetup(BaseModel):
     branch_id: int

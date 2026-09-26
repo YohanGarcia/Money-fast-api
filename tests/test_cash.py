@@ -10,7 +10,7 @@ from zipfile import ZipFile
 from tests import test_api as legacy
 from app.core.database import SessionLocal
 from app.models.payment import Payment
-from app.models.cash import CashMovement
+from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.services.cash_service import today
 
 class CashTests(unittest.TestCase):
@@ -52,7 +52,22 @@ class CashTests(unittest.TestCase):
     def payment(self,amount='1000',method='cash',origin='field',headers=None,code=201,**extra):
         body=dict(loan_id=self.loan['id'],payment_type='custom',amount=amount,method=method,origin=origin,branch_id=self.branch,idempotency_key=str(uuid.uuid4()),**extra)
         return self.req('/payments',body,headers or self.roles['collector'],code)
-    def open(self,amount='1000'):return self.cmd('open',amount=amount,notes='Conteo inicial')
+    def _finish_pending_close(self):
+        with SessionLocal() as db:
+            transfer=db.query(CashCustodyTransfer).filter(CashCustodyTransfer.kind=='closing_capital', CashCustodyTransfer.state=='pending').order_by(CashCustodyTransfer.id.desc()).first()
+            if not transfer:
+                return
+            session=db.get(CashSession,transfer.session_id)
+            session_version=session.version
+            transfer_version=transfer.version
+        self.cmd('confirm_closing_transfer',headers=self.admin,target_id=transfer.id,version=session_version,transfer_version=transfer_version,acceptance_id='legacy-close-'+uuid.uuid4().hex,acceptance_method='authenticated_confirmation',notes='Recepción administrativa de cierre')
+
+    def open(self,amount='1000'):
+        self._finish_pending_close()
+        if Decimal(amount)>0:
+            self.req('/capital/movements',dict(kind='injection',amount=amount,notes='Fondo de prueba'),code=200)
+        created=self.cmd('open',target_id=self.users['cashier']['id'],amount=amount,notes='Conteo inicial')
+        return self.cmd('confirm_opening',headers=self.roles['cashier'],target_id=created['session_id'],version=1,transfer_version=1,amount=amount,acceptance_id='legacy-open-'+uuid.uuid4().hex,acceptance_method='authenticated_confirmation',notes='Recibido conforme')
     def delivery(self,amount='1000'):
         return self.cmd('declare',headers=self.roles['collector'],amount=amount)['delivery_id']
     def receive(self,did,amount='600'):
@@ -111,10 +126,10 @@ class CashTests(unittest.TestCase):
         self.assertEqual(self.workspace()['sessions'][0]['snapshot'],saved)
         self.open('500');self.assertEqual(Decimal(self.workspace()['session']['balance']),500)
 
-    def test_opening_difference_and_correct_totals(self):
-        self.open('900');s=self.workspace()['session'];self.assertEqual(s['state'],'opening_review')
-        self.cmd('resolve',target_id=s['id'],version=s['version'],amount='900',resolution='approve',notes='Apertura ajustada')
-        s=self.workspace()['session'];self.cmd('close',version=s['version'],denominations={'500':1,'200':2})
+    def test_opening_is_independent_and_totals_remain_consistent(self):
+        self.open('900');s=self.workspace()['session'];self.assertEqual(s['state'],'open');self.assertEqual(Decimal(s['opening_expected']),Decimal('0'))
+        self.cmd('close',version=s['version'],denominations={'500':1,'200':2},notes='Conteo exacto')
+        self._finish_pending_close()
         snap=self.workspace()['sessions'][0]['snapshot']
         self.assertEqual(Decimal(snap['opening'])+Decimal(snap['incoming'])-Decimal(snap['outgoing']),Decimal(snap['expected']))
 

@@ -18,6 +18,7 @@ from app.models.loan import Loan
 from app.models.payment import Payment
 from app.models.loan_application import LoanApplication
 from app.models.bank_account import BankAccount
+from app.models.company import Company
 from app.models.cash import *
 from app.schemas.cash import CashCommand, CashSetup
 from app.services import cash_service as svc
@@ -80,7 +81,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         result=public(row)
         if isinstance(row,CashMovement) and row.kind=='bank_disbursement' and row.loan_id:
             result['bank_amount']=str(db.get(Loan,row.loan_id).principal_amount)
-        for k in ('collector_id','cashier_id','actor_id','opened_by','closed_by','reviewed_by'):
+        for k in ('collector_id','cashier_id','actor_id','opened_by','closed_by','reviewed_by','from_user_id','to_user_id','accepted_by'):
             uid=result.get(k)
             if uid: result[k+'_name']=users[uid].full_name if uid in users else 'Usuario histórico'
         return result
@@ -104,16 +105,24 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         collectors=[dict(id=uid,name=users[uid].full_name,pending=str(amount)) for uid,amount in totals.items()],
         outstanding=[dict(payment_id=p.id,collector_id=p.collected_by_id,loan_id=p.loan_id,paid_at=p.paid_at,amount=str(p.amount),pending=str(amount)) for p,amount in outstanding])
     if not mine:
-        session=svc.active_session(db,box,False)
+        session=svc.active_session(db,box,False,user.id if user.role=='cashier' else None)
         sessions=db.scalars(select(CashSession).where(CashSession.box_id==box.id).order_by(CashSession.id.desc())).all()
         movements=db.scalars(select(CashMovement).where(CashMovement.box_id==box.id).order_by(CashMovement.id.desc())).all()
+        custody_transfers=db.scalars(select(CashCustodyTransfer).where(CashCustodyTransfer.box_id==box.id).order_by(CashCustodyTransfer.id.desc())).all()
+        if user.role == 'cashier':
+            sessions=[s for s in sessions if s.cashier_id==user.id]
+            session_ids={s.id for s in sessions}
+            movements=[m for m in movements if m.session_id in session_ids]
+            custody_transfers=[t for t in custody_transfers if t.to_user_id==user.id or t.from_user_id==user.id]
         last=sessions[0] if sessions else None
         historical_users={m.actor_id for m in movements}|{d.collector_id for d in deliveries}|{d.cashier_id for d in deliveries}
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
-        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],
-          expected_opening=str(last.counted if last and last.state=='closed' else box.initial_balance),
+        data.update(users=branch_users,loans=loans,session=enrich(session) if session and (user.role!='cashier' or session.cashier_id==user.id) else None,sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
+          # The next opening is independent. This field is retained for API compatibility,
+          # but is informational only and never becomes an opening obligation.
+          expected_opening='0.00',
           audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
         data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
@@ -180,6 +189,17 @@ def receipt(delivery_id:int,branch_id:int|None=None,db:Session=Depends(get_db),u
     if d.state not in ('confirmed','reversed','surplus_confirmed'):svc.fail('Entrega aún no confirmada.')
     fields={'Sucursal':db.get(Branch,box.branch_id).name,'Cobrador':db.get(User,d.collector_id).full_name,'Cajero':db.get(User,d.cashier_id).full_name,'Fecha':d.confirmed_at.replace(tzinfo=UTC).astimezone(svc.TZ).isoformat(),'Declarado RD$':d.declared,'Recibido RD$':d.received,'Pendiente tras entrega RD$':d.remaining,'Estado':d.state,'Observación':d.notes}
     return {'html':'<html><head><meta charset="utf-8"><title>Comprobante de entrega</title></head><body><h1>Comprobante ENT-'+str(d.id)+'</h1>'+''.join('<p><b>'+escape(k)+': </b>'+escape(str(v))+'</p>' for k,v in fields.items())+'</body></html>'}
+
+
+@router.get('/custody-receipt/{transfer_id}')
+def custody_receipt(transfer_id:int,branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+    box=svc.scope(db,user,branch_id)
+    transfer=db.get(CashCustodyTransfer,transfer_id)
+    if not transfer or transfer.box_id!=box.id or transfer.state!='confirmed': svc.fail('Comprobante de custodia no encontrado.',404)
+    if user.role=='cashier' and user.id not in (transfer.from_user_id,transfer.to_user_id): svc.fail('Comprobante de custodia no encontrado.',404)
+    names={u.id:u.full_name for u in db.scalars(select(User).where(User.company_id==user.company_id)).all()}
+    fields={'Empresa':db.get(Company,user.company_id).name,'Sucursal':db.get(Branch,box.branch_id).name,'Jornada':transfer.session_id,'Tipo':transfer.kind,'Entrega':names.get(transfer.from_user_id,'Usuario histórico'),'Recepción':names.get(transfer.to_user_id,'Usuario histórico'),'Importe RD$':transfer.amount,'Aceptado por':names.get(transfer.accepted_by,'Usuario histórico'),'Fecha de aceptación':transfer.accepted_at,'Identificador de aceptación':transfer.acceptance_id,'Método':transfer.acceptance_method,'Observación':transfer.notes}
+    return {'html':'<html><head><meta charset="utf-8"><title>Comprobante de custodia</title></head><body><h1>Comprobante CUST-'+str(transfer.id)+'</h1>'+''.join('<p><b>'+escape(k)+': </b>'+escape(str(v))+'</p>' for k,v in fields.items())+'</body></html>'}
 
 @router.get('/proof/{kind}/{target_id}')
 def proof(kind:str,target_id:int,branch_id:int|None=None,inline:bool=False,db:Session=Depends(get_db),user:User=Depends(get_current_user)):

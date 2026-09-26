@@ -1,5 +1,10 @@
-"""Capital reserve = money the owner has put in the business that is neither in a
-cash box nor lent out. Balance is the running sum of the ledger."""
+"""Ledger for capital outside cash custody.
+
+``balance()`` is the capital reserve (capital contable disponible), not the
+physical cash held by any branch. Cash custody is represented by cash boxes,
+sessions and movements. A custody handover may create exactly one linked
+capital movement, but it never creates a loan payment or financial revenue.
+"""
 from decimal import Decimal
 
 from fastapi import HTTPException
@@ -19,6 +24,22 @@ def balance(db, company_id) -> Decimal:
     minus = db.scalar(select(func.coalesce(func.sum(CapitalMovement.amount), 0)).where(
         CapitalMovement.company_id == company_id, CapitalMovement.kind.in_(list(SUBTRACT)))) or ZERO
     return Decimal(plus) - Decimal(minus)
+
+
+
+def net_owner_contributions(db, company_id) -> Decimal:
+    """Net injections less owner withdrawals, NOT audited accounting equity.
+
+    Ordinary custody transfers between Capital and cashier sessions are
+    deliberately excluded, as are loan collections and expenses.
+    """
+    injected = db.scalar(select(func.coalesce(func.sum(CapitalMovement.amount), 0)).where(
+        CapitalMovement.company_id == company_id, CapitalMovement.kind == "injection"
+    )) or ZERO
+    withdrawn = db.scalar(select(func.coalesce(func.sum(CapitalMovement.amount), 0)).where(
+        CapitalMovement.company_id == company_id, CapitalMovement.kind == "withdrawal"
+    )) or ZERO
+    return Decimal(injected) - Decimal(withdrawn)
 
 
 def record(db, company_id, actor_id, kind, amount, notes="", cash_movement_id=None) -> CapitalMovement:
