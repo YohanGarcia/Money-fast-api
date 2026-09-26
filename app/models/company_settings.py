@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -24,6 +24,8 @@ class CompanySettings(Base):
     address_reference: Mapped[str] = mapped_column(String(255), default="", server_default="")
     phone: Mapped[str] = mapped_column(String(30), default="")
     currency_symbol: Mapped[str] = mapped_column(String(8), default="$")
+    # Controls whether opening funds are assigned and accepted digitally in MoneyFast.
+    digital_cash_opening_handover: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

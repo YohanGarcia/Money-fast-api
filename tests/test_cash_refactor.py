@@ -10,6 +10,7 @@ from tests import test_api as legacy
 from app.core.database import SessionLocal
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.models.capital import CapitalMovement
+from app.models.company_settings import CompanySettings
 
 
 class CashRefactorTests(unittest.TestCase):
@@ -59,6 +60,35 @@ class CashRefactorTests(unittest.TestCase):
 
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
+
+    def test_physical_opening_mode_skips_digital_handover(self):
+        """When digital handover is disabled, the cashier declares physical opening cash directly."""
+        # Ensure the singleton exists, then switch this company to physical opening mode.
+        self.req('/company-settings')
+        with SessionLocal() as db:
+            settings = db.query(CompanySettings).first()
+            settings.digital_cash_opening_handover = False
+            db.commit()
+        before_capital = Decimal(self.req('/capital')['balance'])
+        opened = self.cmd('open', headers=self.roles['cashier'], amount='1000', notes='Recibí RD$1,000 físicamente')
+        self.assertEqual(opened['state'], 'open')
+        self.assertEqual(opened['opening_mode'], 'physical_declared')
+        self.assertNotIn('transfer_id', opened)
+        with SessionLocal() as db:
+            session = db.get(CashSession, opened['session_id'])
+            self.assertEqual(session.balance, Decimal('1000.00'))
+            self.assertEqual(session.opening_counted, Decimal('1000.00'))
+            transfer = db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first()
+            self.assertIsNone(transfer)
+            opening_movement = db.query(CashMovement).filter(
+                CashMovement.session_id == session.id,
+                CashMovement.kind == 'opening_fund',
+            ).first()
+            self.assertIsNone(opening_movement)
+        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
+        workspace = self.workspace(headers=self.roles['cashier'])
+        self.assertFalse(workspace['digital_cash_opening_handover'])
+        self.assertEqual(Decimal(workspace['session']['balance']), Decimal('1000.00'))
 
     def test_finance_report_sums_each_cashier_and_excludes_confirmed_closes(self):
         """Cash moves from session to reserve once, without disappearing or doubling."""

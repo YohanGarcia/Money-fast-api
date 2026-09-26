@@ -287,28 +287,42 @@ def command(db,user,p):
     else: require_role(user,'admin','cashier')
     result={}
     if action=='open':
+        from app.models.company_settings import CompanySettings
+        settings = db.scalar(select(CompanySettings).where(CompanySettings.company_id == user.company_id))
+        digital_handover = settings.digital_cash_opening_handover if settings is not None else True
         cashier = user
         deliverer = user
-        if user.role == 'admin' and p.target_id:
+        if digital_handover:
+            if user.role == 'admin' and p.target_id:
+                candidate = db.get(User, p.target_id)
+                if candidate and candidate.role == 'cashier':
+                    cashier = candidate
+                    deliverer = user
+            elif user.role == 'cashier':
+                candidate = db.get(User, p.target_id) if p.target_id else None
+                if not candidate or candidate.role not in ('admin','manager') or not _same_company_branch(db, user, candidate, box.branch_id):
+                    fail('El cajero debe identificar al encargado que entrega el fondo.')
+                deliverer = candidate
+            if deliverer.id == cashier.id and user.role != 'admin':
+                fail('La entrega y la recepción deben quedar separadas.', 403)
+        elif user.role == 'admin' and p.target_id:
             candidate = db.get(User, p.target_id)
             if candidate and candidate.role == 'cashier':
                 cashier = candidate
-                deliverer = user
-        elif user.role == 'cashier':
-            candidate = db.get(User, p.target_id) if p.target_id else None
-            if not candidate or candidate.role not in ('admin','manager') or not _same_company_branch(db, user, candidate, box.branch_id):
-                fail('El cajero debe identificar al encargado que entrega el fondo.')
-            deliverer = candidate
         if not _same_company_branch(db, user, cashier, box.branch_id):
             fail('El cajero receptor no pertenece a la sucursal.', 403)
-        if deliverer.id == cashier.id and user.role != 'admin':
-            fail('La entrega y la recepción deben quedar separadas.', 403)
         if active_session(db,box,False,cashier_id=cashier.id):
             fail('Este cajero ya tiene una jornada abierta o pendiente de resolver.',409)
-        row=CashSession(box_id=box.id,business_date=today(),opening_expected=ZERO,opening_counted=p.amount,balance=ZERO,opened_by=user.id,cashier_id=cashier.id,state='opening_pending',notes=p.notes)
-        db.add(row);db.flush();result={'session_id':row.id,'state':row.state}
-        transfer=_custody_transfer(db,box=box,session=row,kind='opening_fund',from_user_id=deliverer.id,to_user_id=cashier.id,amount=p.amount,notes=p.notes)
-        result['transfer_id']=transfer.id
+        if not digital_handover:
+            row=CashSession(box_id=box.id,business_date=today(),opening_expected=p.amount,opening_counted=p.amount,balance=p.amount,opened_by=user.id,cashier_id=cashier.id,state='open',opened_at=now(),notes=p.notes)
+            db.add(row);db.flush()
+            audit(db,box,user,'physical_opening_declared',session_id=row.id,cashier_id=cashier.id,amount=p.amount,notes=p.notes)
+            result={'session_id':row.id,'state':row.state,'opening_mode':'physical_declared'}
+        else:
+            row=CashSession(box_id=box.id,business_date=today(),opening_expected=ZERO,opening_counted=p.amount,balance=ZERO,opened_by=user.id,cashier_id=cashier.id,state='opening_pending',notes=p.notes)
+            db.add(row);db.flush();result={'session_id':row.id,'state':row.state,'opening_mode':'digital_handover'}
+            transfer=_custody_transfer(db,box=box,session=row,kind='opening_fund',from_user_id=deliverer.id,to_user_id=cashier.id,amount=p.amount,notes=p.notes)
+            result['transfer_id']=transfer.id
     elif action=='confirm_opening':
         session=db.get(CashSession,p.target_id)
         if not session or session.box_id!=box.id or session.state!='opening_pending': fail('La apertura no está pendiente de confirmación.',409)

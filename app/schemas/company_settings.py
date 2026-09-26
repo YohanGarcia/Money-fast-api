@@ -10,6 +10,7 @@ class CompanySettingsUpdate(BaseModel):
     tax_id: str = Field(min_length=3, max_length=40)
     phone: str = Field(min_length=7, max_length=30)
     currency_symbol: str = Field(min_length=1, max_length=8)
+    digital_cash_opening_handover: bool = True
     # Structured address. ``address`` is composed server-side from these parts.
     province: str = Field(default="", max_length=60)
     municipality: str = Field(default="", max_length=80)
@@ -34,5 +35,6 @@ class CompanySettingsRead(BaseModel):
     address_reference: str = ""
     phone: str
     currency_symbol: str
+    digital_cash_opening_handover: bool = True
     id: int
     updated_at: datetime
