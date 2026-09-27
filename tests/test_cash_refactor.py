@@ -10,7 +10,6 @@ from tests import test_api as legacy
 from app.core.database import SessionLocal
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.models.capital import CapitalMovement
-from app.models.company_settings import CompanySettings
 
 
 class CashRefactorTests(unittest.TestCase):
@@ -55,40 +54,10 @@ class CashRefactorTests(unittest.TestCase):
         return self.req('/cash/commands', dict(action=action, branch_id=self.branch, idempotency_key=str(uuid.uuid4()), **fields), headers, code)
 
     def open_for(self, cashier='cashier', amount='1000'):
-        created = self.cmd('open', target_id=self.users[cashier]['id'], amount=amount, notes='Fondo entregado')
-        return self.cmd('confirm_opening', headers=self.roles[cashier], target_id=created['session_id'], version=1, transfer_version=1, amount=amount, acceptance_id='accept-' + uuid.uuid4().hex, acceptance_method='authenticated_confirmation', notes='Recibido conforme')
+        return self.cmd('open', target_id=self.users[cashier]['id'], amount=amount, notes='Fondo recibido físicamente')
 
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
-
-    def test_physical_opening_mode_skips_digital_handover(self):
-        """When digital handover is disabled, the cashier declares physical opening cash directly."""
-        # Ensure the singleton exists, then switch this company to physical opening mode.
-        self.req('/company-settings')
-        with SessionLocal() as db:
-            settings = db.query(CompanySettings).first()
-            settings.digital_cash_opening_handover = False
-            db.commit()
-        before_capital = Decimal(self.req('/capital')['balance'])
-        opened = self.cmd('open', headers=self.roles['cashier'], amount='1000', notes='Recibí RD$1,000 físicamente')
-        self.assertEqual(opened['state'], 'open')
-        self.assertEqual(opened['opening_mode'], 'physical_declared')
-        self.assertNotIn('transfer_id', opened)
-        with SessionLocal() as db:
-            session = db.get(CashSession, opened['session_id'])
-            self.assertEqual(session.balance, Decimal('1000.00'))
-            self.assertEqual(session.opening_counted, Decimal('1000.00'))
-            transfer = db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first()
-            self.assertIsNone(transfer)
-            opening_movement = db.query(CashMovement).filter(
-                CashMovement.session_id == session.id,
-                CashMovement.kind == 'opening_fund',
-            ).first()
-            self.assertIsNone(opening_movement)
-        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
-        workspace = self.workspace(headers=self.roles['cashier'])
-        self.assertFalse(workspace['digital_cash_opening_handover'])
-        self.assertEqual(Decimal(workspace['session']['balance']), Decimal('1000.00'))
 
     def test_finance_report_sums_each_cashier_and_excludes_confirmed_closes(self):
         """Cash moves from session to reserve once, without disappearing or doubling."""
@@ -236,19 +205,19 @@ class CashRefactorTests(unittest.TestCase):
             self.assertEqual(transfer.to_user_id, self.users['manager']['id'])
             self.assertEqual(transfer.amount, Decimal('700.00'))
 
-    def test_opening_is_independent_and_moves_capital_once(self):
-        result = self.open_for(amount='0')
+    def test_physical_opening_is_independent_from_capital(self):
+        before_capital = Decimal(self.req('/capital')['balance'])
+        result = self.open_for(amount='700')
         self.assertEqual(result['state'], 'open')
+        self.assertEqual(result['opening_mode'], 'physical_declared')
+        self.assertNotIn('transfer_id', result)
         with SessionLocal() as db:
+            session = db.get(CashSession, result['session_id'])
+            self.assertEqual(session.opening_counted, Decimal('700.00'))
+            self.assertEqual(session.balance, Decimal('700.00'))
+            self.assertIsNone(db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first())
             self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').count(), 0)
-
-        self.req('/capital/movements', dict(kind='injection', amount='2000', notes='Segundo fondo'), code=200)
-        result = self.open_for(cashier='cashier2', amount='700')
-        self.assertEqual(result['state'], 'open')
-        with SessionLocal() as db:
-            rows = db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').all()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].amount, Decimal('700.00'))
+        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
 
     def test_two_cashiers_have_independent_sessions(self):
         first = self.open_for('cashier', '800')

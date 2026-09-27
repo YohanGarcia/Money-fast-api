@@ -119,14 +119,10 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
-        from app.models.company_settings import CompanySettings
-        settings = db.scalar(select(CompanySettings).where(CompanySettings.company_id == user.company_id))
-        digital_handover = settings.digital_cash_opening_handover if settings is not None else True
         data.update(users=branch_users,loans=loans,session=enrich(session) if session and (user.role!='cashier' or session.cashier_id==user.id) else None,sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
           expected_opening='0.00',
-          digital_cash_opening_handover=digital_handover,
           audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
         data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]

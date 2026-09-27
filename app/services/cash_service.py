@@ -59,7 +59,7 @@ def check_version(row, version):
 def active_session(db, box, required=True, cashier_id=None):
     statement = select(CashSession).where(
         CashSession.box_id==box.id,
-        CashSession.state.in_(['opening_pending','opening_review','open','closing_review','closing_transfer_pending']),
+        CashSession.state.in_(['opening_review','open','closing_review','closing_transfer_pending']),
     )
     if cashier_id is not None:
         statement = statement.where(CashSession.cashier_id == cashier_id)
@@ -283,29 +283,12 @@ def command(db,user,p):
     action=p.action
     if action=='declare': require_role(user,'collector')
     elif action in ('resolve','reverse','confirm_surplus','reject_surplus'): require_role(user,'admin')
-    elif action in ('confirm_opening','confirm_closing_transfer'): require_role(user,'admin','manager','cashier')
+    elif action == 'confirm_closing_transfer': require_role(user,'admin','manager','cashier')
     else: require_role(user,'admin','cashier')
     result={}
     if action=='open':
-        from app.models.company_settings import CompanySettings
-        settings = db.scalar(select(CompanySettings).where(CompanySettings.company_id == user.company_id))
-        digital_handover = settings.digital_cash_opening_handover if settings is not None else True
         cashier = user
-        deliverer = user
-        if digital_handover:
-            if user.role == 'admin' and p.target_id:
-                candidate = db.get(User, p.target_id)
-                if candidate and candidate.role == 'cashier':
-                    cashier = candidate
-                    deliverer = user
-            elif user.role == 'cashier':
-                candidate = db.get(User, p.target_id) if p.target_id else None
-                if not candidate or candidate.role not in ('admin','manager') or not _same_company_branch(db, user, candidate, box.branch_id):
-                    fail('El cajero debe identificar al encargado que entrega el fondo.')
-                deliverer = candidate
-            if deliverer.id == cashier.id and user.role != 'admin':
-                fail('La entrega y la recepción deben quedar separadas.', 403)
-        elif user.role == 'admin' and p.target_id:
+        if user.role == 'admin' and p.target_id:
             candidate = db.get(User, p.target_id)
             if candidate and candidate.role == 'cashier':
                 cashier = candidate
@@ -313,30 +296,11 @@ def command(db,user,p):
             fail('El cajero receptor no pertenece a la sucursal.', 403)
         if active_session(db,box,False,cashier_id=cashier.id):
             fail('Este cajero ya tiene una jornada abierta o pendiente de resolver.',409)
-        if not digital_handover:
-            row=CashSession(box_id=box.id,business_date=today(),opening_expected=p.amount,opening_counted=p.amount,balance=p.amount,opened_by=user.id,cashier_id=cashier.id,state='open',opened_at=now(),notes=p.notes)
-            db.add(row);db.flush()
-            audit(db,box,user,'physical_opening_declared',session_id=row.id,cashier_id=cashier.id,amount=p.amount,notes=p.notes)
-            result={'session_id':row.id,'state':row.state,'opening_mode':'physical_declared'}
-        else:
-            row=CashSession(box_id=box.id,business_date=today(),opening_expected=ZERO,opening_counted=p.amount,balance=ZERO,opened_by=user.id,cashier_id=cashier.id,state='opening_pending',notes=p.notes)
-            db.add(row);db.flush();result={'session_id':row.id,'state':row.state,'opening_mode':'digital_handover'}
-            transfer=_custody_transfer(db,box=box,session=row,kind='opening_fund',from_user_id=deliverer.id,to_user_id=cashier.id,amount=p.amount,notes=p.notes)
-            result['transfer_id']=transfer.id
-    elif action=='confirm_opening':
-        session=db.get(CashSession,p.target_id)
-        if not session or session.box_id!=box.id or session.state!='opening_pending': fail('La apertura no está pendiente de confirmación.',409)
-        if session.cashier_id != user.id and user.role != 'admin': fail('Solo el cajero receptor puede confirmar el fondo.',403)
-        transfer=db.scalar(select(CashCustodyTransfer).where(CashCustodyTransfer.session_id==session.id,CashCustodyTransfer.kind=='opening_fund',CashCustodyTransfer.state=='pending'))
-        if not transfer: fail('No existe una entrega de fondo pendiente.',409)
-        check_version(session,p.version)
-        check_version(transfer, p.transfer_version if p.transfer_version is not None else transfer.version)
-        _require_acceptance(p)
-        if p.amount != transfer.amount: fail('El importe recibido debe coincidir con el fondo entregado.',409)
-        _record_capital_handover(db,user,transfer,session,direction='to_cash',amount=transfer.amount,notes=p.notes)
-        transfer.state='confirmed';transfer.acceptance_id=p.acceptance_id;transfer.acceptance_method=p.acceptance_method;transfer.accepted_by=user.id;transfer.accepted_at=now();transfer.notes=p.notes or transfer.notes
-        session.opening_counted=transfer.amount;session.balance=transfer.amount;session.state='open';session.opened_at=now()
-        result={'session_id':session.id,'transfer_id':transfer.id,'state':session.state}
+        row=CashSession(box_id=box.id,business_date=today(),opening_expected=p.amount,opening_counted=p.amount,balance=p.amount,opened_by=user.id,cashier_id=cashier.id,state='open',opened_at=now(),notes=p.notes)
+        db.add(row);db.flush()
+        audit(db,box,user,'physical_opening_declared',session_id=row.id,cashier_id=cashier.id,amount=p.amount,notes=p.notes)
+        result={'session_id':row.id,'state':row.state,'opening_mode':'physical_declared'}
+
     elif action=='declare':
         reserved=db.scalar(select(func.coalesce(func.sum(CashDelivery.declared),0)).where(CashDelivery.box_id==box.id,CashDelivery.collector_id==user.id,CashDelivery.state=='pending'))
         if p.amount<=0 or p.amount>pending(db,box,user.id)-reserved: fail('La entrega supera el pendiente disponible o ya declarado.')

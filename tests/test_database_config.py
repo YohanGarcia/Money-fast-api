@@ -86,7 +86,7 @@ engine.dispose()
                 self.assertIn("alembic_version", actual)
                 with fresh_engine.connect() as conn:
                     rows = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars().all()
-                self.assertEqual(rows, ["b2c3d4e5f6a7"])
+                self.assertEqual(rows, ["c3d4e5f6a7b8"])
                 custody_cols = {
                     col["name"] for col in sa.inspect(fresh_engine).get_columns("cash_sessions")
                 }
