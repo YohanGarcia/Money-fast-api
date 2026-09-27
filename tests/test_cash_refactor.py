@@ -9,6 +9,7 @@ from tests import test_api as legacy
 from app.core.database import SessionLocal
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.models.capital import CapitalMovement
+from app.models.customer import Customer
 
 
 class CashRefactorTests(unittest.TestCase):
@@ -34,6 +35,8 @@ class CashRefactorTests(unittest.TestCase):
             user = self.req('/users', dict(full_name=role + ' QA', email=email, password='workerpass123', role=api_role, branch_id=self.branch), code=201)
             self.users[role] = user
             self.roles[role] = self.auth_headers(self.login(email, 'workerpass123')['access_token'])
+        self.customer = self.create_customer(self.admin)
+        self.loan = self.create_loan(self.admin, self.customer['id'])
         self.req('/cash/setup', dict(branch_id=self.branch, initial_balance='0', notes='Configuración histórica'), code=200)
         self.req('/cash/activate', {}, code=200)
         self.req('/capital/movements', dict(kind='injection', amount='5000', notes='Fondo de prueba'), code=200)
@@ -74,6 +77,23 @@ class CashRefactorTests(unittest.TestCase):
         with SessionLocal() as db:
             sessions = db.query(CashSession).filter(CashSession.box_id == 1).all()
             self.assertEqual({s.cashier_id for s in sessions}, {self.users['cashier']['id'], self.users['cashier2']['id']})
+
+    def test_admin_consolidated_balance_updates_after_cashier_payment(self):
+        self.req('/capital/movements', dict(kind='injection', amount='151000', notes='Fondos de dos cajeros'), code=200)
+        with SessionLocal() as db:
+            db.get(Customer, self.customer['id']).cash_branch_id = self.branch
+            db.commit()
+        self.open_for('cashier', '51000')
+        self.open_for('cashier2', '100000')
+        before = self.workspace()
+        self.assertEqual(Decimal(before['consolidated_balance']), Decimal('151000.00'))
+        payment = self.req('/payments', dict(loan_id=self.loan['id'], payment_type='custom', amount='1000', method='cash', origin='counter', branch_id=self.branch, idempotency_key='maria-payment-001'), headers=self.roles['cashier'], code=201)
+        self.assertEqual(payment['amount'], '1000.00')
+        after = self.workspace()
+        self.assertEqual(Decimal(after['consolidated_balance']), Decimal('152000.00'))
+        balances = {row['cashier_id']: Decimal(row['balance']) for row in after['sessions'] if row['state'] == 'open'}
+        self.assertEqual(balances[self.users['cashier']['id']], Decimal('52000.00'))
+        self.assertEqual(balances[self.users['cashier2']['id']], Decimal('100000.00'))
 
     def test_close_requires_physical_confirmation_and_transfers_total(self):
         self.open_for('cashier', '1000')

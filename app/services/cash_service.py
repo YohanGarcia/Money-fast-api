@@ -209,7 +209,6 @@ def register_payment(db,user,payload):
     loan=db.get(Loan,payload.loan_id)
     if not loan: fail('Préstamo no encontrado.',404)
     ensure_customer(db,user,loan,box)
-    if payload.amount is None: fail('Actualiza la app: registra un importe explícito.')
     session=active_session(db,box,cashier_id=user.id if user.role=='cashier' else None) if payload.origin=='counter' else None
     if payload.method=='transfer':
         if not payload.reference_code or not payload.bank_account_id or not payload.proof: fail('La transferencia requiere referencia, cuenta bancaria de destino y comprobante.')
