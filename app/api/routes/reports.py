@@ -54,17 +54,29 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
 
     efectivo = None
     if svc.enabled(db, company_id):
-        efectivo = ZERO
-        for box in db.scalars(select(CashBox).where(CashBox.company_id == company_id)).all():
-            last = db.scalar(select(CashSession).where(CashSession.box_id == box.id).order_by(CashSession.id.desc()))
-            if last is None:
-                efectivo += box.initial_balance
-            elif last.state == "open":
-                efectivo += last.balance
-            else:
-                efectivo += last.counted if last.counted is not None else last.balance
+        # An independent cash balance exists for *each* active cashier.
+        # Pending opening funds remain in Capital until the cashier accepts
+        # them. Closed sessions have already transferred their cash to Capital
+        # and must not be counted again.
+        current_sessions = db.scalars(
+            select(CashSession).join(CashBox).where(
+                CashBox.company_id == company_id,
+                CashSession.state.in_(("open", "closing_review", "closing_transfer_pending")),
+            )
+        ).all()
+        efectivo = sum(
+            (
+                session.counted
+                if session.state in ("closing_review", "closing_transfer_pending")
+                and session.counted is not None
+                else session.balance
+                for session in current_sessions
+            ),
+            ZERO,
+        )
 
     reserva = capital_service.balance(db, company_id)
+    aportes_netos = capital_service.net_owner_contributions(db, company_id)
     por_cobrar = cartera_capital + cartera_interes + cartera_mora
     ganancia_cobrada = interes_cobrado + mora_cobrada
     ganancia_proyectada = cartera_interes + cartera_mora
@@ -77,6 +89,7 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
         start=str(start), end=str(end),
         caja_enabled=svc.enabled(db, company_id),
         reserva_capital=s(reserva),
+        aportes_netos=s(aportes_netos),
         efectivo_caja=None if efectivo is None else s(efectivo),
         cartera_capital=s(cartera_capital),
         cartera_interes=s(cartera_interes),
@@ -105,7 +118,8 @@ def _rows(d: dict) -> list[list]:
         ["Período", f'{d["start"]} a {d["end"]}'],
         [],
         ["Tu dinero ahora (foto actual)", "RD$"],
-        ["Reserva de capital (fuera de caja)", d["reserva_capital"]],
+        ["Reserva operativa central (fuera de caja)", d["reserva_capital"]],
+        ["Aportes netos (inyecciones menos retiros)", d["aportes_netos"]],
         ["Efectivo en caja", efectivo],
         ["En préstamos (capital en la calle)", d["cartera_capital"]],
         ["Interés por cobrar", d["cartera_interes"]],
@@ -120,7 +134,7 @@ def _rows(d: dict) -> list[list]:
         ["  · Capital recuperado", d["capital_recuperado"]],
         ["  · Interés cobrado", d["interes_cobrado"]],
         ["  · Mora cobrada", d["mora_cobrada"]],
-        ["Ganancia cobrada (interés + mora)", d["ganancia_cobrada"]],
+        ["Ingresos financieros brutos cobrados (interés + mora; sin descontar gastos)", d["ganancia_cobrada"]],
         ["Ganancia proyectada (interés + mora pendiente)", d["ganancia_proyectada"]],
         ["Desembolsado (capital colocado)", d["desembolsado"]],
         ["Nómina pagada", d["nomina_pagada"]],

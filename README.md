@@ -36,8 +36,8 @@ uv sync
 # 2. Configurar variables de entorno
 cp .env.example .env      # y edita los valores
 
-# 3. Aplicar migraciones
-uv run alembic upgrade head
+# 3. Preparar instalación nueva, legacy o BD ya versionada
+uv run python scripts/prepare_database.py
 
 # 4. (Opcional) Sembrar datos base + superadmin
 uv run python scripts/seed_multitenant.py
@@ -45,6 +45,23 @@ uv run python scripts/seed_multitenant.py
 # 5. Levantar el servidor
 uv run uvicorn app.main:app --host 0.0.0.0 --port 4000 --reload
 ```
+
+### Base de datos y migraciones
+
+El primer script detecta una base vacía y genera el esquema actual con los modelos
+SQLAlchemy; solo entonces registra la versión Alembic `head`. Esto es necesario
+porque las primeras migraciones históricas fueron escritas para un esquema legado,
+y `alembic upgrade head` **no** funciona sobre una PostgreSQL vacía.
+
+Con una BD ya versionada, el mismo script ejecuta únicamente las migraciones
+pendientes. En un esquema legado sin `alembic_version`, comprueba las tablas
+mínimas de la revisión histórica antes de aplicar el `stamp`: si faltan, se
+detiene sin fingir una actualización exitosa. Realiza copia de seguridad y
+comprueba el esquema legado real antes de migrar datos existentes.
+
+Para una base con Alembic ya inicializado también puedes usar
+`uv run alembic upgrade head` directamente. Nunca hagas `stamp head`
+manualmente en una base existente parcialmente creada.
 
 API disponible en `http://localhost:4000` · documentación interactiva en `http://localhost:4000/docs`.
 

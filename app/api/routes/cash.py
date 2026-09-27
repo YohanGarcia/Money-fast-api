@@ -105,7 +105,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         collectors=[dict(id=uid,name=users[uid].full_name,pending=str(amount)) for uid,amount in totals.items()],
         outstanding=[dict(payment_id=p.id,collector_id=p.collected_by_id,loan_id=p.loan_id,paid_at=p.paid_at,amount=str(p.amount),pending=str(amount)) for p,amount in outstanding])
     if not mine:
-        session=svc.active_session(db,box,False,user.id if user.role=='cashier' else None)
+        session=svc.active_session(db,box,False,user.id) if user.role=='cashier' else None
         sessions=db.scalars(select(CashSession).where(CashSession.box_id==box.id).order_by(CashSession.id.desc())).all()
         movements=db.scalars(select(CashMovement).where(CashMovement.box_id==box.id).order_by(CashMovement.id.desc())).all()
         custody_transfers=db.scalars(select(CashCustodyTransfer).where(CashCustodyTransfer.box_id==box.id).order_by(CashCustodyTransfer.id.desc())).all()
@@ -119,7 +119,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
-        data.update(users=branch_users,loans=loans,session=enrich(session) if session and (user.role!='cashier' or session.cashier_id==user.id) else None,sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
+        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','opening_review','closing_review','closing_transfer_pending')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
           expected_opening='0.00',

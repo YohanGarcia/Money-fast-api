@@ -40,14 +40,19 @@ class CashTests(unittest.TestCase):
             u=self.req('/users',dict(full_name=role+' QA',email=role+'@example.com',password='workerpass123',role=role,branch_id=self.branch),code=201)
             self.users[role]=u
             self.roles[role]=self.auth_headers(self.login(role+'@example.com','workerpass123')['access_token'])
+        self.admin_id=self.req('/users')[0]['id']
         self.customer=self.create_customer(self.admin,collector_id=self.users['collector']['id'])
         self.loan=self.create_loan(self.admin,self.customer['id'])
         for bid in (self.branch,self.other): self.req('/cash/setup',dict(branch_id=bid,initial_balance='1000',notes='Prueba inicial'))
         self.req('/cash/activate',{})
         self.bank_account=self.req('/bank-accounts',dict(bank_name='Banco QA',account_number='1234567890',account_holder='Empresa QA'),code=201)
 
-    def workspace(self,headers=None): return self.req(f'/cash/workspace?branch_id={self.branch}',headers=headers)
+    def workspace(self,headers=None): return self.req(f'/cash/workspace?branch_id={self.branch}',headers=headers or self.roles['cashier'])
     def cmd(self,action,headers=None,code=200,**fields):
+        if headers is None:
+            headers = self.roles['collector'] if action == 'declare' else self.roles['cashier'] if action in ('open','movement','close','receive','receive_collector','reject_delivery','disburse') else self.admin
+        if action == 'close' and 'receiver_id' not in fields:
+            fields['receiver_id'] = self.admin_id
         return self.req('/cash/commands',dict(action=action,branch_id=self.branch,idempotency_key=str(uuid.uuid4()),**fields),headers,code)
     def payment(self,amount='1000',method='cash',origin='field',headers=None,code=201,**extra):
         body=dict(loan_id=self.loan['id'],payment_type='custom',amount=amount,method=method,origin=origin,branch_id=self.branch,idempotency_key=str(uuid.uuid4()),**extra)
@@ -66,8 +71,7 @@ class CashTests(unittest.TestCase):
         self._finish_pending_close()
         if Decimal(amount)>0:
             self.req('/capital/movements',dict(kind='injection',amount=amount,notes='Fondo de prueba'),code=200)
-        created=self.cmd('open',target_id=self.users['cashier']['id'],amount=amount,notes='Conteo inicial')
-        return self.cmd('confirm_opening',headers=self.roles['cashier'],target_id=created['session_id'],version=1,transfer_version=1,amount=amount,acceptance_id='legacy-open-'+uuid.uuid4().hex,acceptance_method='authenticated_confirmation',notes='Recibido conforme')
+        return self.cmd('open',headers=self.roles['cashier'],amount=amount,notes='Conteo inicial')
     def delivery(self,amount='1000'):
         return self.cmd('declare',headers=self.roles['collector'],amount=amount)['delivery_id']
     def receive(self,did,amount='600'):
@@ -93,8 +97,8 @@ class CashTests(unittest.TestCase):
         transfer=self.transfer()
         self.assertEqual(transfer['status'],'pending');self.assertEqual(len(self.req('/payments')),0)
         body=dict(action='confirm_transfer',branch_id=self.branch,target_id=transfer['transfer_id'],version=1,idempotency_key=str(uuid.uuid4()))
-        result=self.req('/cash/commands',body,self.roles['cashier'])
-        self.assertEqual(self.req('/cash/commands',body,self.roles['cashier']),result)
+        result=self.req('/cash/commands',body,self.admin)
+        self.req('/cash/commands',body,self.roles['cashier'],code=403)
         self.assertEqual(len(self.req('/payments')),1)
         self.cmd('confirm_transfer',target_id=transfer['transfer_id'],version=1,code=409)
         second=self.transfer()
@@ -127,7 +131,7 @@ class CashTests(unittest.TestCase):
         self.open('500');self.assertEqual(Decimal(self.workspace()['session']['balance']),500)
 
     def test_opening_is_independent_and_totals_remain_consistent(self):
-        self.open('900');s=self.workspace()['session'];self.assertEqual(s['state'],'open');self.assertEqual(Decimal(s['opening_expected']),Decimal('0'))
+        self.open('900');s=self.workspace()['session'];self.assertEqual(s['state'],'open');self.assertEqual(Decimal(s['opening_expected']),Decimal('900'))
         self.cmd('close',version=s['version'],denominations={'500':1,'200':2},notes='Conteo exacto')
         self._finish_pending_close()
         snap=self.workspace()['sessions'][0]['snapshot']
@@ -162,7 +166,7 @@ class CashTests(unittest.TestCase):
 
     def test_simultaneous_open_and_identical_payment(self):
         def opening(_):
-            return self.client.post('/api/v1/cash/commands',json=dict(action='open',branch_id=self.branch,amount='1000',idempotency_key=str(uuid.uuid4())),headers=self.admin).status_code
+            return self.client.post('/api/v1/cash/commands',json=dict(action='open',branch_id=self.branch,amount='1000',idempotency_key=str(uuid.uuid4())),headers=self.roles['cashier']).status_code
         with ThreadPoolExecutor(2) as pool: self.assertEqual(sorted(pool.map(opening,range(2))),[200,409])
         payload=dict(loan_id=self.loan['id'],payment_type='custom',amount='1000',method='cash',origin='field',branch_id=self.branch,idempotency_key=str(uuid.uuid4()))
         def pay(_):return self.client.post('/api/v1/payments',json=payload,headers=self.roles['collector'])
