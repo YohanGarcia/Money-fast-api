@@ -142,7 +142,7 @@ class CashRefactorTests(unittest.TestCase):
         # validation alone cannot distinguish them.
         self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=2, code=409)
-        self.cmd('movement', kind='expense', amount='100', notes='QA expense',
+        self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=2, session_id=first['session_id'])
         with SessionLocal() as db:
             first_row = db.get(CashSession, first['session_id'])
