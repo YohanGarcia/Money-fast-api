@@ -59,7 +59,7 @@ def check_version(row, version):
 def active_session(db, box, required=True, cashier_id=None):
     statement = select(CashSession).where(
         CashSession.box_id==box.id,
-        CashSession.state.in_(['opening_pending','opening_review','open','closing_review','closing_transfer_pending']),
+        CashSession.state.in_(['opening_review','open','closing_review','closing_transfer_pending']),
     )
     if cashier_id is not None:
         statement = statement.where(CashSession.cashier_id == cashier_id)
@@ -283,7 +283,7 @@ def command(db,user,p):
     action=p.action
     if action=='declare': require_role(user,'collector')
     elif action in ('resolve','reverse','confirm_surplus','reject_surplus'): require_role(user,'admin')
-    elif action in ('confirm_opening','confirm_closing_transfer'): require_role(user,'admin','manager','cashier')
+    elif action == 'confirm_closing_transfer': require_role(user,'admin','manager','cashier')
     else: require_role(user,'admin','cashier')
     result={}
     if action=='open':
