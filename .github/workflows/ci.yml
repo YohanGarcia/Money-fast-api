@@ -25,7 +25,7 @@ jobs:
           --health-interval=10s --health-timeout=5s --health-retries=5
     env:
       DATABASE_URL: postgresql+psycopg://moneyfast:moneyfast@localhost:5432/moneyfast_test
-      SECRET_KEY: ci-only-secret
+      SECRET_KEY: ci-only-secret-key-for-github-actions
       ENVIRONMENT: production
       CORS_ORIGINS: http://localhost:5173
       SMTP_HOST: ""
@@ -48,4 +48,4 @@ jobs:
       - name: Validate Alembic schema consistency
         run: uv run alembic check
       - name: Run API tests
-        run: uv run pytest -q
+        run: uv run python -m pytest -q
