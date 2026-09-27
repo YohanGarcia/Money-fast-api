@@ -426,7 +426,7 @@ def command(db,user,p):
             session.state='closing_review'
             result={'session_id':session.id,'state':session.state,'difference':str(difference)}
         else:
-            receiver = db.get(User,p.target_id) if p.target_id else (user if user.role=='admin' else None)
+            receiver = db.get(User,p.receiver_id) if p.receiver_id else (user if user.role=='admin' else None)
             if not receiver or receiver.role not in ('admin','manager') or not _same_company_branch(db,user,receiver,box.branch_id):
                 fail('Identifica al encargado que recibirá físicamente el efectivo de cierre.',403)
             if receiver.id == session.cashier_id and user.role != 'admin': fail('La entrega de cierre requiere un responsable distinto.',403)

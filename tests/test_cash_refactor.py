@@ -258,6 +258,29 @@ class CashRefactorTests(unittest.TestCase):
             sessions = db.query(CashSession).filter(CashSession.box_id == 1).all()
             self.assertEqual({s.cashier_id for s in sessions}, {self.users['cashier']['id'], self.users['cashier2']['id']})
 
+    def test_admin_close_uses_explicit_session_and_receiver(self):
+        opened = self.open_for('cashier', '1000')
+        session_id = opened['session_id']
+        with SessionLocal() as db:
+            session = db.get(CashSession, session_id)
+            version = session.version
+        pending = self.cmd(
+            'close',
+            session_id=session_id,
+            receiver_id=self.admin['id'],
+            version=version,
+            denominations={'1000': 1},
+            notes='Cuadre exacto por administrador',
+        )
+        self.assertEqual(pending['state'], 'closing_transfer_pending')
+        with SessionLocal() as db:
+            transfer = db.query(CashCustodyTransfer).filter(
+                CashCustodyTransfer.session_id == session_id,
+                CashCustodyTransfer.kind == 'closing_capital',
+            ).one()
+            self.assertEqual(transfer.to_user_id, self.admin['id'])
+            self.assertEqual(transfer.amount, Decimal('1000.00'))
+
     def test_close_requires_physical_confirmation_and_transfers_total(self):
         self.open_for('cashier', '1000')
         session = self.workspace()['session']
