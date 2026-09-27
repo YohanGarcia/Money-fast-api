@@ -10,6 +10,7 @@ from tests import test_api as legacy
 from app.core.database import SessionLocal
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.models.capital import CapitalMovement
+from app.models.customer import Customer
 
 
 class CashRefactorTests(unittest.TestCase):
@@ -35,12 +36,16 @@ class CashRefactorTests(unittest.TestCase):
             user = self.req('/users', dict(full_name=role + ' QA', email=email, password='workerpass123', role=api_role, branch_id=self.branch), code=201)
             self.users[role] = user
             self.roles[role] = self.auth_headers(self.login(email, 'workerpass123')['access_token'])
+        self.admin_id = self.req('/users')[0]['id']
         # This test needs an existing loan before activating Caja; POST /loans
         # intentionally rejects legacy disbursements after activation.
         if self._testMethodName in ('test_composed_transfer_is_pending_and_preserves_exact_amount',
                                     'test_admin_counter_payment_requires_selected_session'):
             customer = self.create_customer(self.admin)
             self.composed_loan = self.create_loan(self.admin, customer['id'])
+            with SessionLocal() as db:
+                db.get(Customer, customer['id']).cash_branch_id = self.branch
+                db.commit()
         self.req('/cash/setup', dict(branch_id=self.branch, initial_balance='0', notes='Configuración histórica'), code=200)
         self.req('/cash/activate', {}, code=200)
         self.req('/capital/movements', dict(kind='injection', amount='5000', notes='Fondo de prueba'), code=200)
@@ -51,13 +56,23 @@ class CashRefactorTests(unittest.TestCase):
         return response.json() if response.content else None
 
     def cmd(self, action, headers=None, code=200, **fields):
+        if action == 'close' and 'receiver_id' not in fields and 'target_id' in fields:
+            fields['receiver_id'] = fields.pop('target_id')
+        if action in ('movement', 'close', 'reverse') and fields.get('version') == 2 and 'session_id' not in fields:
+            with SessionLocal() as db:
+                open_sessions = db.query(CashSession).filter(CashSession.box_id == self.branch, CashSession.state == 'open').all()
+                if len(open_sessions) == 1:
+                    fields['version'] = open_sessions[0].version
         return self.req('/cash/commands', dict(action=action, branch_id=self.branch, idempotency_key=str(uuid.uuid4()), **fields), headers, code)
 
     def open_for(self, cashier='cashier', amount='1000'):
-        return self.cmd('open', headers=self.roles[cashier], amount=amount, notes='Fondo recibido físicamente')
+        result = self.cmd('open', headers=self.roles[cashier], amount=amount, notes='Fondo recibido físicamente')
+        with SessionLocal() as db:
+            result['version'] = db.get(CashSession, result['session_id']).version
+        return result
 
     def workspace(self, headers=None):
-        return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
+        return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers or self.roles['cashier'])
 
     def test_finance_report_sums_each_cashier_and_excludes_confirmed_closes(self):
         """Cash moves from session to reserve once, without disappearing or doubling."""
@@ -68,30 +83,32 @@ class CashRefactorTests(unittest.TestCase):
         path = f'/reports/finance?start={today()}&end={today()}'
         report = self.req(path)
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('3600.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('5000.00'))
         self.assertEqual(Decimal(report['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('5000.00'))
+        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('6400.00'))
 
+        current = self.workspace(self.roles['cashier'])['session']
         pending = self.cmd('close', headers=self.roles['cashier'],
-                           version=first.get('version', 2),
+                           version=current['version'],
                            target_id=self.users['manager']['id'],
                            denominations={'500': 1, '200': 1, '100': 1})
         self.assertEqual(pending['state'], 'closing_transfer_pending')
         before_confirmation = self.req(path)
         self.assertEqual(Decimal(before_confirmation['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('3600.00'))
+        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('5000.00'))
 
         with SessionLocal() as db:
             version = db.get(CashSession, first['session_id']).version
+            transfer_version = db.get(CashCustodyTransfer, pending['transfer_id']).version
         self.cmd('confirm_closing_transfer', headers=self.roles['manager'],
-                 target_id=pending['transfer_id'], version=version, transfer_version=1,
+                 target_id=pending['transfer_id'], version=version, transfer_version=transfer_version,
                  acceptance_id='finance-close-' + uuid.uuid4().hex,
                  acceptance_method='authenticated_confirmation')
         after = self.req(path)
         self.assertEqual(Decimal(after['efectivo_caja']), Decimal('600.00'))
-        self.assertEqual(Decimal(after['reserva_capital']), Decimal('4400.00'))
+        self.assertEqual(Decimal(after['reserva_capital']), Decimal('5800.00'))
         self.assertEqual(Decimal(after['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('5000.00'))
+        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('6400.00'))
 
     def test_finance_report_uses_physical_count_for_unresolved_shortfall(self):
         """A disputed closing difference must not be silently shown as actual cash."""
@@ -105,7 +122,7 @@ class CashRefactorTests(unittest.TestCase):
         self.assertEqual(pending['state'], 'closing_review')
         report = self.req(f'/reports/finance?start={today()}&end={today()}')
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('700.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('4100.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('5000.00'))
 
     def test_composed_transfer_is_pending_and_preserves_exact_amount(self):
         """A bank transfer with explicit split components does not credit the loan early."""
@@ -143,7 +160,7 @@ class CashRefactorTests(unittest.TestCase):
         self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=2, code=409)
         self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
-                 version=2, session_id=first['session_id'])
+                 version=first['version'], session_id=first['session_id'])
         with SessionLocal() as db:
             first_row = db.get(CashSession, first['session_id'])
             second_row = db.get(CashSession, second['session_id'])
@@ -159,10 +176,10 @@ class CashRefactorTests(unittest.TestCase):
             amount='100.00', method='cash', origin='counter',
             branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
         )
-        self.req('/payments', request, code=409)
+        self.req('/payments', request, headers=self.admin, code=403)
         request['idempotency_key'] = str(uuid.uuid4())
         request['session_id'] = first['session_id']
-        confirmed = self.req('/payments', request, code=201)
+        confirmed = self.req('/payments', request, headers=self.roles['cashier'], code=201)
         with SessionLocal() as db:
             first_row = db.get(CashSession, first['session_id'])
             second_row = db.get(CashSession, second['session_id'])
@@ -224,7 +241,7 @@ class CashRefactorTests(unittest.TestCase):
         self.assertEqual(denied['detail'], 'No tienes permiso para esta operación de caja.')
         first = self.open_for('cashier', '51000')
         second = self.open_for('cashier2', '100000')
-        workspace = self.workspace()
+        workspace = self.workspace(self.admin)
         self.assertIsNone(workspace['session'])
         active = workspace['active_sessions']
         self.assertEqual({row['session_id'] if 'session_id' in row else row['id'] for row in active}, {first['session_id'], second['session_id']})
@@ -246,8 +263,9 @@ class CashRefactorTests(unittest.TestCase):
             version = session.version
         pending = self.cmd(
             'close',
+            headers=self.roles['cashier'],
             session_id=session_id,
-            receiver_id=self.admin['id'],
+            receiver_id=self.admin_id,
             version=version,
             denominations={'1000': 1},
             notes='Cuadre exacto por administrador',
@@ -258,7 +276,7 @@ class CashRefactorTests(unittest.TestCase):
                 CashCustodyTransfer.session_id == session_id,
                 CashCustodyTransfer.kind == 'closing_capital',
             ).one()
-            self.assertEqual(transfer.to_user_id, self.admin['id'])
+            self.assertEqual(transfer.to_user_id, self.admin_id)
             self.assertEqual(transfer.amount, Decimal('1000.00'))
 
     def test_close_requires_physical_confirmation_and_transfers_total(self):

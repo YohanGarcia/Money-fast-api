@@ -1,0 +1,51 @@
+name: API CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: moneyfast
+          POSTGRES_PASSWORD: moneyfast
+          POSTGRES_DB: moneyfast_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U moneyfast -d moneyfast_test"
+          --health-interval=10s --health-timeout=5s --health-retries=5
+    env:
+      DATABASE_URL: postgresql+psycopg://moneyfast:moneyfast@localhost:5432/moneyfast_test
+      SECRET_KEY: ci-only-secret-key-for-github-actions
+      ENVIRONMENT: production
+      CORS_ORIGINS: http://localhost:5173
+      SMTP_HOST: ""
+      SMTP_USER: ""
+      SMTP_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+      - name: Bootstrap the legacy schema baseline
+        run: |
+          uv run python -c "import app.models; from app.core.database import Base, engine; Base.metadata.create_all(bind=engine)"
+          uv run alembic stamp head
+      - name: Validate Alembic schema consistency
+        run: uv run alembic check
+      - name: Run API tests
+        run: uv run python -m pytest -q

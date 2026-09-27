@@ -126,6 +126,20 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
           audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
         data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
+    if user.role == 'admin':
+        # Administrative supervision is company-wide. This read-only
+        # aggregate never becomes an operable session or replaces workspace
+        # authorization for a selected branch.
+        boxes=db.scalars(select(CashBox).where(CashBox.company_id==user.company_id)).all()
+        branches={b.id:b.name for b in db.scalars(select(Branch).where(Branch.company_id==user.company_id)).all()}
+        branch_rows=[]
+        consolidated=svc.ZERO
+        for candidate in boxes:
+            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','opening_review','closing_review','closing_transfer_pending']))).all()),svc.ZERO)
+            consolidated += amount
+            branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount)})
+        data['cash_boxes']=branch_rows
+        data['consolidated_balance']=str(consolidated)
     return jsonable_encoder(data)
 
 def filtered_report(db,user,branch_id,start,end,collector_id,actor_id,kind,state):
