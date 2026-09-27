@@ -300,20 +300,7 @@ def command(db,user,p):
         db.add(row);db.flush()
         audit(db,box,user,'physical_opening_declared',session_id=row.id,cashier_id=cashier.id,amount=p.amount,notes=p.notes)
         result={'session_id':row.id,'state':row.state,'opening_mode':'physical_declared'}
-    elif action=='confirm_opening':
-        session=db.get(CashSession,p.target_id)
-        if not session or session.box_id!=box.id or session.state!='opening_pending': fail('La apertura no está pendiente de confirmación.',409)
-        if session.cashier_id != user.id and user.role != 'admin': fail('Solo el cajero receptor puede confirmar el fondo.',403)
-        transfer=db.scalar(select(CashCustodyTransfer).where(CashCustodyTransfer.session_id==session.id,CashCustodyTransfer.kind=='opening_fund',CashCustodyTransfer.state=='pending'))
-        if not transfer: fail('No existe una entrega de fondo pendiente.',409)
-        check_version(session,p.version)
-        check_version(transfer, p.transfer_version if p.transfer_version is not None else transfer.version)
-        _require_acceptance(p)
-        if p.amount != transfer.amount: fail('El importe recibido debe coincidir con el fondo entregado.',409)
-        _record_capital_handover(db,user,transfer,session,direction='to_cash',amount=transfer.amount,notes=p.notes)
-        transfer.state='confirmed';transfer.acceptance_id=p.acceptance_id;transfer.acceptance_method=p.acceptance_method;transfer.accepted_by=user.id;transfer.accepted_at=now();transfer.notes=p.notes or transfer.notes
-        session.opening_counted=transfer.amount;session.balance=transfer.amount;session.state='open';session.opened_at=now()
-        result={'session_id':session.id,'transfer_id':transfer.id,'state':session.state}
+
     elif action=='declare':
         reserved=db.scalar(select(func.coalesce(func.sum(CashDelivery.declared),0)).where(CashDelivery.box_id==box.id,CashDelivery.collector_id==user.id,CashDelivery.state=='pending'))
         if p.amount<=0 or p.amount>pending(db,box,user.id)-reserved: fail('La entrega supera el pendiente disponible o ya declarado.')
