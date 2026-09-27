@@ -205,19 +205,19 @@ class CashRefactorTests(unittest.TestCase):
             self.assertEqual(transfer.to_user_id, self.users['manager']['id'])
             self.assertEqual(transfer.amount, Decimal('700.00'))
 
-    def test_opening_is_independent_and_moves_capital_once(self):
-        result = self.open_for(amount='0')
+    def test_physical_opening_is_independent_from_capital(self):
+        before_capital = Decimal(self.req('/capital')['balance'])
+        result = self.open_for(amount='700')
         self.assertEqual(result['state'], 'open')
+        self.assertEqual(result['opening_mode'], 'physical_declared')
+        self.assertNotIn('transfer_id', result)
         with SessionLocal() as db:
+            session = db.get(CashSession, result['session_id'])
+            self.assertEqual(session.opening_counted, Decimal('700.00'))
+            self.assertEqual(session.balance, Decimal('700.00'))
+            self.assertIsNone(db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first())
             self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').count(), 0)
-
-        self.req('/capital/movements', dict(kind='injection', amount='2000', notes='Segundo fondo'), code=200)
-        result = self.open_for(cashier='cashier2', amount='700')
-        self.assertEqual(result['state'], 'open')
-        with SessionLocal() as db:
-            rows = db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').all()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].amount, Decimal('700.00'))
+        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
 
     def test_two_cashiers_have_independent_sessions(self):
         first = self.open_for('cashier', '800')
