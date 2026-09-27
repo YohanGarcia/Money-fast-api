@@ -227,6 +227,7 @@ def register_payment(db,user,payload):
     old,digest=replay(db,user,payload.idempotency_key,payload.model_dump(mode='json'))
     if old: return old
     if user.role=='collector' and payload.origin!='field': fail('El cobrador registra cobros de campo.',403)
+    if payload.origin=='counter' and user.role!='cashier': fail('Los cobros de ventanilla pertenecen a la caja del cajero.',403)
     if user.role=='cashier' and payload.origin!='counter': fail('El cajero registra cobros de ventanilla.',403)
     loan=db.get(Loan,payload.loan_id)
     if not loan: fail('Préstamo no encontrado.',404)
@@ -282,9 +283,9 @@ def command(db,user,p):
     if old: return old
     action=p.action
     if action=='declare': require_role(user,'collector')
-    elif action in ('resolve','reverse','confirm_surplus','reject_surplus'): require_role(user,'admin')
+    elif action in ('resolve','reverse','confirm_surplus','reject_surplus','confirm_transfer','reject_transfer'): require_role(user,'admin')
     elif action == 'confirm_closing_transfer': require_role(user,'admin','manager','cashier')
-    else: require_role(user,'admin','cashier')
+    else: require_role(user,'cashier')
     result={}
     if action=='open':
         cashier = user

@@ -54,7 +54,7 @@ class CashRefactorTests(unittest.TestCase):
         return self.req('/cash/commands', dict(action=action, branch_id=self.branch, idempotency_key=str(uuid.uuid4()), **fields), headers, code)
 
     def open_for(self, cashier='cashier', amount='1000'):
-        return self.cmd('open', target_id=self.users[cashier]['id'], amount=amount, notes='Fondo recibido físicamente')
+        return self.cmd('open', headers=self.roles[cashier], amount=amount, notes='Fondo recibido físicamente')
 
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
@@ -140,9 +140,9 @@ class CashRefactorTests(unittest.TestCase):
         second = self.open_for('cashier2', '600')
         # Both newly opened sessions are at version 2, so optimistic version
         # validation alone cannot distinguish them.
-        self.cmd('movement', kind='expense', amount='100', notes='QA expense',
+        self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=2, code=409)
-        self.cmd('movement', kind='expense', amount='100', notes='QA expense',
+        self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=2, session_id=first['session_id'])
         with SessionLocal() as db:
             first_row = db.get(CashSession, first['session_id'])
@@ -218,6 +218,17 @@ class CashRefactorTests(unittest.TestCase):
             self.assertIsNone(db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first())
             self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').count(), 0)
         self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
+
+    def test_admin_is_supervisor_not_cashier_operator(self):
+        denied = self.cmd('open', amount='1000', notes='Admin should not own a drawer', code=403)
+        self.assertEqual(denied['detail'], 'No tienes permiso para esta operación de caja.')
+        first = self.open_for('cashier', '51000')
+        second = self.open_for('cashier2', '100000')
+        workspace = self.workspace()
+        self.assertIsNone(workspace['session'])
+        active = workspace['active_sessions']
+        self.assertEqual({row['session_id'] if 'session_id' in row else row['id'] for row in active}, {first['session_id'], second['session_id']})
+        self.assertEqual(sum(Decimal(row['balance']) for row in active), Decimal('151000.00'))
 
     def test_two_cashiers_have_independent_sessions(self):
         first = self.open_for('cashier', '800')
