@@ -54,8 +54,7 @@ class CashRefactorTests(unittest.TestCase):
         return self.req('/cash/commands', dict(action=action, branch_id=self.branch, idempotency_key=str(uuid.uuid4()), **fields), headers, code)
 
     def open_for(self, cashier='cashier', amount='1000'):
-        created = self.cmd('open', target_id=self.users[cashier]['id'], amount=amount, notes='Fondo entregado')
-        return self.cmd('confirm_opening', headers=self.roles[cashier], target_id=created['session_id'], version=1, transfer_version=1, amount=amount, acceptance_id='accept-' + uuid.uuid4().hex, acceptance_method='authenticated_confirmation', notes='Recibido conforme')
+        return self.cmd('open', target_id=self.users[cashier]['id'], amount=amount, notes='Fondo recibido físicamente')
 
     def workspace(self, headers=None):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers)
