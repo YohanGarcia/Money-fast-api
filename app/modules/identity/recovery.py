@@ -19,7 +19,7 @@ from app.core.security import hash_token, new_opaque_token, password_policy_viol
 from app.core.time import now_utc
 from app.modules.identity import throttle
 from app.modules.identity.audit import record_event
-from app.modules.identity.auth import normalize_identifier, revoke_user_sessions, set_password
+from app.modules.identity.auth import find_unambiguous_account, normalize_identifier, revoke_user_sessions, set_password
 from app.modules.identity.errors import (
     InvalidRecoveryToken,
     PasswordPolicyViolation,
@@ -107,7 +107,7 @@ def request_recovery(
     if not account_blocked:
         throttle.register_failure(db, S_REQ_ACCT, ident, settings.recovery_max_requests_account, now)
 
-    user = db.scalar(select(UserAccount).where(UserAccount.email == ident))
+    user = find_unambiguous_account(db, ident)  # ambiguous across tenants => nothing is issued (fail closed)
     if user is None or user.status == "disabled" or account_blocked:
         record_event(
             db,

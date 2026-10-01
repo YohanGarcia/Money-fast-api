@@ -91,7 +91,7 @@ def create_user(
         branch = db.get(Branch, branch_id)
         if branch is None or branch.company_id != actor.tenant_id:
             raise TenantMismatch()
-    if db.scalar(select(UserAccount.id).where(UserAccount.email == ident)):
+    if db.scalar(select(UserAccount.id).where(UserAccount.email == ident, UserAccount.company_id == actor.tenant_id)):
         raise Conflict("Ya existe un usuario con ese correo.")
     now = now_utc()
     person = Person(tenant_id=actor.tenant_id, given_names=given_names.strip(), family_names=family_names.strip())

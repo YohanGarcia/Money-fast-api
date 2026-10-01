@@ -217,7 +217,7 @@ def create_user(
     current_user: User = Depends(require_admin),
     company_id: int = Depends(get_company_id),
 ) -> User:
-    existing = db.scalar(select(User).where(User.email == payload.email.lower()))
+    existing = db.scalar(select(User).where(User.email == payload.email.lower(), User.company_id == company_id))
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
@@ -260,7 +260,9 @@ def update_user(
 
     if user.role is None:
         raise HTTPException(409, "Este usuario se administra con la API v2 (identidad y roles).")
-    existing = db.scalar(select(User).where(User.email == payload.email.lower(), User.id != user_id))
+    existing = db.scalar(
+        select(User).where(User.email == payload.email.lower(), User.id != user_id, User.company_id == company_id)
+    )
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 

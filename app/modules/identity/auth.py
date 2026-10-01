@@ -65,6 +65,20 @@ def _clock() -> datetime:
     return now_utc()
 
 
+def find_unambiguous_account(db: Session, ident: str) -> UserAccount | None:
+    """The account for a login identifier, or None when there is none *or more than one*.
+
+    The same normalised email may exist in several tenants and the unauthenticated contract carries no
+    tenant context. BLOCKED_BY_SPEC: until that context is defined, an ambiguous identifier fails closed
+    (never an arbitrary pick) and is indistinguishable from an unknown one for the caller.
+    """
+    rows = db.scalars(select(UserAccount).where(UserAccount.email == ident).limit(2)).all()
+    if len(rows) > 1:
+        log.warning("login_identifier_ambiguous")
+        return None
+    return rows[0] if rows else None
+
+
 def revoke_session(db: Session, session: UserSession, reason: str, now: datetime | None = None) -> bool:
     if not session.is_active:
         return False
@@ -124,7 +138,7 @@ def login(
         log.warning("login_throttled", extra={"retry_after": wait})
         raise RateLimited(wait)
 
-    user = db.scalar(select(UserAccount).where(UserAccount.email == ident))
+    user = find_unambiguous_account(db, ident)
     if user is None:
         verify_and_update(password, dummy_hash())  # equalise timing with the existing-account path
         valid, new_hash = False, None

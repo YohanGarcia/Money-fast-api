@@ -48,6 +48,7 @@ include = [
   "tests/conftest.py",
   "tests/test_t001_foundation.py",
   "tests/test_t002_identity.py",
+  "tests/test_t002_tenant_login.py",
 ]
 
 [tool.ruff.lint]
@@ -57,4 +58,4 @@ select = ["E", "F", "I", "UP", "B"]
 extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_permission"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/test_t002_identity.py" = ["F811"]  # pytest fixture re-use via import
+"tests/test_t00[0-9]_*.py" = ["F811"]  # pytest fixture re-use via import

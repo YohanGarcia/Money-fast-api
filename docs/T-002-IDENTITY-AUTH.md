@@ -94,7 +94,7 @@ La IP es la del socket (`request.client.host`); las cabeceras `X-Forwarded-For` 
 ## 10. Decisiones tomadas dentro de la libertad de T-002
 
 * `person_id` opcional en `users` (compatibilidad con filas/flujo legacy); obligatorio en el alta v2.
-* `email` sigue siendo identificador de login único global (el login no recibe tenant).
+* El identificador de login es **tenant-aware** (migración `0003`): unicidad `(company_id, email)` para cuentas de agencia y unicidad separada para cuentas de plataforma (`company_id NULL`); el email se guarda normalizado (`lower(btrim)`, check `email_normalized`). Ya no hay unicidad global.
 * Tenant = `companies.id` hasta T-003. Usuario de plataforma = `company_id NULL`; sin endpoints de plataforma en T-002.
 * No se implementó MFA (hooks: `SecretNotifier`, estado `pending`, servicio de auth); sin impersonación ni break-glass ni cuentas de servicio.
 * Sin dependencias nuevas (Argon2/JWT ya existían).
@@ -103,7 +103,13 @@ La IP es la del socket (`request.client.host`); las cabeceras `X-Forwarded-For` 
 
 * `security_version` no se implementó: la revocación se hace por filas de sesión, que ya se evalúan en cada request.
 * Los contadores de `auth_throttle` no se purgan automáticamente (no hay jobs aún).
-* El alta de usuario con correo ya existente responde 409 también para correos de otro tenant (señal de existencia limitada a quien tiene `users.create`).
 * Roles: crear/archivar sí; **editar la composición** de un rol (y su historia) queda para un paquete posterior.
 * Los endpoints legacy (v1) de otros módulos siguen usando `require_roles`; su reemplazo por `require_permission` ocurre al reconstruir cada módulo.
 * Web/Mobile conservan tokens en `localStorage`/`AsyncStorage`; v2 los entrega en el cuerpo JSON y su almacenamiento seguro es parte de la convergencia de esas superficies.
+
+## 12. Identificador de login multi-tenant (revisión de gate)
+
+* Alta/edición (v2 y v1 legacy) comprueban conflicto **solo dentro del tenant del actor**: el mismo correo en otro tenant no produce 409 ni ninguna otra señal.
+* **BLOCKED_BY_SPEC — contexto de tenant en login/recuperación.** `POST /auth/login` y `/auth/recovery/request` no llevan contexto de tenant (y no se inventó un mecanismo de selección). Si un identificador existe en más de una cuenta, no hay forma segura de resolverlo: el sistema **falla cerrado** (`find_unambiguous_account`): no elige ninguna cuenta, responde exactamente como a un identificador desconocido (401 `invalid_credentials` / 202 genérico sin emitir token) y no crea sesión. Los identificadores sin duplicado funcionan igual que antes.
+  Consecuencia que debe decidirse antes de habilitar duplicados en producción: un correo duplicado entre tenants **no puede iniciar sesión ni recuperarse** hasta que exista un contrato de contexto (p. ej. subdominio/slug de agencia en el login, o resolución por credencial). Un administrador de otro tenant podría, con ese comportamiento, volver ambiguo el correo de un usuario ajeno (denegación de acceso, no acceso). Opciones sin elegir: (a) tenant explícito en login y recuperación; (b) subdominio/host por agencia; (c) resolución por credencial válida única.
+* `POST /api/v1/auth/register` y `POST /api/v1/companies` (creación de tenant, sin contexto previo) **mantienen** el 409 por correo existente en cualquier tenant, precisamente para no crear identificadores ambiguos; esto deja una señal de existencia en el registro anónimo (comportamiento heredado) que debe cerrarse con verificación de correo al definirse el onboarding.

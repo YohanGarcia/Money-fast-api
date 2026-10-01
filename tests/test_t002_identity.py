@@ -455,7 +455,7 @@ def test_z04_cross_tenant_read_write_and_role_assignment_denied(client, sink, te
     assert client.delete(f"{V2}/users/{uid_b}/roles/{b_role['id']}", headers=adm_a).status_code == 404
     assert (
         client.post(f"{V2}/users", headers=adm_a, json={"email": "b-staff@example.com", "given_names": "x"}).status_code
-        == 409
+        == 201  # same email in another tenant is not a conflict (and reveals nothing)
     )
     assert {r["name"] for r in client.get(f"{V2}/roles", headers=adm_a).json()} == {"Administrador de agencia", "Rol A"}
     assert all(e["subject_id"] != uid_b for e in client.get(f"{V2}/security/events", headers=adm_a).json())

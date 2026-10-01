@@ -89,12 +89,21 @@ class UserAccount(Base):
     """Credentials and lifecycle. ``status`` is authoritative; ``is_active`` is a legacy view of it."""
 
     __tablename__ = "users"
-    __table_args__ = (CheckConstraint(_in("status", USER_STATUSES), name="status_valid"),)
+    __table_args__ = (
+        CheckConstraint(_in("status", USER_STATUSES), name="status_valid"),
+        CheckConstraint("email = lower(btrim(email))", name="email_normalized"),
+        # Login identity is tenant-aware: the same normalised email may exist in different tenants.
+        # Platform accounts (company_id NULL) have their own, separate uniqueness.
+        Index(
+            "uq_users_tenant_email", "company_id", "email", unique=True, postgresql_where=text("company_id IS NOT NULL")
+        ),
+        Index("uq_users_platform_email", "email", unique=True, postgresql_where=text("company_id IS NULL")),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     person_id: Mapped[int | None] = mapped_column(ForeignKey("persons.id"), nullable=True, index=True)
     full_name: Mapped[str] = mapped_column(String(140))
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)  # login identifier
+    email: Mapped[str] = mapped_column(String(255), index=True)  # normalised login identifier (lower, trimmed)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[UserRole | None] = mapped_column(
         SqlEnum(UserRole), nullable=True
