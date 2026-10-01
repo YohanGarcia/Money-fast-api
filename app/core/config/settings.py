@@ -116,6 +116,8 @@ class Settings(BaseSettings):
                 raise ValueError("SECRET_KEY debe tener al menos 32 caracteres en staging/produccion.")
             if self.debug:
                 raise ValueError("DEBUG no puede estar activo en staging/produccion.")
+            if "trusted_hosts" not in self.model_fields_set:
+                raise ValueError("TRUSTED_HOSTS debe definirse explicitamente en staging/produccion.")
             if "*" in self.trusted_host_list or not self.trusted_host_list:
                 raise ValueError("TRUSTED_HOSTS debe listar hosts explicitos (sin '*') en staging/produccion.")
         return self

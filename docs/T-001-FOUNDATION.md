@@ -96,8 +96,15 @@ Sin dependencias de runtime nuevas (stdlib: `logging`, `contextvars`, `zoneinfo`
 
 ## Limitaciones conocidas / acciones del propietario
 
-- **Bases ya desplegadas** (p. ej. Railway) tienen una cadena Alembic anterior: `alembic upgrade head` fallará ("can't locate revision"). Según ADR-007 los datos son de prueba y se permite `RESET_AND_RESEED`; si hubiera datos a conservar, requiere decisión explícita. `railpack.json` ahora ejecuta `alembic upgrade head` antes de uvicorn y `TRUSTED_HOSTS`/`SECRET_KEY` deben definirse en `staging`/`production`.
+- **Migraciones / bases existentes (decisión confirmada):** `RESET_AND_RESEED` para los entornos actuales de prueba (Fast Money aún no está en producción). No se mantiene compatibilidad con la cadena Alembic legacy; la baseline `0001` es la base de la convergencia v2. Esto NO se extrapola a futuras bases de producción. `railpack.json` ejecuta `alembic upgrade head`; en `staging`/`production` deben definirse `SECRET_KEY` y `TRUSTED_HOSTS` explícitos (la app se niega a arrancar si no).
 - El `.env` local con `DATABASE_URL=sqlite:///...` deja de funcionar; apuntarlo a PostgreSQL.
 - La lógica legacy no cambió: mora/estados siguen usando fecha UTC (`loan_service.py`), el reverso de Caja no corrige Crédito, etc. Pertenece a paquetes posteriores.
 - `app/services/email_service.py` imprime el código de recuperación en logs de desarrollo (legacy, fuera de T-001).
 - Los clientes web/móvil leen `detail`; se conserva el alias hasta su convergencia.
+
+## Deuda explícita para T-002 (seguridad)
+
+- **Código de recuperación en logs**: `app/services/email_service.py` imprime/registra el código de recuperación cuando SMTP no está configurado. No lo introdujo T-001 y no bloquea la fundación, pero **MUST** eliminarse/corregirse en Identity/Auth: ningún recovery code, token o secreto puede terminar en logs en la arquitectura nueva. (El `debug_code` devuelto por `/auth/request-password-reset` fuera de producción también debe revisarse.)
+- Otros hallazgos de la auditoría que corresponden a T-002: límite de intentos de login/recuperación, enumeración de usuarios en `verify-reset-code`, tokens en `localStorage`/`AsyncStorage`.
+- `app/services/cash_service.py` tiene un diff local sin confirmar, ajeno a T-001, que se revisará en el paquete de Caja.
+

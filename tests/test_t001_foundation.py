@@ -248,7 +248,10 @@ def test_t001_12_no_sqlite_in_new_runtime_or_test_configuration():
 # -- Supporting config / logging checks -------------------------------------
 def test_settings_are_strict_in_staging_and_production():
     base = dict(database_url=PG_URL, secret_key="x" * 40, trusted_hosts="api.example.com")
-    assert Settings(environment="production", **base).is_strict
+    assert Settings(environment="production", _env_file=None, **base).is_strict
+    implicit = {k: v for k, v in base.items() if k != "trusted_hosts"}
+    with pytest.raises(ValidationError):  # the local-hosts default must not satisfy a strict environment
+        Settings(environment="production", _env_file=None, **implicit)
     for override in (
         dict(secret_key="change-me-in-production"),
         dict(secret_key="short"),
@@ -256,7 +259,7 @@ def test_settings_are_strict_in_staging_and_production():
         dict(debug=True),
     ):
         with pytest.raises(ValidationError):
-            Settings(environment="staging", **{**base, **override})
+            Settings(environment="staging", _env_file=None, **{**base, **override})
     with pytest.raises(ValidationError):
         Settings(database_url=PG_URL, default_timezone="UTC-4")
     with pytest.raises(ValidationError):
