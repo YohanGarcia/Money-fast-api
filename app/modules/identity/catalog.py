@@ -49,6 +49,11 @@ CATALOG: tuple[PermissionDef, ...] = (
     PermissionDef("customers.activate", "tenant", "Activar y desactivar clientes", True),
     PermissionDef("customers.assign_branch", "tenant", "Cambiar la sucursal de gestion de un cliente", True),
     PermissionDef("customers.duplicates.review", "tenant", "Revisar posibles duplicados (sin fusionar)", True),
+    PermissionDef("credit.products.read", "tenant", "Consultar productos de credito, versiones y simulaciones"),
+    PermissionDef("credit.products.create", "tenant", "Crear productos de credito"),
+    PermissionDef("credit.products.update_draft", "tenant", "Editar y validar borradores de version de producto"),
+    PermissionDef("credit.products.publish", "tenant", "Publicar versiones y reactivar productos de credito", True),
+    PermissionDef("credit.products.deactivate", "tenant", "Desactivar productos y retirar versiones", True),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

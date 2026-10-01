@@ -74,3 +74,5 @@ __all__ = [
     "UserRole",
     "UserSession",
 ]
+
+from app.modules.credit.models import CreditProduct, CreditProductCurrency, CreditProductVersion  # noqa: F401

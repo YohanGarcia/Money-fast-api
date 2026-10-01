@@ -52,6 +52,8 @@ include = [
   "tests/test_t002_google.py",
   "tests/test_t003_organization.py",
   "tests/test_t004_customers.py",
+  "tests/test_t005_engine.py",
+  "tests/test_t005_credit_products.py",
 ]
 
 [tool.ruff.lint]
@@ -62,3 +64,4 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 
 [tool.ruff.lint.per-file-ignores]
 "tests/test_t00[0-9]_*.py" = ["F811"]  # pytest fixture re-use via import
+"tests/test_t005_credit_products.py" = ["E501"]  # long inline SQL literals
