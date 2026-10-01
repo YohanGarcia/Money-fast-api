@@ -251,6 +251,99 @@ def test_v04_published_version_is_immutable_in_api_and_database(client, tenant_a
     assert got["rules"] == rules() and got["rules_hash"] == v["rules_hash"]
 
 
+def _raises_immutable(sql, **params):
+    with SessionLocal() as db:
+        with pytest.raises(DBAPIError, match="immutable"):
+            db.execute(text(sql), params)
+            db.commit()
+        db.rollback()
+
+
+def test_v04b_currency_rows_cannot_be_moved_into_or_out_of_a_published_version(client, tenant_a, tenant_b):
+    """Review fix 01: the currency guard must inspect OLD *and* NEW version_id on UPDATE."""
+    adm = admin_headers(client, tenant_a)
+    for code in ("USD", "EUR"):
+        assert client.post(f"{V2}/tenant/currencies", headers=adm, json={"code": code}).status_code == 201
+    p, pub = flow(client, adm)  # published: DOP only
+    draft = mk_version(client, adm, p["id"], cur=[{"code": "USD", "min_amount": "10", "max_amount": "99"}])
+    base = f"{P}/{p['id']}/versions/{pub['id']}"
+    snap_before = client.get(f"{base}/snapshot", headers=adm).json()
+    cur_before = client.get(base, headers=adm).json()["currencies"]
+    assert snap_before["hash_verified"] is True
+    ids = {"pub": pub["id"], "draft": draft["id"]}
+
+    # 1. draft -> published (the reported hole)
+    _raises_immutable(
+        "UPDATE credit_product_currencies SET version_id = :pub WHERE version_id = :draft AND currency_code = 'USD'",
+        **ids,
+    )
+    # 2. everything at once: version, tenant, currency and limits
+    _raises_immutable(
+        "UPDATE credit_product_currencies SET version_id = :pub, tenant_id = :other, currency_code = 'EUR', "
+        "min_amount = 1, max_amount = 2 WHERE version_id = :draft AND currency_code = 'USD'",
+        other=tenant_b["tenant_id"],
+        **ids,
+    )
+    # 3. published -> draft (moving a frozen row out of its version)
+    _raises_immutable("UPDATE credit_product_currencies SET version_id = :draft WHERE version_id = :pub", **ids)
+    # 4. in-place changes / insert / delete on the published version
+    _raises_immutable("UPDATE credit_product_currencies SET max_amount = 1 WHERE version_id = :pub", **ids)
+    _raises_immutable("DELETE FROM credit_product_currencies WHERE version_id = :pub", **ids)
+    _raises_immutable(
+        "INSERT INTO credit_product_currencies (version_id, currency_code, tenant_id, min_amount, max_amount) "
+        "SELECT id, 'EUR', tenant_id, 1, 2 FROM credit_product_versions WHERE id = :pub",
+        **ids,
+    )
+    # the draft row is still a draft row and a draft->draft move stays possible
+    other = mk_version(client, adm, p["id"], cur=[])
+    with SessionLocal() as db:
+        db.execute(
+            text("UPDATE credit_product_currencies SET version_id = :o WHERE version_id = :draft"),
+            {"o": other["id"], "draft": draft["id"]},
+        )
+        db.commit()
+    assert client.get(f"{P}/{p['id']}/versions/{other['id']}", headers=adm).json()["currencies"][0]["code"] == "USD"
+
+    # nothing frozen changed
+    after = client.get(base, headers=adm).json()
+    assert after["currencies"] == cur_before and after["rules_hash"] == pub["rules_hash"] == snap_before["rules_hash"]
+    snap_after = client.get(f"{base}/snapshot", headers=adm).json()
+    assert snap_after["snapshot"] == snap_before["snapshot"] and snap_after["hash_verified"] is True
+    assert client.post(f"{base}/simulate", headers=adm, json=SIM).status_code == 200
+
+
+def test_v04c_every_frozen_column_of_a_published_version_is_protected_against_direct_update(client, tenant_a):
+    adm = admin_headers(client, tenant_a)
+    p, pub = flow(client, adm)
+    frozen = {
+        "rules": "'{}'::jsonb",
+        "rules_hash": "'sha256:x'",
+        "snapshot": "'{}'::jsonb",
+        "effective_from": "effective_from + 1",
+        "published_at": "now() + interval '1 day'",
+        "published_by": "999",
+        "created_by": "999",
+        "created_at": "created_at - interval '1 day'",
+        "version_number": "99",
+        "product_id": "product_id + 1000",
+        "tenant_id": "tenant_id + 1000",
+        "id": "id + 1000",
+    }
+    for column, value in frozen.items():
+        _raises_immutable(f"UPDATE credit_product_versions SET {column} = {value} WHERE id = :id", id=pub["id"])
+    for target in ("draft", "foo"):  # no way back to draft, no unknown status
+        with SessionLocal() as db:
+            with pytest.raises(DBAPIError):
+                db.execute(
+                    text("UPDATE credit_product_versions SET status = :s WHERE id = :id"),
+                    {"s": target, "id": pub["id"]},
+                )
+                db.commit()
+            db.rollback()
+    got = client.get(f"{P}/{p['id']}/versions/{pub['id']}", headers=adm).json()
+    assert got["rules"] == pub["rules"] and got["rules_hash"] == pub["rules_hash"] and got["status"] == "published"
+
+
 def test_v05_new_version_does_not_alter_the_previous_one(client, tenant_a):
     adm = admin_headers(client, tenant_a)
     p, v1 = flow(client, adm)
@@ -725,6 +818,10 @@ def test_migration_0007_upgrade_downgrade_reupgrade(scratch_db):
                 for r in c.execute(text("SELECT indexname FROM pg_indexes WHERE tablename = 'credit_product_versions'"))
             }
             assert "uq_credit_product_versions_open" in idx
+            guard = c.execute(
+                text("SELECT prosrc FROM pg_proc WHERE proname = 'credit_product_currencies_guard'")
+            ).scalar()
+            assert "NEW.version_id" in guard and "OLD.version_id" in guard  # both ends of an UPDATE are inspected
         with eng.begin() as c:  # the trigger exists in a migrated database too
             c.execute(
                 text(

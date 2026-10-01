@@ -183,12 +183,17 @@ VERSION_GUARD_TRIGGER = (
 )
 CURRENCY_GUARD_FN = """
 CREATE OR REPLACE FUNCTION credit_product_currencies_guard() RETURNS trigger AS $$
-DECLARE v_status text; v_id integer;
+DECLARE v_old text; v_new text;
 BEGIN
-  v_id := CASE WHEN TG_OP = 'INSERT' THEN NEW.version_id ELSE OLD.version_id END;
-  SELECT status INTO v_status FROM credit_product_versions WHERE id = v_id;
-  IF v_status IS NOT NULL AND v_status <> 'draft' THEN
-    RAISE EXCEPTION 'credit product version % is published: its currencies are immutable', v_id;
+  -- both ends are checked: a row may not be written into, removed from or MOVED to/from a non-draft version
+  IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    SELECT status INTO v_old FROM credit_product_versions WHERE id = OLD.version_id;
+  END IF;
+  IF TG_OP IN ('INSERT', 'UPDATE') THEN
+    SELECT status INTO v_new FROM credit_product_versions WHERE id = NEW.version_id;
+  END IF;
+  IF (v_old IS NOT NULL AND v_old <> 'draft') OR (v_new IS NOT NULL AND v_new <> 'draft') THEN
+    RAISE EXCEPTION 'credit product version is published: its currencies are immutable (%)', TG_OP;
   END IF;
   RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END $$ LANGUAGE plpgsql
