@@ -114,3 +114,16 @@ drops keys containing `hash`, so the digest is stored under `rules_digest`.
 * Concurrency: version numbering and publication serialised by the product row lock + unique constraints; tested with
   threads (6 concurrent creates → 1..6; 2 concurrent publishes → exactly one winner, one open-ended version).
 * Tenant isolation: every query filters `tenant_id`; foreign ids are 404; composite FKs reject cross-tenant rows in the DB.
+
+## Locking protocol (review fix 02)
+
+* Lock order for writes through the API: product row `FOR UPDATE` → version row `FOR UPDATE`, **before** reading
+  rules/currencies (edit, validate, publish, retire). Publish therefore sees every committed change of the draft and
+  freezes exactly that content; a change committed later is refused by the immutability guards.
+* `credit_product_currencies_guard()` locks the version row(s) it inspects `FOR SHARE` (ascending id), so a currency
+  write waits for an in-flight publish and is then rejected, and a publish waits for an in-flight currency write and then
+  reads its result. Direct `UPDATE credit_product_versions … SET rules` takes the row lock itself.
+* Share locks do not conflict with each other and publish locks a single version row, so the protocol has no lock cycle;
+  the ascending-id order is defence in depth (a mutation that removes it is NOT detected by tests, deliberately noted).
+* A publish after a content change keeps the old `validated_hash` and is refused (422) until the draft is validated again,
+  unless the change was hash-neutral (e.g. holiday order), in which case the final stored content is what gets frozen.

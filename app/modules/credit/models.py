@@ -183,9 +183,23 @@ VERSION_GUARD_TRIGGER = (
 )
 CURRENCY_GUARD_FN = """
 CREATE OR REPLACE FUNCTION credit_product_currencies_guard() RETURNS trigger AS $$
-DECLARE v_old text; v_new text;
+DECLARE v_old text; v_new text; v_lo integer; v_hi integer;
 BEGIN
-  -- both ends are checked: a row may not be written into, removed from or MOVED to/from a non-draft version
+  -- Both ends are checked: a row may not be written into, removed from or MOVED to/from a non-draft version.
+  -- The version rows are locked FOR SHARE (conflicts with publish's FOR UPDATE and with any UPDATE of the
+  -- version) so the draft cannot be published between this check and the commit of the change, and a publish in
+  -- flight makes this write wait and then be rejected. Locks are taken in ascending id order: no lock-order cycles.
+  IF TG_OP = 'INSERT' THEN
+    v_lo := NEW.version_id; v_hi := NEW.version_id;
+  ELSIF TG_OP = 'DELETE' THEN
+    v_lo := OLD.version_id; v_hi := OLD.version_id;
+  ELSE
+    v_lo := LEAST(OLD.version_id, NEW.version_id); v_hi := GREATEST(OLD.version_id, NEW.version_id);
+  END IF;
+  PERFORM 1 FROM credit_product_versions WHERE id = v_lo FOR SHARE;
+  IF v_hi <> v_lo THEN
+    PERFORM 1 FROM credit_product_versions WHERE id = v_hi FOR SHARE;
+  END IF;
   IF TG_OP IN ('UPDATE', 'DELETE') THEN
     SELECT status INTO v_old FROM credit_product_versions WHERE id = OLD.version_id;
   END IF;

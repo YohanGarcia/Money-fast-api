@@ -67,14 +67,20 @@ def _product(db: Session, actor: Principal, product_id: int, *, lock: bool = Fal
     return product
 
 
-def _version(db: Session, actor: Principal, product_id: int, version_id: int) -> CreditProductVersion:
-    version = db.scalar(
-        select(CreditProductVersion).where(
-            CreditProductVersion.id == version_id,
-            CreditProductVersion.product_id == product_id,
-            CreditProductVersion.tenant_id == actor.tenant_id,
-        )
+def _version(
+    db: Session, actor: Principal, product_id: int, version_id: int, *, lock: bool = False
+) -> CreditProductVersion:
+    """``lock=True`` takes ``FOR UPDATE`` on the version row (always AFTER the product row: one lock order). Every
+    write path locks before it reads rules/currencies, so a concurrent direct change to the draft either lands first
+    (and is read) or waits until this transaction ends (and is then rejected by the immutability guards)."""
+    stmt = select(CreditProductVersion).where(
+        CreditProductVersion.id == version_id,
+        CreditProductVersion.product_id == product_id,
+        CreditProductVersion.tenant_id == actor.tenant_id,
     )
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    version = db.scalar(stmt)
     if version is None:
         raise TenantMismatch()
     return version
@@ -326,7 +332,7 @@ def update_version(
 ) -> dict:
     _gate(actor, UPDATE_DRAFT)
     product = _product(db, actor, product_id, lock=True)
-    version = _version(db, actor, product.id, version_id)
+    version = _version(db, actor, product.id, version_id, lock=True)
     if version.status != "draft":
         raise VersionImmutable()
     if version.row_version != body.row_version:
@@ -366,7 +372,7 @@ def _run_validation(db: Session, actor: Principal, version: CreditProductVersion
 def validate_version(db: Session, actor: Principal, product_id: int, version_id: int, client_ip: str | None) -> dict:
     _gate(actor, UPDATE_DRAFT)
     product = _product(db, actor, product_id, lock=True)
-    version = _version(db, actor, product.id, version_id)
+    version = _version(db, actor, product.id, version_id, lock=True)
     if version.status != "draft":
         raise VersionImmutable("Solo se validan borradores; las versiones publicadas ya fueron validadas.")
     result, currencies = _run_validation(db, actor, version)
@@ -431,7 +437,7 @@ def publish_version(
 ) -> dict:
     _gate(actor, PUBLISH)
     product = _product(db, actor, product_id, lock=True)
-    version = _version(db, actor, product.id, version_id)
+    version = _version(db, actor, product.id, version_id, lock=True)
     if version.status != "draft":
         raise VersionImmutable("La version ya esta publicada.")
     if version.row_version != body.row_version:
@@ -509,7 +515,7 @@ def retire_version(
 ) -> dict:
     _gate(actor, DEACTIVATE)
     product = _product(db, actor, product_id, lock=True)
-    version = _version(db, actor, product.id, version_id)
+    version = _version(db, actor, product.id, version_id, lock=True)
     if version.status != "published":
         raise InvalidStateTransition("Solo se retira una version publicada.")
     today = business_date(tz=_tenant(db, actor).default_timezone)
