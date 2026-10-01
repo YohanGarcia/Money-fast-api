@@ -11,7 +11,7 @@ Person != UserAccount != Role != Permission:
 The tenant is the ``companies`` row until T-003 formalises Tenant/Branch.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 
@@ -19,6 +19,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -27,6 +28,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy import Enum as SqlEnum
@@ -35,6 +37,7 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
+from app.shared.normalization import normalize_document, normalize_document_type, normalize_name
 
 
 def _now() -> datetime:
@@ -68,7 +71,26 @@ class Person(Base):
     __tablename__ = "persons"
     __table_args__ = (
         CheckConstraint(_in("status", PERSON_STATUSES), name="status_valid"),
+        CheckConstraint("(document_number IS NULL) = (document_number_normalized IS NULL)", name="document_consistent"),
+        CheckConstraint("document_number IS NULL OR document_type IS NOT NULL", name="document_type_required"),
+        CheckConstraint(
+            "document_issue_date IS NULL OR document_expiry_date IS NULL "
+            "OR document_expiry_date >= document_issue_date",
+            name="document_dates_ordered",
+        ),
         Index("ix_persons_tenant_id", "tenant_id"),
+        # target of tenant-safe composite foreign keys (customer profiles, identity revisions)
+        UniqueConstraint("tenant_id", "id", name="uq_persons_tenant_id"),
+        # One identity per normalised document inside a tenant (the EXACT_MATCH rule of DF-02 §2 / T-004 §12).
+        Index(
+            "uq_persons_tenant_document",
+            "tenant_id",
+            "document_type",
+            "document_number_normalized",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL AND document_number_normalized IS NOT NULL"),
+        ),
+        Index("ix_persons_tenant_search_name", "tenant_id", "search_name"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -76,7 +98,15 @@ class Person(Base):
     given_names: Mapped[str] = mapped_column(String(120))
     family_names: Mapped[str] = mapped_column(String(120), default="")
     document_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
-    document_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    document_number: Mapped[str | None] = mapped_column(String(40), nullable=True)  # as entered
+    document_number_normalized: Mapped[str | None] = mapped_column(String(40), nullable=True)  # derived, see events
+    document_country: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    document_issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    document_expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    alias: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    nationality: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    search_name: Mapped[str] = mapped_column(String(260), default="")  # derived: accent/case-insensitive full name
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
@@ -386,3 +416,14 @@ class OidcChallenge(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+@event.listens_for(Person, "before_insert")
+@event.listens_for(Person, "before_update")
+def _derive_person_normalized_fields(mapper, connection, target: Person) -> None:
+    """Single source of the derived columns: the normalised document and the search name."""
+    target.document_type = normalize_document_type(target.document_type)
+    target.document_number_normalized = normalize_document(target.document_number)
+    if target.document_number_normalized is None:
+        target.document_number = None
+    target.search_name = normalize_name(f"{target.given_names} {target.family_names}")

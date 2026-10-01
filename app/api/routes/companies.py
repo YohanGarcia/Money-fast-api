@@ -217,6 +217,11 @@ def delete_company(
             detail="La empresa tiene datos. Desactívala en vez de borrarla.",
         )
 
+    from app.modules.customers.models import CustomerProfile
+
+    if db.scalar(select(func.count()).select_from(CustomerProfile).where(CustomerProfile.tenant_id == company_id)):
+        raise HTTPException(status_code=400, detail="La empresa tiene datos. Desactivala en vez de borrarla.")
+
     # Safe to remove: drop its users and subscriptions, then the company.
     # Identity rows hang off the tenant: assignments/tokens first, then users, roles and persons.
     from app.modules.identity.models import Person, RecoveryToken, Role, RolePermission, UserRoleAssignment

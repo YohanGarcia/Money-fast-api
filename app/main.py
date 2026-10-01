@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.context.middleware import RequestContextMiddleware
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.modules.customers.api import router as customers_router
 from app.modules.identity.api import router as identity_router
 from app.modules.organization.api import router as organization_router
 
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     application.include_router(api_router, prefix="/api/v1")
     application.include_router(identity_router)
     application.include_router(organization_router)
+    application.include_router(customers_router)
 
     @application.get("/")
     def root() -> dict[str, str]:
