@@ -1,0 +1,290 @@
+"""Identity & authorization persistence (T-002, ADR-004).
+
+Person != UserAccount != Role != Permission:
+
+* ``Person``       — common identity only (no credentials, permissions or debt);
+* ``UserAccount``  — credentials + lifecycle (table ``users``, kept for FK compatibility);
+* ``Role``         — administrable bundle of permissions (tenant roles or platform roles);
+* ``Permission``   — stable ``resource.action`` code from a code-defined catalog;
+* ``UserRoleAssignment`` — who holds which role, at which scope, with revocation history.
+
+The tenant is the ``companies`` row until T-003 formalises Tenant/Branch.
+"""
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from enum import Enum
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy import Enum as SqlEnum
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.db import Base
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+# --- statuses ---------------------------------------------------------------
+USER_STATUSES = ("pending", "active", "locked", "disabled")
+PERSON_STATUSES = ("active", "inactive")
+ROLE_STATUSES = ("active", "archived")
+ASSIGNMENT_SCOPES = ("tenant", "branch", "own")
+TOKEN_PURPOSES = ("recovery", "activation")
+
+
+def _in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(v) for v in values)})"
+
+
+class UserRole(str, Enum):  # noqa: UP042 - persisted enum values must stay plain strings
+    """LEGACY coarse role. Kept only for legacy routes until their modules are rebuilt;
+    authorization in the new architecture never relies on it."""
+
+    superadmin = "superadmin"
+    admin = "admin"
+    manager = "manager"
+    collector = "collector"
+    cashier = "cashier"
+
+
+class Person(Base):
+    __tablename__ = "persons"
+    __table_args__ = (
+        CheckConstraint(_in("status", PERSON_STATUSES), name="status_valid"),
+        Index("ix_persons_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True)
+    given_names: Mapped[str] = mapped_column(String(120))
+    family_names: Mapped[str] = mapped_column(String(120), default="")
+    document_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    document_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.given_names} {self.family_names}".strip()
+
+
+class UserAccount(Base):
+    """Credentials and lifecycle. ``status`` is authoritative; ``is_active`` is a legacy view of it."""
+
+    __tablename__ = "users"
+    __table_args__ = (CheckConstraint(_in("status", USER_STATUSES), name="status_valid"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    person_id: Mapped[int | None] = mapped_column(ForeignKey("persons.id"), nullable=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(140))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)  # login identifier
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[UserRole | None] = mapped_column(
+        SqlEnum(UserRole), nullable=True
+    )  # LEGACY; NULL = no legacy privileges
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True)  # tenant; NULL = platform
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True, index=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Last known GPS position (live tracking, opt-in from the mobile app). LEGACY, owned by routes.
+    last_lat: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    last_lng: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    last_location_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    company = relationship("Company", back_populates="users")
+    branch = relationship("Branch")
+    person = relationship("Person")
+
+    @property
+    def tenant_id(self) -> int | None:
+        return self.company_id
+
+    @property
+    def is_platform(self) -> bool:
+        return self.company_id is None
+
+    @property
+    def branch_name(self) -> str | None:
+        return self.branch.name if self.branch is not None else None
+
+    @hybrid_property
+    def is_active(self) -> bool:
+        return self.status == "active"
+
+    @is_active.inplace.setter
+    def _is_active_setter(self, value: bool) -> None:
+        # LEGACY writers only (user edit screens). New code uses the explicit state machine.
+        if value and self.status != "active":
+            self.status = "active"
+            self.disabled_at = None
+            self.locked_at = self.locked_until = None
+            self.activated_at = self.activated_at or _now()
+        elif not value and self.status != "disabled":
+            self.status = "disabled"
+            self.disabled_at = _now()
+
+    @is_active.inplace.expression
+    @classmethod
+    def _is_active_expression(cls):
+        return cls.status == "active"
+
+
+class Permission(Base):
+    __tablename__ = "permissions"
+    __table_args__ = (CheckConstraint(_in("scope_kind", ("platform", "tenant")), name="scope_kind_valid"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), unique=True)
+    description: Mapped[str] = mapped_column(String(255), default="")
+    scope_kind: Mapped[str] = mapped_column(String(10))  # platform | tenant administration capability
+    is_sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class Role(Base):
+    __tablename__ = "roles"
+    __table_args__ = (
+        CheckConstraint(_in("status", ROLE_STATUSES), name="status_valid"),
+        # Tenant-aware uniqueness; platform roles (tenant_id NULL) are unique among themselves.
+        Index("uq_roles_tenant_name", "tenant_id", "name", unique=True, postgresql_where=text("tenant_id IS NOT NULL")),
+        Index("uq_roles_platform_name", "name", unique=True, postgresql_where=text("tenant_id IS NULL")),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    system_defined: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    permissions = relationship("Permission", secondary="role_permissions", lazy="selectin")
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), primary_key=True)
+    permission_id: Mapped[int] = mapped_column(ForeignKey("permissions.id"), primary_key=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class UserRoleAssignment(Base):
+    """Role held by a user at a scope. Revocation keeps the row (history is never deleted)."""
+
+    __tablename__ = "user_role_assignments"
+    __table_args__ = (
+        CheckConstraint(_in("scope_kind", ASSIGNMENT_SCOPES), name="scope_kind_valid"),
+        CheckConstraint("(scope_kind = 'branch') = (branch_id IS NOT NULL)", name="branch_scope_consistent"),
+        Index(
+            "uq_assignment_active_nonbranch",
+            "user_id",
+            "role_id",
+            "scope_kind",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL AND branch_id IS NULL"),
+        ),
+        Index(
+            "uq_assignment_active_branch",
+            "user_id",
+            "role_id",
+            "branch_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL AND branch_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
+    scope_kind: Mapped[str] = mapped_column(String(10), default="tenant")
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
+    assigned_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    revoked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    role = relationship("Role")
+
+
+class RecoveryToken(Base):
+    """Single-use, expiring, revocable secret. Only its SHA-256 is stored."""
+
+    __tablename__ = "recovery_tokens"
+    __table_args__ = (CheckConstraint(_in("purpose", TOKEN_PURPOSES), name="purpose_valid"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    purpose: Mapped[str] = mapped_column(String(20))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class AuthThrottle(Base):
+    """Exponential-backoff counters keyed by an HMAC of the identifier (no raw emails/IPs)."""
+
+    __tablename__ = "auth_throttle"
+    __table_args__ = (UniqueConstraint("scope", "key_hash"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(40))
+    key_hash: Mapped[str] = mapped_column(String(64))
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SecurityEvent(Base):
+    """Append-only functional security audit (never edited or deleted; enforced by a DB trigger).
+
+    ``actor_id`` / ``subject_id`` are deliberately not foreign keys: they are historical evidence
+    that must outlive any row. ``details`` is whitelisted/redacted and never holds secrets.
+    """
+
+    __tablename__ = "security_events"
+    __table_args__ = (
+        Index("ix_security_events_tenant_occurred", "tenant_id", "occurred_at"),
+        Index("ix_security_events_subject", "subject_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    event_type: Mapped[str] = mapped_column(String(60))
+    outcome: Mapped[str] = mapped_column(String(20), default="success")
+    tenant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subject_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)

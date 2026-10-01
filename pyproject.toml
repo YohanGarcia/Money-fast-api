@@ -39,6 +39,7 @@ include = [
   "app/core/logging/**/*.py",
   "app/core/time/**/*.py",
   "app/core/database.py",
+  "app/core/security/**/*.py",
   "app/modules/**/*.py",
   "app/shared/**/*.py",
   "app/api/system.py",
@@ -46,10 +47,14 @@ include = [
   "tests/pg_env.py",
   "tests/conftest.py",
   "tests/test_t001_foundation.py",
+  "tests/test_t002_identity.py",
 ]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.flake8-bugbear]
-extend-immutable-calls = ["fastapi.Depends"]
+extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_permission"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_t002_identity.py" = ["F811"]  # pytest fixture re-use via import

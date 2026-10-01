@@ -292,32 +292,11 @@ class MoneyFastApiTests(unittest.TestCase):
         companies_response = self.client.get("/api/v1/companies", headers=headers)
         self.assertEqual(companies_response.status_code, 403, companies_response.text)
 
-    def test_password_reset_debug_code_hidden_outside_development(self) -> None:
+    def test_legacy_password_reset_endpoints_and_debug_code_are_retired(self) -> None:
+        """T-002: the code-based reset (debug_code, verify-reset-code) no longer exists; use /api/v2/auth/recovery."""
         self.register_owner(email="reset@example.com")
-
-        previous_environment = settings.environment
-        settings.environment = "production"
-        try:
-            response = self.client.post(
-                "/api/v1/auth/request-password-reset",
-                json={"email": "reset@example.com"},
-            )
-        finally:
-            settings.environment = previous_environment
-
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertIsNone(body["debug_code"])
-        self.assertEqual(body["email"], "reset@example.com")
-
-    def test_password_reset_debug_code_present_in_development(self) -> None:
-        self.register_owner(email="devreset@example.com")
-        response = self.client.post(
-            "/api/v1/auth/request-password-reset",
-            json={"email": "devreset@example.com"},
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertIsNotNone(response.json()["debug_code"])
+        for path in ("request-password-reset", "verify-reset-code", "reset-password"):
+            self.assertEqual(self.client.post(f"/api/v1/auth/{path}", json={"email": "reset@example.com"}).status_code, 404)
 
     # ── loan / payment math ────────────────────────────────────────────────
     def test_customer_loan_and_composed_payment_flow(self) -> None:

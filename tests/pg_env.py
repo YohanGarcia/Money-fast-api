@@ -23,6 +23,10 @@ os.environ["DATABASE_URL"] = url
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["ENVIRONMENT"] = "development"
 # Keep tests hermetic: never hit real SMTP even if a .env configures it.
+# Cheap Argon2 parameters keep the suites fast; production uses the configured defaults.
+os.environ["PASSWORD_HASH_TIME_COST"] = "1"
+os.environ["PASSWORD_HASH_MEMORY_KIB"] = "8192"
+os.environ["PASSWORD_HASH_PARALLELISM"] = "1"
 os.environ["SMTP_HOST"] = ""
 os.environ["SMTP_USER"] = ""
 os.environ["SMTP_PASSWORD"] = ""

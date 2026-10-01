@@ -35,6 +35,26 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=10, ge=0)
     db_connect_timeout_seconds: int = Field(default=5, ge=1)
 
+    # Authentication (T-002). Argon2id parameters are configurable; defaults follow argon2-cffi.
+    password_min_length: int = Field(default=10, ge=8)
+    password_max_length: int = Field(default=128, ge=64)
+    password_hash_time_cost: int = Field(default=3, ge=1)
+    password_hash_memory_kib: int = Field(default=65536, ge=8192)
+    password_hash_parallelism: int = Field(default=4, ge=1)
+    recovery_token_ttl_minutes: int = Field(default=15, ge=1)
+    activation_token_ttl_hours: int = Field(default=72, ge=1)
+    # Anti-abuse: exponential backoff per counter (seconds), capped; failures decay after the window.
+    auth_throttle_window_seconds: int = Field(default=900, ge=60)
+    auth_throttle_base_seconds: int = Field(default=30, ge=1)
+    auth_throttle_max_seconds: int = Field(default=900, ge=1)
+    auth_max_failures_account_ip: int = Field(default=5, ge=1)
+    auth_max_failures_ip: int = Field(default=50, ge=1)
+    auth_account_lock_failures: int = Field(default=10, ge=1)
+    auth_account_lock_seconds: int = Field(default=900, ge=1)
+    recovery_max_requests_account: int = Field(default=3, ge=1)
+    recovery_max_requests_ip: int = Field(default=20, ge=1)
+    recovery_max_failures_ip: int = Field(default=10, ge=1)
+
     # IANA identifier of the platform default business timezone (ADR-006).
     default_timezone: str = "America/Santo_Domingo"
 

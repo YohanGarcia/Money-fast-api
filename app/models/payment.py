@@ -36,7 +36,7 @@ class Payment(Base):
     reference_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     loan = relationship("Loan", back_populates="payments")
-    collected_by = relationship("User")
+    collected_by = relationship("UserAccount")
 
     @property
     def collector_name(self) -> str | None:

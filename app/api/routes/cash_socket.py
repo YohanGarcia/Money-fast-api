@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from app.api.deps import get_current_user
+from app.core.errors import AppError
 from app.core.database import SessionLocal
 from app.services import cash_service, cash_live
 
@@ -39,7 +40,7 @@ async def live(ws: WebSocket):
                 # Revoked sessions and branch reassignments close the stream.
                 await run_in_threadpool(authorize, token, branch_id)
                 await ws.send_json({'type': event})
-    except HTTPException as exc:
+    except (HTTPException, AppError) as exc:
         await ws.close(4401 if exc.status_code == 401 else 4403)
     except (WebSocketDisconnect, OSError, RuntimeError):
         pass

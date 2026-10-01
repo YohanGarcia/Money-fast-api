@@ -23,7 +23,21 @@ class RequestContext:
     timezone: str | None = None  # effective IANA zone; None = platform default
 
 
-_current: ContextVar[RequestContext | None] = ContextVar("request_context", default=None)
+class _Holder:
+    """Mutable cell shared by every copy of the contextvar.
+
+    FastAPI runs sync dependencies in a worker thread with a *copy* of the context;
+    rebinding the variable there would be lost. Mutating this shared cell is visible
+    to the whole request (handlers, logging, the middleware's access log).
+    """
+
+    __slots__ = ("ctx",)
+
+    def __init__(self, ctx: RequestContext) -> None:
+        self.ctx = ctx
+
+
+_current: ContextVar[_Holder | None] = ContextVar("request_context", default=None)
 
 
 def new_correlation_id() -> str:
@@ -38,11 +52,12 @@ def sanitize_correlation_id(value: str | None) -> str | None:
 
 
 def get_context() -> RequestContext | None:
-    return _current.get()
+    holder = _current.get()
+    return holder.ctx if holder else None
 
 
 def set_context(ctx: RequestContext) -> Token:
-    return _current.set(ctx)
+    return _current.set(_Holder(ctx))
 
 
 def reset_context(token: Token) -> None:
@@ -50,10 +65,9 @@ def reset_context(token: Token) -> None:
 
 
 def bind_context(**changes: str | None) -> RequestContext:
-    """Replace fields of the active context (used by future auth resolvers)."""
-    ctx = get_context()
-    if ctx is None:
+    """Replace fields of the active context (used by the authenticated resolver)."""
+    holder = _current.get()
+    if holder is None:
         raise RuntimeError("No hay contexto de request activo.")
-    updated = replace(ctx, **changes)
-    _current.set(updated)
-    return updated
+    holder.ctx = replace(holder.ctx, **changes)
+    return holder.ctx

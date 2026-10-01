@@ -28,7 +28,7 @@ class UserRead(BaseModel):
     id: int
     full_name: str
     email: EmailStr
-    role: UserRole
+    role: UserRole | None = None
     is_active: bool
     company_id: int | None = None
     branch_id: int | None = None

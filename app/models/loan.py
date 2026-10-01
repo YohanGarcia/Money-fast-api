@@ -49,7 +49,7 @@ class Loan(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     customer = relationship("Customer", back_populates="loans")
-    created_by = relationship("User")
+    created_by = relationship("UserAccount")
     installments = relationship(
         "LoanInstallment",
         back_populates="loan",

@@ -8,9 +8,12 @@ class AppError(Exception):
     code = "internal_error"
     default_message = "Error interno."
 
-    def __init__(self, message: str | None = None, *, details: Any = None) -> None:
+    def __init__(
+        self, message: str | None = None, *, details: Any = None, headers: dict[str, str] | None = None
+    ) -> None:
         self.message = message or self.default_message
         self.details = details
+        self.headers = headers
         super().__init__(self.message)
 
 
