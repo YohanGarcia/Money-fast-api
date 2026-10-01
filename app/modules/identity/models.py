@@ -21,6 +21,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -44,7 +45,7 @@ def _now() -> datetime:
 USER_STATUSES = ("pending", "active", "locked", "disabled")
 PERSON_STATUSES = ("active", "inactive")
 ROLE_STATUSES = ("active", "archived")
-ASSIGNMENT_SCOPES = ("tenant", "branch", "own")
+ASSIGNMENT_SCOPES = ("tenant", "branch", "cash_point", "own")
 TOKEN_PURPOSES = ("recovery", "activation")
 
 
@@ -92,6 +93,10 @@ class UserAccount(Base):
     __table_args__ = (
         CheckConstraint(_in("status", USER_STATUSES), name="status_valid"),
         CheckConstraint("email = lower(btrim(email))", name="email_normalized"),
+        # A user's home branch must belong to the user's own tenant.
+        ForeignKeyConstraint(
+            ["company_id", "branch_id"], ["branches.company_id", "branches.id"], name="fk_users_tenant_branch"
+        ),
         # Login identity is tenant-aware: the same normalised email may exist in different tenants.
         # Platform accounts (company_id NULL) have their own, separate uniqueness.
         Index(
@@ -126,7 +131,7 @@ class UserAccount(Base):
 
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     company = relationship("Company", back_populates="users")
-    branch = relationship("Branch")
+    branch = relationship("Branch", foreign_keys="UserAccount.branch_id")
     person = relationship("Person")
 
     @property
@@ -211,13 +216,33 @@ class UserRoleAssignment(Base):
     __table_args__ = (
         CheckConstraint(_in("scope_kind", ASSIGNMENT_SCOPES), name="scope_kind_valid"),
         CheckConstraint("(scope_kind = 'branch') = (branch_id IS NOT NULL)", name="branch_scope_consistent"),
+        CheckConstraint(
+            "(scope_kind = 'cash_point') = (cash_point_id IS NOT NULL)", name="cash_point_scope_consistent"
+        ),
+        # A scope can never reference a branch / cash point of another tenant (composite, tenant-safe keys).
+        ForeignKeyConstraint(
+            ["tenant_id", "branch_id"], ["branches.company_id", "branches.id"], name="fk_assignments_tenant_branch"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "cash_point_id"],
+            ["cash_points.tenant_id", "cash_points.id"],
+            name="fk_assignments_tenant_cash_point",
+        ),
         Index(
             "uq_assignment_active_nonbranch",
             "user_id",
             "role_id",
             "scope_kind",
             unique=True,
-            postgresql_where=text("revoked_at IS NULL AND branch_id IS NULL"),
+            postgresql_where=text("revoked_at IS NULL AND branch_id IS NULL AND cash_point_id IS NULL"),
+        ),
+        Index(
+            "uq_assignment_active_cash_point",
+            "user_id",
+            "role_id",
+            "cash_point_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL AND cash_point_id IS NOT NULL"),
         ),
         Index(
             "uq_assignment_active_branch",
@@ -235,6 +260,7 @@ class UserRoleAssignment(Base):
     role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
     scope_kind: Mapped[str] = mapped_column(String(10), default="tenant")
     branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
+    cash_point_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     assigned_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     revoked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)

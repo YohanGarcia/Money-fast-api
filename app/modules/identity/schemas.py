@@ -53,8 +53,9 @@ class RoleCreateIn(_In):
 
 class RoleAssignIn(_In):
     role_id: int
-    scope: Literal["tenant", "branch", "own"] = "tenant"
+    scope: Literal["tenant", "branch", "cash_point", "own"] = "tenant"
     branch_id: int | None = None
+    cash_point_id: int | None = None
 
 
 class PersonOut(BaseModel):
@@ -121,6 +122,7 @@ class AssignmentOut(BaseModel):
     role_id: int
     scope_kind: str
     branch_id: int | None
+    cash_point_id: int | None = None
 
 
 class EventOut(BaseModel):

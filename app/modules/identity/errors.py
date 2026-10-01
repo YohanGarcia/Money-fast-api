@@ -92,3 +92,8 @@ class ExternalIdentityNotLinked(AppError):
 class ExternalIdentityConflict(AppError):
     status_code, code = 409, "external_identity_conflict"
     default_message = "La identidad externa ya esta vinculada a otra cuenta."
+
+
+class TenantInactive(AppError):
+    status_code, code = 403, "tenant_inactive"
+    default_message = "La agencia esta inactiva."

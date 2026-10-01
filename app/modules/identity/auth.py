@@ -27,6 +27,7 @@ from app.core.security import (
     verify_token_hash,
 )
 from app.core.time import now_utc
+from app.models.company import Company
 from app.models.session import UserSession
 from app.modules.identity import throttle
 from app.modules.identity.audit import record_event
@@ -39,9 +40,11 @@ from app.modules.identity.errors import (
     RateLimited,
     SessionExpired,
     SessionInvalid,
+    TenantInactive,
 )
 from app.modules.identity.models import UserAccount
 from app.modules.identity.tenant import normalize_slug, resolve_tenant
+from app.modules.organization.resolver import context_values
 
 log = logging.getLogger("app.identity.auth")
 
@@ -277,11 +280,19 @@ def authenticate_access_token(db: Session, token: str, now: datetime | None = No
         raise SessionExpired()
     if user.status != "active":
         raise SessionInvalid()
+    timezone = base_currency = None
+    if user.company_id is not None:
+        tenant = db.get(Company, user.company_id)
+        if tenant is None or tenant.status != "active":
+            raise TenantInactive()  # an inactive tenant accepts no new authenticated operations
+        timezone, base_currency = context_values(db, user.company_id, user.branch_id)
     if get_context() is not None:  # HTTP requests only (WebSocket/scripts have no request context)
         bind_context(
             actor_id=str(user.id),
             tenant_id=str(user.company_id) if user.company_id is not None else None,
             branch_id=str(user.branch_id) if user.branch_id is not None else None,
+            timezone=timezone,
+            base_currency=base_currency,
         )
     return user, session
 

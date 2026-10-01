@@ -50,6 +50,7 @@ include = [
   "tests/test_t002_identity.py",
   "tests/test_t002_tenant_login.py",
   "tests/test_t002_google.py",
+  "tests/test_t003_organization.py",
 ]
 
 [tool.ruff.lint]

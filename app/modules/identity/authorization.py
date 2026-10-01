@@ -19,6 +19,7 @@ class Grant:
     permission: str
     scope_kind: str  # tenant | branch | own
     branch_id: int | None = None
+    cash_point_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,7 @@ class Principal:
         tenant_id: int | None = None,
         branch_id: int | None = None,
         owner_id: int | None = None,
+        cash_point_id: int | None = None,
     ) -> bool:
         """DENY unless an existing grant of a catalogued permission covers the target."""
         if permission not in CATALOG_CODES:
@@ -53,6 +55,8 @@ class Principal:
                 return True
             if g.scope_kind == "branch" and branch_id is not None and g.branch_id == branch_id:
                 return True
+            if g.scope_kind == "cash_point" and cash_point_id is not None and g.cash_point_id == cash_point_id:
+                return True
             if g.scope_kind == "own" and owner_id is not None and owner_id == self.user_id:
                 return True
         return False
@@ -60,6 +64,17 @@ class Principal:
     def holds_at_tenant_scope(self, permission: str) -> bool:
         return permission in CATALOG_CODES and any(
             g.permission == permission and g.scope_kind == "tenant" for g in self.grants
+        )
+
+    def holds_for_cash_point(self, permission: str, cash_point_id: int, branch_id: int | None) -> bool:
+        return permission in CATALOG_CODES and any(
+            g.permission == permission
+            and (
+                g.scope_kind == "tenant"
+                or (g.scope_kind == "branch" and branch_id is not None and g.branch_id == branch_id)
+                or (g.scope_kind == "cash_point" and g.cash_point_id == cash_point_id)
+            )
+            for g in self.grants
         )
 
     def holds_for_branch(self, permission: str, branch_id: int) -> bool:
@@ -76,7 +91,12 @@ def effective_grants(db: Session, user: UserAccount) -> tuple[Grant, ...]:
     kind = "platform" if user.company_id is None else "tenant"
     role_tenant = Role.tenant_id.is_(None) if user.company_id is None else Role.tenant_id == user.company_id
     rows = db.execute(
-        select(Permission.code, UserRoleAssignment.scope_kind, UserRoleAssignment.branch_id)
+        select(
+            Permission.code,
+            UserRoleAssignment.scope_kind,
+            UserRoleAssignment.branch_id,
+            UserRoleAssignment.cash_point_id,
+        )
         .join(RolePermission, RolePermission.permission_id == Permission.id)
         .join(Role, Role.id == RolePermission.role_id)
         .join(UserRoleAssignment, UserRoleAssignment.role_id == Role.id)
@@ -90,8 +110,8 @@ def effective_grants(db: Session, user: UserAccount) -> tuple[Grant, ...]:
     ).all()
     return tuple(
         sorted(
-            {Grant(code, scope, branch) for code, scope, branch in rows},
-            key=lambda g: (g.permission, g.scope_kind, g.branch_id or 0),
+            {Grant(code, scope, branch, cp) for code, scope, branch, cp in rows},
+            key=lambda g: (g.permission, g.scope_kind, g.branch_id or 0, g.cash_point_id or 0),
         )
     )
 
@@ -112,18 +132,26 @@ def require(principal: Principal, permission: str, **target) -> None:
 
 
 def assert_within_ceiling(
-    actor: Principal, permission_codes: set[str], *, scope_kind: str = "tenant", branch_id: int | None = None
+    actor: Principal,
+    permission_codes: set[str],
+    *,
+    scope_kind: str = "tenant",
+    branch_id: int | None = None,
+    cash_point_id: int | None = None,
+    cash_point_branch_id: int | None = None,
 ) -> None:
     """Delegation ceiling: the actor may only hand out permissions they hold themselves, at least as widely.
 
     Conservative: tenant-wide and 'own' grants require the actor to hold the permission tenant-wide;
-    branch grants require tenant-wide or the same branch.
+    branch grants require tenant-wide or the same branch; cash-point grants require tenant-wide, the cash
+    point's branch, or that cash point.
     """
     for code in permission_codes:
-        ok = (
-            actor.holds_for_branch(code, branch_id)
-            if scope_kind == "branch" and branch_id is not None
-            else actor.holds_at_tenant_scope(code)
-        )
+        if scope_kind == "branch" and branch_id is not None:
+            ok = actor.holds_for_branch(code, branch_id)
+        elif scope_kind == "cash_point" and cash_point_id is not None:
+            ok = actor.holds_for_cash_point(code, cash_point_id, cash_point_branch_id)
+        else:
+            ok = actor.holds_at_tenant_scope(code)
         if not ok:
             raise DelegationCeilingViolation()

@@ -8,13 +8,15 @@ from app.core.context import get_context
 from app.core.logging import scrub
 from app.modules.identity.models import SecurityEvent
 
-_FORBIDDEN_KEY = re.compile(r"pass|secret|token|hash|code|authorization|cookie|credential|key", re.I)
+_FORBIDDEN_KEY = re.compile(r"pass|secret|token|hash|authorization|cookie|credential|api_?key|private_?key|otp", re.I)
 MAX_VALUE = 200
 
 
 def _clean_value(value):
     if isinstance(value, bool) or value is None or isinstance(value, int):
         return value
+    if isinstance(value, dict):  # before/after snapshots
+        return clean_details(value)
     if isinstance(value, (list, tuple)):
         return [_clean_value(v) for v in value][:50]
     return scrub(str(value))[:MAX_VALUE]

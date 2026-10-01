@@ -285,7 +285,14 @@ def assign_role(
     db: Session = Depends(get_session),
 ):
     return admin.assign_role(
-        db, actor, user_id, body.role_id, scope_kind=body.scope, branch_id=body.branch_id, client_ip=client_ip(request)
+        db,
+        actor,
+        user_id,
+        body.role_id,
+        scope_kind=body.scope,
+        branch_id=body.branch_id,
+        cash_point_id=body.cash_point_id,
+        client_ip=client_ip(request),
     )
 
 

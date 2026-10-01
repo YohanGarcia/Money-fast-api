@@ -19,6 +19,7 @@ from app.models.session import UserSession
 from app.models.subscription import Subscription, SubscriptionStatus
 from app.models.tour_progress import TourProgress, TourStatus
 from app.models.user import User, UserRole
+from app.modules.organization.models import CashPoint, CashPointCurrency, Currency, TenantCurrency  # noqa: F401
 from app.modules.identity.models import (  # noqa: F401
     AuthThrottle,
     ExternalIdentity,

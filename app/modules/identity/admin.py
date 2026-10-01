@@ -260,6 +260,7 @@ def assign_role(
     *,
     scope_kind: str,
     branch_id: int | None,
+    cash_point_id: int | None = None,
     client_ip: str | None,
 ) -> UserRoleAssignment:
     require(actor, "roles.assign", tenant_id=actor.tenant_id)
@@ -275,13 +276,31 @@ def assign_role(
             raise TenantMismatch()
     else:
         branch_id = None
-    assert_within_ceiling(actor, _role_permission_codes(role), scope_kind=scope_kind, branch_id=branch_id)
+    cp_branch_id = None
+    if scope_kind == "cash_point":
+        from app.modules.organization.models import CashPoint
+
+        cash_point = db.get(CashPoint, cash_point_id) if cash_point_id is not None else None
+        if cash_point is None or cash_point.tenant_id != actor.tenant_id:
+            raise TenantMismatch()
+        cp_branch_id = cash_point.branch_id
+    else:
+        cash_point_id = None
+    assert_within_ceiling(
+        actor,
+        _role_permission_codes(role),
+        scope_kind=scope_kind,
+        branch_id=branch_id,
+        cash_point_id=cash_point_id,
+        cash_point_branch_id=cp_branch_id,
+    )
     row = UserRoleAssignment(
         tenant_id=actor.tenant_id,
         user_id=target.id,
         role_id=role.id,
         scope_kind=scope_kind,
         branch_id=branch_id,
+        cash_point_id=cash_point_id,
         assigned_by=actor.user_id,
     )
     db.add(row)
@@ -297,7 +316,7 @@ def assign_role(
         actor_id=actor.user_id,
         subject_id=target.id,
         client_ip=client_ip,
-        details={"role_id": role.id, "scope": scope_kind, "branch_id": branch_id},
+        details={"role_id": role.id, "scope": scope_kind, "branch_id": branch_id, "cash_point_id": cash_point_id},
     )
     db.commit()
     return row

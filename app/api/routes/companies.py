@@ -232,6 +232,11 @@ def delete_company(
         db.execute(delete(RolePermission).where(RolePermission.role_id.in_(role_ids)))
         db.execute(delete(Role).where(Role.id.in_(role_ids)))
     db.execute(delete(Person).where(Person.tenant_id == company_id))
+    from app.modules.organization.models import CashPoint, CashPointCurrency, TenantCurrency
+
+    db.execute(delete(CashPointCurrency).where(CashPointCurrency.tenant_id == company_id))
+    db.execute(delete(CashPoint).where(CashPoint.tenant_id == company_id))
+    db.execute(delete(TenantCurrency).where(TenantCurrency.tenant_id == company_id))  # base-currency FK is deferred
     for sub in db.scalars(select(Subscription).where(Subscription.company_id == company_id)).all():
         db.delete(sub)
     db.delete(company)

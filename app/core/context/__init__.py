@@ -21,6 +21,7 @@ class RequestContext:
     tenant_id: str | None = None
     branch_id: str | None = None
     timezone: str | None = None  # effective IANA zone; None = platform default
+    base_currency: str | None = None  # tenant base currency (ISO 4217)
 
 
 class _Holder:
