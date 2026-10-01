@@ -16,6 +16,7 @@ from app.modules.identity import auth as auth_service
 from app.modules.identity.audit import record_event
 from app.modules.identity.catalog import bootstrap_owner
 from app.modules.identity.deps import client_ip
+from app.modules.identity.tenant import is_valid_slug, normalize_slug, unique_slug
 from app.schemas.auth import LoginInput, RefreshInput, RegisterInput, TokenPair
 from app.schemas.user import UserRead
 from app.services.plan_limits import get_free_plan
@@ -30,8 +31,16 @@ def register(payload: RegisterInput, request: Request, db: Session = Depends(get
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
+    if payload.tenant_slug is not None:
+        slug = normalize_slug(payload.tenant_slug)
+        if not is_valid_slug(slug):
+            raise HTTPException(status_code=422, detail="El identificador de agencia no es valido.")
+        if db.scalar(select(Company.id).where(Company.slug == slug)):
+            raise HTTPException(status_code=409, detail="Ese identificador de agencia ya esta en uso.")
+    else:
+        slug = unique_slug(db, payload.company_name)
     free_plan = get_free_plan(db)
-    company = Company(name=payload.company_name, plan_id=free_plan.id if free_plan else None)
+    company = Company(name=payload.company_name, slug=slug, plan_id=free_plan.id if free_plan else None)
     db.add(company)
     db.flush()
 
@@ -67,7 +76,7 @@ def login(payload: LoginInput, request: Request, db: Session = Depends(get_db)) 
     return _pair(
         auth_service.login(
             db, email=payload.email, password=payload.password, device_name=payload.device_name,
-            client_ip=client_ip(request),
+            client_ip=client_ip(request), unscoped=True,
         )
     )
 

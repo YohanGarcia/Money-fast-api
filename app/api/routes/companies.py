@@ -12,6 +12,7 @@ from app.models.customer import Customer
 from app.models.loan import Loan
 from app.models.plan import Plan
 from app.models.subscription import Subscription, SubscriptionStatus
+from app.modules.identity.tenant import unique_slug
 from app.models.user import User, UserRole
 from app.core.security import get_password_hash
 from app.schemas.subscription import PlatformOverview
@@ -140,6 +141,7 @@ def create_company(
 
     company = Company(
         name=payload.name.strip(),
+        slug=unique_slug(db, payload.name),
         tax_id=payload.tax_id.strip(),
         address=payload.address.strip(),
         phone=payload.phone.strip(),

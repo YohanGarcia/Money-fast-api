@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     password_hash_parallelism: int = Field(default=4, ge=1)
     recovery_token_ttl_minutes: int = Field(default=15, ge=1)
     activation_token_ttl_hours: int = Field(default=72, ge=1)
+    # Google OpenID Connect (login only; the backend never holds a client secret or provider tokens).
+    google_client_id: str = ""  # expected `aud`; empty = Google sign-in not configured
+    oidc_challenge_ttl_seconds: int = Field(default=300, ge=30)
+    oidc_clock_skew_seconds: int = Field(default=60, ge=0)
     # Anti-abuse: exponential backoff per counter (seconds), capped; failures decay after the window.
     auth_throttle_window_seconds: int = Field(default=900, ge=60)
     auth_throttle_base_seconds: int = Field(default=30, ge=1)

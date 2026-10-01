@@ -12,6 +12,8 @@ class _In(BaseModel):
 
 
 class LoginIn(_In):
+    # Tenant context resolved BEFORE the account. Omitted = platform namespace (never a tenant account).
+    tenant_slug: str | None = Field(default=None, min_length=1, max_length=63)
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=128)
     device_name: str | None = Field(default=None, max_length=120)
@@ -22,6 +24,7 @@ class RefreshIn(_In):
 
 
 class RecoveryRequestIn(_In):
+    tenant_slug: str | None = Field(default=None, min_length=1, max_length=63)
     email: str = Field(min_length=3, max_length=255)
 
 
@@ -130,3 +133,30 @@ class EventOut(BaseModel):
     subject_id: int | None
     correlation_id: str | None
     details: dict
+
+
+class GoogleChallengeIn(_In):
+    tenant_slug: str = Field(min_length=1, max_length=63)
+
+
+class GoogleLoginIn(_In):
+    tenant_slug: str = Field(min_length=1, max_length=63)
+    id_token: str = Field(min_length=20, max_length=8192)
+    nonce: str = Field(min_length=20, max_length=200)
+    device_name: str | None = Field(default=None, max_length=120)
+
+
+class GoogleLinkIn(_In):
+    id_token: str = Field(min_length=20, max_length=8192)
+    nonce: str = Field(min_length=20, max_length=200)
+
+
+class ChallengeOut(BaseModel):
+    nonce: str
+    expires_in: int
+
+
+class ExternalIdentityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    provider: str
+    linked_at: datetime

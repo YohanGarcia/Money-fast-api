@@ -297,3 +297,66 @@ class SecurityEvent(Base):
     correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class ExternalIdentity(Base):
+    """A provider identity (OIDC ``iss`` + ``sub``) explicitly linked to one UserAccount of one tenant.
+
+    Fast Money stays authoritative for tenant, account, status, roles and sessions: the provider only
+    proves who is at the keyboard. No provider tokens are stored; ``email`` is informational metadata
+    captured at link time and is never used to find or link accounts. Unlinking keeps the row (revoked).
+    """
+
+    __tablename__ = "external_identities"
+    __table_args__ = (
+        CheckConstraint(_in("provider", ("google",)), name="provider_valid"),
+        # One provider identity <-> one account per tenant; one identity per provider per account.
+        Index(
+            "uq_external_identity_active_subject",
+            "tenant_id",
+            "provider",
+            "issuer",
+            "subject",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        Index(
+            "uq_external_identity_active_user",
+            "user_id",
+            "provider",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(20))
+    issuer: Mapped[str] = mapped_column(String(255))
+    subject: Mapped[str] = mapped_column(String(255))
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OidcChallenge(Base):
+    """Single-use nonce handed to the client before it talks to the provider (replay/CSRF protection).
+
+    Bound to a tenant and a purpose (``login`` or ``link``); ``link`` challenges are also bound to the user.
+    Only the SHA-256 of the nonce is stored.
+    """
+
+    __tablename__ = "oidc_challenges"
+    __table_args__ = (CheckConstraint(_in("purpose", ("login", "link")), name="purpose_valid"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"))
+    purpose: Mapped[str] = mapped_column(String(10))
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

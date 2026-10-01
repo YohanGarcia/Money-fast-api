@@ -21,6 +21,8 @@ from app.models.tour_progress import TourProgress, TourStatus
 from app.models.user import User, UserRole
 from app.modules.identity.models import (  # noqa: F401
     AuthThrottle,
+    ExternalIdentity,
+    OidcChallenge,
     Permission,
     Person,
     RecoveryToken,

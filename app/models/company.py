@@ -1,16 +1,20 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.modules.identity.tenant import SLUG_SQL_REGEX, default_slug
 
 
 class Company(Base):
     __tablename__ = "companies"
+    __table_args__ = (CheckConstraint(f"slug ~ '{SLUG_SQL_REGEX}'", name="slug_format"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(160), index=True)
+    # Public tenant identifier used to resolve the tenant before authenticating (login/recovery/Google).
+    slug: Mapped[str] = mapped_column(String(63), unique=True, default=default_slug)
     tax_id: Mapped[str] = mapped_column(String(40), default="")
     address: Mapped[str] = mapped_column(String(255), default="")
     phone: Mapped[str] = mapped_column(String(30), default="")

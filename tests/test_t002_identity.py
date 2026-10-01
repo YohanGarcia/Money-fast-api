@@ -82,7 +82,7 @@ def client(sink):
 
 def make_tenant(name: str, admin_email: str) -> dict:
     with SessionLocal() as db:
-        company = Company(name=name)
+        company = Company(name=name, slug=name.lower())
         db.add(company)
         db.flush()
         user = UserAccount(
@@ -101,11 +101,17 @@ def make_tenant(name: str, admin_email: str) -> dict:
         )
         db.add(branch)
         db.commit()
-        return {"tenant_id": company.id, "admin_id": user.id, "email": admin_email, "branch_id": branch.id}
+        return {
+            "tenant_id": company.id,
+            "admin_id": user.id,
+            "email": admin_email,
+            "branch_id": branch.id,
+            "slug": name.lower(),
+        }
 
 
-def login(client, email, password=PW, expect=200):
-    r = client.post(f"{V2}/auth/login", json={"email": email, "password": password})
+def login(client, email, password=PW, expect=200, slug="alfa"):
+    r = client.post(f"{V2}/auth/login", json={"tenant_slug": slug, "email": email, "password": password})
     assert r.status_code == expect, r.text
     return r.json() if expect == 200 else r
 
@@ -115,7 +121,7 @@ def h(tokens) -> dict:
 
 
 def admin_headers(client, tenant) -> dict:
-    return h(login(client, tenant["email"]))
+    return h(login(client, tenant["email"], slug=tenant["slug"]))
 
 
 def create_role(client, headers, name, perms, expect=201):
@@ -204,6 +210,7 @@ def test_a04_locked_user_denied_and_auto_lock_expires(client, tenant_a):
             with pytest.raises(InvalidCredentials):
                 auth_service.login(
                     db,
+                    tenant_slug="alfa",
                     email=tenant_a["email"],
                     password="bad-password-1",
                     device_name=None,
@@ -213,14 +220,34 @@ def test_a04_locked_user_denied_and_auto_lock_expires(client, tenant_a):
         user = db.query(UserAccount).filter_by(email=tenant_a["email"]).one()
         assert user.status == "locked" and user.locked_until > t0
         with pytest.raises(AccountLocked):
-            auth_service.login(db, email=tenant_a["email"], password=PW, device_name=None, client_ip="10.9.9.9", now=t0)
+            auth_service.login(
+                db,
+                tenant_slug="alfa",
+                email=tenant_a["email"],
+                password=PW,
+                device_name=None,
+                client_ip="10.9.9.9",
+                now=t0,
+            )
         with pytest.raises(InvalidCredentials):  # wrong password reveals nothing about the lock
             auth_service.login(
-                db, email=tenant_a["email"], password="bad-password-1", device_name=None, client_ip="10.9.9.8", now=t0
+                db,
+                tenant_slug="alfa",
+                email=tenant_a["email"],
+                password="bad-password-1",
+                device_name=None,
+                client_ip="10.9.9.8",
+                now=t0,
             )
         later = t0 + timedelta(seconds=settings.auth_account_lock_seconds + 1)
         ok = auth_service.login(
-            db, email=tenant_a["email"], password=PW, device_name=None, client_ip="10.9.9.7", now=later
+            db,
+            tenant_slug="alfa",
+            email=tenant_a["email"],
+            password=PW,
+            device_name=None,
+            client_ip="10.9.9.7",
+            now=later,
         )
         assert ok.user.status == "active"
     assert events("account.locked") and events("account.unlocked")
@@ -246,15 +273,21 @@ def test_a05_login_rate_limiting_backoff(client, tenant_a):
     assert login(client, "ghost@example.com", PW, expect=429).json()["error"]["code"] == "rate_limited"
     # blocked attempts are not counted, so the block cannot be extended indefinitely
     first = int(
-        client.post(f"{V2}/auth/login", json={"email": tenant_a["email"], "password": PW}).headers["Retry-After"]
+        client.post(
+            f"{V2}/auth/login", json={"tenant_slug": "alfa", "email": tenant_a["email"], "password": PW}
+        ).headers["Retry-After"]
     )
     second = int(
-        client.post(f"{V2}/auth/login", json={"email": tenant_a["email"], "password": PW}).headers["Retry-After"]
+        client.post(
+            f"{V2}/auth/login", json={"tenant_slug": "alfa", "email": tenant_a["email"], "password": PW}
+        ).headers["Retry-After"]
     )
     assert second <= first <= settings.auth_throttle_base_seconds
     # a different account from the same IP is not blocked by the per-account counter
     assert (
-        client.post(f"{V2}/auth/login", json={"email": "other@example.com", "password": "bad-password-1"}).status_code
+        client.post(
+            f"{V2}/auth/login", json={"tenant_slug": "alfa", "email": "other@example.com", "password": "bad-password-1"}
+        ).status_code
         == 401
     )
 
@@ -262,7 +295,7 @@ def test_a05_login_rate_limiting_backoff(client, tenant_a):
 def test_a05_backoff_is_exponential_capped_and_temporary(tenant_a):
     now = now_utc()
     base = settings.auth_throttle_base_seconds
-    kw = dict(email=tenant_a["email"], device_name=None, client_ip="10.1.1.1")
+    kw = dict(tenant_slug="alfa", email=tenant_a["email"], device_name=None, client_ip="10.1.1.1")
     with SessionLocal() as db:
         for _ in range(settings.auth_max_failures_account_ip):
             with pytest.raises(InvalidCredentials):
@@ -283,7 +316,7 @@ def test_a05_backoff_is_exponential_capped_and_temporary(tenant_a):
 
 def test_a06_recovery_single_use_and_revokes_sessions(client, sink, tenant_a):
     old = login(client, tenant_a["email"])
-    r = client.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]})
+    r = client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]})
     assert r.status_code == 202
     secret = sink.last(tenant_a["email"])["secret"]
     done = client.post(f"{V2}/auth/recovery/complete", json={"token": secret, "new_password": NEW_PW})
@@ -296,9 +329,9 @@ def test_a06_recovery_single_use_and_revokes_sessions(client, sink, tenant_a):
     login(client, tenant_a["email"], PW, expect=401)
     login(client, tenant_a["email"], NEW_PW)
     # a newer request revokes the previous unused token
-    client.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]})
+    client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]})
     first = sink.last()["secret"]
-    client.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]})
+    client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]})
     second = sink.last()["secret"]
     assert first != second
     assert (
@@ -313,7 +346,7 @@ def test_a06_recovery_single_use_and_revokes_sessions(client, sink, tenant_a):
 
 
 def test_a07_expired_and_invalid_recovery_tokens_denied(client, sink, tenant_a):
-    client.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]})
+    client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]})
     secret = sink.last()["secret"]
     with SessionLocal() as db:
         db.execute(update(RecoveryToken).values(expires_at=now_utc() - timedelta(minutes=1)))
@@ -338,7 +371,8 @@ def test_a07b_recovery_completion_is_rate_limited(client):
 
 def test_a07c_recovery_request_rate_limits_are_silent_per_account(client, sink, tenant_a):
     statuses = [
-        client.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]}).status_code for _ in range(6)
+        client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]}).status_code
+        for _ in range(6)
     ]
     assert statuses == [202] * 6  # same answer every time
     assert len(sink.messages) == settings.recovery_max_requests_account  # but no further tokens are issued
@@ -616,7 +650,7 @@ def test_s02_secrets_never_reach_logs_or_stdout(client, sink, tenant_a, caplog, 
     with caplog.at_level(logging.DEBUG):
         adm = admin_headers(client, tenant_a)
         user = activate_user(client, sink, adm, "log@example.com")
-        client.post(f"{V2}/auth/recovery/request", json={"email": "log@example.com"})
+        client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": "log@example.com"})
         secret = sink.last("log@example.com")["secret"]
         client.post(f"{V2}/auth/recovery/complete", json={"token": secret, "new_password": NEW_PW})
         login(client, "log@example.com", "bad-password-1", expect=401)
@@ -629,7 +663,10 @@ def test_s02_secrets_never_reach_logs_or_stdout(client, sink, tenant_a, caplog, 
     for s in secrets_seen:
         assert s not in haystack
     assert "$argon2" not in haystack and user["id"]
-    assert "debug_code" not in client.post(f"{V2}/auth/recovery/request", json={"email": "log@example.com"}).text
+    assert (
+        "debug_code"
+        not in client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": "log@example.com"}).text
+    )
 
 
 def test_s03_account_enumeration_mitigated(client, sink, tenant_a):
@@ -638,7 +675,7 @@ def test_s03_account_enumeration_mitigated(client, sink, tenant_a):
     client.post(f"{V2}/users/{staff['id']}/disable", headers=adm)
 
     def shape(email):
-        r = client.post(f"{V2}/auth/recovery/request", json={"email": email})
+        r = client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": email})
         return r.status_code, r.json()
 
     known, unknown, disabled = shape(tenant_a["email"]), shape("ghost@example.com"), shape("staff@example.com")
@@ -655,7 +692,7 @@ def test_s03_account_enumeration_mitigated(client, sink, tenant_a):
 def test_s04_secrets_absent_from_audit(client, sink, tenant_a):
     adm = admin_headers(client, tenant_a)
     user = activate_user(client, sink, adm, "audit@example.com")
-    client.post(f"{V2}/auth/recovery/request", json={"email": "audit@example.com"})
+    client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": "audit@example.com"})
     secret = sink.last("audit@example.com")["secret"]
     client.post(f"{V2}/auth/recovery/complete", json={"token": secret, "new_password": NEW_PW})
     login(client, "audit@example.com", "bad-password-1", expect=401)
@@ -726,7 +763,7 @@ def test_audit_events_cover_the_security_lifecycle(client, sink, tenant_a):
 def test_recovery_request_event_without_secret_and_correlation(client, sink, tenant_a):
     r = client.post(
         f"{V2}/auth/recovery/request",
-        json={"email": tenant_a["email"]},
+        json={"tenant_slug": "alfa", "email": tenant_a["email"]},
         headers={"X-Correlation-ID": "trace-recovery-001"},
     )
     assert r.status_code == 202
@@ -858,7 +895,7 @@ def test_recovery_token_is_single_use_under_concurrency(sink, tenant_a):
     from concurrent.futures import ThreadPoolExecutor
 
     with TestClient(app) as c:
-        c.post(f"{V2}/auth/recovery/request", json={"email": tenant_a["email"]})
+        c.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "alfa", "email": tenant_a["email"]})
     secret = sink.last(tenant_a["email"])["secret"]
 
     def attempt(i):

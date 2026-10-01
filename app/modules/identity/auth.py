@@ -41,6 +41,7 @@ from app.modules.identity.errors import (
     SessionInvalid,
 )
 from app.modules.identity.models import UserAccount
+from app.modules.identity.tenant import normalize_slug, resolve_tenant
 
 log = logging.getLogger("app.identity.auth")
 
@@ -77,6 +78,28 @@ def find_unambiguous_account(db: Session, ident: str) -> UserAccount | None:
         log.warning("login_identifier_ambiguous")
         return None
     return rows[0] if rows else None
+
+
+def scope_key(tenant_slug: str | None, unscoped: bool) -> str:
+    """Namespace of an identifier for throttling: legacy (no tenant), platform, or one tenant slug."""
+    if unscoped:
+        return "legacy"
+    return normalize_slug(tenant_slug) if tenant_slug else "platform"
+
+
+def resolve_account(db: Session, ident: str, tenant_slug: str | None, *, unscoped: bool = False) -> UserAccount | None:
+    """Deterministic account lookup. The tenant slug is resolved BEFORE the account is looked up, so the same
+    email in two tenants never collides. An unknown/inactive slug is indistinguishable from an unknown email.
+    ``tenant_slug=None`` addresses the platform namespace (company_id NULL). ``unscoped`` is the legacy v1
+    contract (no tenant context): resolved only when the email is unique, otherwise fail closed."""
+    if unscoped:
+        return find_unambiguous_account(db, ident)
+    if not tenant_slug:
+        return db.scalar(select(UserAccount).where(UserAccount.email == ident, UserAccount.company_id.is_(None)))
+    company = resolve_tenant(db, tenant_slug)
+    if company is None:
+        return None
+    return db.scalar(select(UserAccount).where(UserAccount.email == ident, UserAccount.company_id == company.id))
 
 
 def revoke_session(db: Session, session: UserSession, reason: str, now: datetime | None = None) -> bool:
@@ -125,12 +148,16 @@ def login(
     password: str,
     device_name: str | None,
     client_ip: str | None,
+    tenant_slug: str | None = None,
+    unscoped: bool = False,
     now: datetime | None = None,
 ) -> LoginResult:
     now = now or _clock()
     ident = normalize_identifier(email)
     ip = client_ip or "unknown"
-    acct_ip_key = f"{ident}|{ip}"
+    ns = scope_key(tenant_slug, unscoped)
+    acct_key = f"{ns}|{ident}"
+    acct_ip_key = f"{acct_key}|{ip}"
 
     wait = max(throttle.retry_after(db, S_ACCT_IP, acct_ip_key, now), throttle.retry_after(db, S_IP, ip, now))
     if wait:
@@ -138,7 +165,7 @@ def login(
         log.warning("login_throttled", extra={"retry_after": wait})
         raise RateLimited(wait)
 
-    user = find_unambiguous_account(db, ident)
+    user = resolve_account(db, ident, tenant_slug, unscoped=unscoped)
     if user is None:
         verify_and_update(password, dummy_hash())  # equalise timing with the existing-account path
         valid, new_hash = False, None
@@ -148,7 +175,7 @@ def login(
     if not valid:
         throttle.register_failure(db, S_IP, ip, settings.auth_max_failures_ip, now)
         throttle.register_failure(db, S_ACCT_IP, acct_ip_key, settings.auth_max_failures_account_ip, now)
-        failures = throttle.register_failure(db, S_ACCT, ident, settings.auth_account_lock_failures, now)
+        failures = throttle.register_failure(db, S_ACCT, acct_key, settings.auth_account_lock_failures, now)
         if user is not None and user.status == "active" and failures >= settings.auth_account_lock_failures:
             user.status = "locked"
             user.locked_at = now
@@ -210,7 +237,7 @@ def login(
         raise InvalidCredentials()
 
     throttle.reset(db, S_ACCT_IP, acct_ip_key)
-    throttle.reset(db, S_ACCT, ident)
+    throttle.reset(db, S_ACCT, acct_key)
     if new_hash:
         user.password_hash = new_hash
     user.last_login_at = now

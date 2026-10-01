@@ -49,6 +49,7 @@ include = [
   "tests/test_t001_foundation.py",
   "tests/test_t002_identity.py",
   "tests/test_t002_tenant_login.py",
+  "tests/test_t002_google.py",
 ]
 
 [tool.ruff.lint]

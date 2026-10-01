@@ -75,3 +75,20 @@ class RecoveryTokenReused(AppError):
 
 class PasswordPolicyViolation(AppError):
     status_code, code, default_message = 422, "password_policy_violation", "La contrasena no cumple la politica."
+
+
+class InvalidExternalToken(AppError):
+    status_code, code = 401, "invalid_external_token"
+    default_message = "La identidad externa no pudo ser validada."
+
+
+class ExternalIdentityNotLinked(AppError):
+    """Also returned for an unknown tenant slug, so the response never reveals which tenants exist."""
+
+    status_code, code = 401, "external_identity_not_linked"
+    default_message = "Esta identidad externa no esta vinculada a una cuenta de esa agencia."
+
+
+class ExternalIdentityConflict(AppError):
+    status_code, code = 409, "external_identity_conflict"
+    default_message = "La identidad externa ya esta vinculada a otra cuenta."

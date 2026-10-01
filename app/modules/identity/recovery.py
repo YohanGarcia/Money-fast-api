@@ -19,7 +19,13 @@ from app.core.security import hash_token, new_opaque_token, password_policy_viol
 from app.core.time import now_utc
 from app.modules.identity import throttle
 from app.modules.identity.audit import record_event
-from app.modules.identity.auth import find_unambiguous_account, normalize_identifier, revoke_user_sessions, set_password
+from app.modules.identity.auth import (
+    normalize_identifier,
+    resolve_account,
+    revoke_user_sessions,
+    scope_key,
+    set_password,
+)
 from app.modules.identity.errors import (
     InvalidRecoveryToken,
     PasswordPolicyViolation,
@@ -93,21 +99,22 @@ def deliver(delivery: PendingDelivery, notifier: SecretNotifier) -> None:
 
 
 def request_recovery(
-    db: Session, *, email: str, client_ip: str | None, now: datetime | None = None
+    db: Session, *, tenant_slug: str | None, email: str, client_ip: str | None, now: datetime | None = None
 ) -> PendingDelivery | None:
     now = now or now_utc()
     ident = normalize_identifier(email)
+    acct_key = f"{scope_key(tenant_slug, False)}|{ident}"
     ip = client_ip or "unknown"
     wait = throttle.retry_after(db, S_REQ_IP, ip, now)
     if wait:
         raise RateLimited(wait)
     throttle.register_failure(db, S_REQ_IP, ip, settings.recovery_max_requests_ip, now)
     # Per-account limit is silent: the caller still gets the same answer, but no token is issued.
-    account_blocked = throttle.retry_after(db, S_REQ_ACCT, ident, now) > 0
+    account_blocked = throttle.retry_after(db, S_REQ_ACCT, acct_key, now) > 0
     if not account_blocked:
-        throttle.register_failure(db, S_REQ_ACCT, ident, settings.recovery_max_requests_account, now)
+        throttle.register_failure(db, S_REQ_ACCT, acct_key, settings.recovery_max_requests_account, now)
 
-    user = find_unambiguous_account(db, ident)  # ambiguous across tenants => nothing is issued (fail closed)
+    user = resolve_account(db, ident, tenant_slug)  # resolved inside the given tenant only
     if user is None or user.status == "disabled" or account_blocked:
         record_event(
             db,
@@ -174,7 +181,7 @@ def complete_recovery(
         user.activated_at = user.activated_at or now
         user.locked_at = user.locked_until = None
     revoked = revoke_user_sessions(db, user.id, "password_recovery", now=now)
-    throttle.reset(db, "login_acct", normalize_identifier(user.email))
+    throttle.reset(db, "login_acct", f"{scope_key(_slug_of(db, user), False)}|{normalize_identifier(user.email)}")
     record_event(
         db,
         "recovery.completed",
@@ -193,3 +200,9 @@ def complete_recovery(
     )
     db.commit()
     return user
+
+
+def _slug_of(db: Session, user: UserAccount) -> str | None:
+    from app.models.company import Company
+
+    return db.scalar(select(Company.slug).where(Company.id == user.company_id)) if user.company_id else None

@@ -3,7 +3,7 @@
 import pytest
 
 from app.core.db import SessionLocal
-from app.models.session import UserSession
+from app.models.company import Company
 from app.modules.identity.models import RecoveryToken, UserAccount
 from tests import pg_env  # noqa: F401  (must precede app imports)
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the T-002 suite)
@@ -14,6 +14,7 @@ from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared
     admin_headers,
     client,
     fresh_db,
+    h,
     login,
     sink,
     tenant_a,
@@ -102,62 +103,121 @@ def test_tenant_login_02_create_and_update_in_one_tenant_do_not_conflict_with_an
     assert cross.status_code == 200, cross.text  # owner1@ lives in tenant 1: no conflict, nothing revealed
 
 
-def test_tenant_login_03_recovery_never_targets_another_tenant(client, sink, tenant_a, tenant_b):
+def _slug_login(client, slug, email, password=PW, expect=200):
+    r = client.post(f"{V2}/auth/login", json={"tenant_slug": slug, "email": email, "password": password})
+    assert r.status_code == expect, r.text
+    return r.json() if expect == 200 else r
+
+
+def test_tenant_login_03_recovery_resolves_only_inside_the_given_slug(client, sink, tenant_a, tenant_b):
     adm_a, adm_b = admin_headers(client, tenant_a), admin_headers(client, tenant_b)
-    activate_user(client, sink, adm_a, "dup@example.com")
-    activate_user(client, sink, adm_b, "dup@example.com")
-    only_b = activate_user(client, sink, adm_b, "only-b@example.com")
+    a = activate_user(client, sink, adm_a, "dup@example.com")
+    b = activate_user(client, sink, adm_b, "dup@example.com")
     sink.messages.clear()
-    # ambiguous identifier: nothing is issued to ANY of the accounts, the answer is unchanged
-    r = client.post(f"{V2}/auth/recovery/request", json={"email": "dup@example.com"})
-    assert r.status_code == 202 and sink.messages == []
-    assert _count(RecoveryToken, used_at=None, revoked_at=None) == 0
-    # an unambiguous identifier reaches exactly its own account
-    client.post(f"{V2}/auth/recovery/request", json={"email": "only-b@example.com"})
-    msg = sink.last("only-b@example.com")
+    r = client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": "beta", "email": "dup@example.com"})
+    assert r.status_code == 202 and len(sink.messages) == 1  # exactly one account, the one in beta
     assert (
-        client.post(f"{V2}/auth/recovery/complete", json={"token": msg["secret"], "new_password": NEW_PW}).status_code
+        client.post(
+            f"{V2}/auth/recovery/complete", json={"token": sink.last()["secret"], "new_password": NEW_PW}
+        ).status_code
         == 200
     )
     with SessionLocal() as db:
-        assert db.get(UserAccount, only_b["id"]).company_id == tenant_b["tenant_id"]
-        # no other account (notably the two "dup" ones) had its password touched by the recovery
-        untouched = db.query(UserAccount).filter(UserAccount.email == "dup@example.com").all()
-        assert len(untouched) == 2
+        assert db.get(UserAccount, b["id"]).password_changed_at is not None
+        assert (
+            db.get(UserAccount, a["id"]).password_changed_at is not None
+        )  # set when A activated: not by this recovery
+        a_token_rows = db.query(RecoveryToken).filter_by(user_id=a["id"], purpose="recovery").count()
+        assert a_token_rows == 0  # alfa's account never got a recovery token
+    # the old password stopped working only in beta
+    _slug_login(client, "beta", "dup@example.com", PW, expect=401)
+    _slug_login(client, "beta", "dup@example.com", NEW_PW)
+    _slug_login(client, "alfa", "dup@example.com", PW)
 
 
-def test_tenant_login_04_no_cross_tenant_account_existence_signal(client, sink, tenant_a, tenant_b):
+def test_tenant_login_04_unknown_slug_and_cross_tenant_probes_reveal_nothing(client, sink, tenant_a, tenant_b):
     adm_a, adm_b = admin_headers(client, tenant_a), admin_headers(client, tenant_b)
-    activate_user(client, sink, adm_b, "exists-in-b@example.com")
-    in_b = _new_user(client, adm_a, "exists-in-b@example.com")  # A invites an address that exists only in B
+    activate_user(client, sink, adm_b, "only-in-beta@example.com")
+    in_b = _new_user(client, adm_a, "only-in-beta@example.com")  # alfa invites an address that exists in beta
     nowhere = _new_user(client, adm_a, "exists-nowhere@example.com")
-    assert in_b.status_code == nowhere.status_code == 201
-    assert set(in_b.json()) == set(nowhere.json())
+    assert in_b.status_code == nowhere.status_code == 201 and set(in_b.json()) == set(nowhere.json())
     assert all(u["tenant_id"] == tenant_a["tenant_id"] for u in client.get(f"{V2}/users", headers=adm_a).json())
-    # unauthenticated probes cannot tell "also exists in B" from "exists nowhere"
+    sink.messages.clear()
     shapes = []
-    for email in ("exists-in-b@example.com", "nobody-at-all@example.com"):
-        rec = client.post(f"{V2}/auth/recovery/request", json={"email": email})
-        log = client.post(f"{V2}/auth/login", json={"email": email, "password": "bad-password-1"})
+    probes = (
+        ("beta", "only-in-beta@example.com"),  # real tenant, real user
+        ("alfa", "only-in-beta@example.com"),  # real tenant, the user lives elsewhere
+        ("no-such-agency", "only-in-beta@example.com"),  # unknown slug
+        ("beta", "nobody-at-all@example.com"),  # real tenant, unknown email
+    )
+    for slug, email in probes:
+        rec = client.post(f"{V2}/auth/recovery/request", json={"tenant_slug": slug, "email": email})
+        log = _slug_login(client, slug, email, "bad-password-1", expect=401)
         err = log.json()["error"]
         shapes.append((rec.status_code, rec.json(), log.status_code, err["code"], err["message"]))
-    assert shapes[0] == shapes[1]
+    assert len(set(map(repr, shapes))) == 1  # byte-for-byte the same answer in every case
+    # mail went only to the two real accounts that hold that address (beta's recovery, alfa's pending invite)
+    assert [m["email"] for m in sink.messages] == ["only-in-beta@example.com"] * 2
 
 
-def test_tenant_login_05_ambiguous_identifier_fails_closed_blocked_by_spec(client, sink, tenant_a, tenant_b):
-    """BLOCKED_BY_SPEC: login/recovery carry no tenant context, so a duplicated identifier cannot be resolved.
-
-    The only safe behaviour available without inventing a tenant-selection contract is to fail closed:
-    never pick one account arbitrarily; answer exactly as for an unknown account."""
+def test_tenant_login_05_same_email_authenticates_in_each_tenant_by_slug(client, sink, tenant_a, tenant_b):
     adm_a, adm_b = admin_headers(client, tenant_a), admin_headers(client, tenant_b)
-    activate_user(client, sink, adm_a, "dup@example.com")
-    activate_user(client, sink, adm_b, "dup@example.com")
-    unique = activate_user(client, sink, adm_a, "unique@example.com")
-    unknown = login(client, "ghost@example.com", PW, expect=401)
-    ambiguous = login(client, "dup@example.com", PW, expect=401)  # the right password for both accounts
-    assert ambiguous.json()["error"]["code"] == unknown.json()["error"]["code"] == "invalid_credentials"
-    assert ambiguous.json()["error"]["message"] == unknown.json()["error"]["message"]
-    assert login(client, "unique@example.com")["user"]["id"] == unique["id"]  # unambiguous logins are unaffected
-    with SessionLocal() as db:  # no session was created for either duplicate
-        dup_ids = [u.id for u in db.query(UserAccount).filter_by(email="dup@example.com")]
-        assert db.query(UserSession).filter(UserSession.user_id.in_(dup_ids)).count() == 0
+    a = activate_user(client, sink, adm_a, "dup@example.com")
+    b = activate_user(client, sink, adm_b, "dup@example.com")
+    ta = _slug_login(client, "alfa", "dup@example.com")
+    tb = _slug_login(client, "beta", "dup@example.com")
+    assert ta["user"]["id"] == a["id"] and ta["user"]["tenant_id"] == tenant_a["tenant_id"]
+    assert tb["user"]["id"] == b["id"] and tb["user"]["tenant_id"] == tenant_b["tenant_id"]
+    assert client.get(f"{V2}/auth/me", headers=h(ta)).json()["user"]["id"] == a["id"]
+    # slug is case-insensitive; a wrong slug is just "invalid credentials"; no slug means the platform namespace
+    assert _slug_login(client, "ALFA", "dup@example.com")["user"]["id"] == a["id"]
+    _slug_login(client, "gamma", "dup@example.com", expect=401)
+    assert client.post(f"{V2}/auth/login", json={"email": "dup@example.com", "password": PW}).status_code == 401
+    # throttling is per tenant namespace: failures in alfa do not block the same email in beta
+    for _ in range(5):
+        _slug_login(client, "alfa", "dup@example.com", "bad-password-1", expect=401)
+    _slug_login(client, "alfa", "dup@example.com", expect=429)
+    assert _slug_login(client, "beta", "dup@example.com")["user"]["id"] == b["id"]
+
+
+def test_tenant_slug_is_unique_valid_and_generated_for_legacy_tenants(client):
+    r1 = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Dueno Uno",
+            "email": "one@example.com",
+            "password": "legacy-pass-123",
+            "company_name": "Agencia Ñandú",
+        },
+    )
+    r2 = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Dueno Dos",
+            "email": "two@example.com",
+            "password": "legacy-pass-123",
+            "company_name": "Agencia Ñandú",
+        },
+    )
+    assert r1.status_code == r2.status_code == 201
+    with SessionLocal() as db:
+        slugs = sorted(c.slug for c in db.query(Company).all())
+    assert slugs == ["agencia-nandu", "agencia-nandu-2"]
+    custom = {
+        "full_name": "Dueno Tres",
+        "email": "three@example.com",
+        "password": "legacy-pass-123",
+        "company_name": "X",
+    }
+    assert client.post("/api/v1/auth/register", json={**custom, "tenant_slug": "mi-agencia"}).status_code == 201
+    taken = {**custom, "email": "four@example.com", "tenant_slug": "MI-agencia"}
+    assert client.post("/api/v1/auth/register", json=taken).status_code == 409
+    for bad in ("Bad Slug", "-x", "admin", "a" * 64):
+        r = client.post("/api/v1/auth/register", json={**custom, "email": "five@example.com", "tenant_slug": bad})
+        assert r.status_code == 422, bad
+    login_ok = _slug_login(client, "mi-agencia", "three@example.com", "legacy-pass-123")
+    assert login_ok["user"]["email"] == "three@example.com"
+    with SessionLocal() as db:
+        with pytest.raises(Exception, match="slug_format"):
+            db.add(Company(name="y", slug="Not A Slug"))
+            db.commit()

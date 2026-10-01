@@ -5,14 +5,21 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.db import get_session
-from app.modules.identity import admin, auth, recovery
+from app.modules.identity import admin, auth, google, recovery
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import AuthContext, client_ip, get_auth_context, get_principal, require_permission
+from app.modules.identity.errors import PermissionDenied
 from app.modules.identity.models import Person
 from app.modules.identity.notifications import SecretNotifier, get_notifier
+from app.modules.identity.oidc import OidcVerifier, build_google_verifier
 from app.modules.identity.schemas import (
     AssignmentOut,
+    ChallengeOut,
     EventOut,
+    ExternalIdentityOut,
+    GoogleChallengeIn,
+    GoogleLinkIn,
+    GoogleLoginIn,
     GrantOut,
     LoginIn,
     MeOut,
@@ -29,6 +36,7 @@ from app.modules.identity.schemas import (
     UserCreateIn,
     UserOut,
 )
+from app.modules.identity.tenant import resolve_tenant
 
 router = APIRouter(prefix="/api/v2", tags=["identity"])
 GENERIC_RECOVERY_MESSAGE = "Si la cuenta existe, enviaremos instrucciones para recuperar el acceso."
@@ -58,7 +66,12 @@ def _role_out(role) -> RoleOut:
 @router.post("/auth/login", response_model=TokenOut)
 def login(body: LoginIn, request: Request, db: Session = Depends(get_session)) -> TokenOut:
     result = auth.login(
-        db, email=body.email, password=body.password, device_name=body.device_name, client_ip=client_ip(request)
+        db,
+        tenant_slug=body.tenant_slug,
+        email=body.email,
+        password=body.password,
+        device_name=body.device_name,
+        client_ip=client_ip(request),
     )
     return _token_out(result)
 
@@ -115,7 +128,9 @@ def recovery_request(
     notifier: SecretNotifier = Depends(get_notifier),
 ) -> dict:
     """Always the same answer for known and unknown accounts."""
-    pending = recovery.request_recovery(db, email=body.email, client_ip=client_ip(request))
+    pending = recovery.request_recovery(
+        db, tenant_slug=body.tenant_slug, email=body.email, client_ip=client_ip(request)
+    )
     if pending is not None:
         background.add_task(recovery.deliver, pending, notifier)
     return {"message": GENERIC_RECOVERY_MESSAGE}
@@ -125,6 +140,70 @@ def recovery_request(
 def recovery_complete(body: RecoveryCompleteIn, request: Request, db: Session = Depends(get_session)) -> dict:
     recovery.complete_recovery(db, token=body.token, new_password=body.new_password, client_ip=client_ip(request))
     return {"message": "Contrasena actualizada. Inicia sesion de nuevo."}
+
+
+# --- Google sign-in (OIDC) ------------------------------------------------------------------------------
+@router.post("/auth/google/challenge", response_model=ChallengeOut)
+def google_challenge(body: GoogleChallengeIn, request: Request, db: Session = Depends(get_session)) -> ChallengeOut:
+    """Single-use nonce for the login flow. The response is the same for known and unknown tenant slugs."""
+    company = resolve_tenant(db, body.tenant_slug)
+    nonce, _ = google.create_challenge(
+        db, tenant_id=company.id if company else None, purpose="login", user_id=None, client_ip=client_ip(request)
+    )
+    return ChallengeOut(nonce=nonce, expires_in=settings.oidc_challenge_ttl_seconds)
+
+
+@router.post("/auth/google/login", response_model=TokenOut)
+def google_login(
+    body: GoogleLoginIn,
+    request: Request,
+    db: Session = Depends(get_session),
+    verifier: OidcVerifier = Depends(build_google_verifier),
+) -> TokenOut:
+    result = google.login_google(
+        db,
+        verifier,
+        tenant_slug=body.tenant_slug,
+        id_token=body.id_token,
+        nonce=body.nonce,
+        device_name=body.device_name,
+        client_ip=client_ip(request),
+    )
+    return _token_out(result)
+
+
+@router.post("/auth/google/link/challenge", response_model=ChallengeOut)
+def google_link_challenge(
+    request: Request, ctx: AuthContext = Depends(get_auth_context), db: Session = Depends(get_session)
+) -> ChallengeOut:
+    if ctx.user.company_id is None:
+        raise PermissionDenied()
+    nonce, _ = google.create_challenge(
+        db, tenant_id=ctx.user.company_id, purpose="link", user_id=ctx.user.id, client_ip=client_ip(request)
+    )
+    return ChallengeOut(nonce=nonce, expires_in=settings.oidc_challenge_ttl_seconds)
+
+
+@router.post("/auth/google/link", response_model=ExternalIdentityOut, status_code=status.HTTP_201_CREATED)
+def google_link(
+    body: GoogleLinkIn,
+    request: Request,
+    ctx: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_session),
+    verifier: OidcVerifier = Depends(build_google_verifier),
+):
+    """Explicit linking by the authenticated owner of the account; never inferred from an email match."""
+    return google.link_google(
+        db, verifier, ctx.user, id_token=body.id_token, nonce=body.nonce, client_ip=client_ip(request)
+    )
+
+
+@router.delete("/auth/google/link", status_code=status.HTTP_204_NO_CONTENT)
+def google_unlink(
+    request: Request, ctx: AuthContext = Depends(get_auth_context), db: Session = Depends(get_session)
+) -> Response:
+    google.unlink_google(db, ctx.user, client_ip(request))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- users ------------------------------------------------------------------------------------------------

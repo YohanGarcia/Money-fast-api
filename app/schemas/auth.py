@@ -14,6 +14,8 @@ class RegisterInput(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     company_name: str = Field(min_length=1, max_length=160)
+    # Optional public tenant identifier (login context); generated from the company name when omitted.
+    tenant_slug: str | None = Field(default=None, min_length=1, max_length=63)
 
     @field_validator("company_name", mode="before")
     @classmethod
