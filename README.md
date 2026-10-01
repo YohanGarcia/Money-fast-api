@@ -23,7 +23,7 @@ Construido con **FastAPI**, **SQLAlchemy 2.0** y **Alembic**. Autenticación con
 
 ## 🛠️ Tecnologías
 
-FastAPI · SQLAlchemy 2.0 · Alembic · Pydantic · JWT · httpx · SQLite (dev) / PostgreSQL (prod) · gestionado con **uv**.
+FastAPI · SQLAlchemy 2.0 · Alembic · Pydantic · JWT · httpx · PostgreSQL (único motor, ver `docs/T-001-FOUNDATION.md`) · gestionado con **uv**.
 
 ## 🚀 Puesta en marcha
 
@@ -36,8 +36,8 @@ uv sync
 # 2. Configurar variables de entorno
 cp .env.example .env      # y edita los valores
 
-# 3. Preparar instalación nueva, legacy o BD ya versionada
-uv run python scripts/prepare_database.py
+# 3. Aplicar migraciones (PostgreSQL)
+uv run alembic upgrade head
 
 # 4. (Opcional) Sembrar datos base + superadmin
 uv run python scripts/seed_multitenant.py
@@ -48,20 +48,11 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 4000 --reload
 
 ### Base de datos y migraciones
 
-El primer script detecta una base vacía y genera el esquema actual con los modelos
-SQLAlchemy; solo entonces registra la versión Alembic `head`. Esto es necesario
-porque las primeras migraciones históricas fueron escritas para un esquema legado,
-y `alembic upgrade head` **no** funciona sobre una PostgreSQL vacía.
-
-Con una BD ya versionada, el mismo script ejecuta únicamente las migraciones
-pendientes. En un esquema legado sin `alembic_version`, comprueba las tablas
-mínimas de la revisión histórica antes de aplicar el `stamp`: si faltan, se
-detiene sin fingir una actualización exitosa. Realiza copia de seguridad y
-comprueba el esquema legado real antes de migrar datos existentes.
-
-Para una base con Alembic ya inicializado también puedes usar
-`uv run alembic upgrade head` directamente. Nunca hagas `stamp head`
-manualmente en una base existente parcialmente creada.
+PostgreSQL es la única base admitida (ADR-003); `DATABASE_URL` es obligatoria. El esquema
+lo gestiona exclusivamente Alembic con una baseline limpia (`0001`); la API ya no crea
+tablas al arrancar. Las migraciones históricas fueron reemplazadas: una BD
+creada con ellas debe reiniciarse (ADR-007: datos de prueba) o alinearse manualmente.
+Detalle en `docs/T-001-FOUNDATION.md`.
 
 API disponible en `http://localhost:4000` · documentación interactiva en `http://localhost:4000/docs`.
 
@@ -70,8 +61,10 @@ API disponible en `http://localhost:4000` · documentación interactiva en `http
 | Variable | Descripción |
 |---|---|
 | `SECRET_KEY` | Clave para firmar los JWT (obligatoria y segura en producción). |
-| `ENVIRONMENT` | `development` o `production`. |
-| `DATABASE_URL` | Conexión a la BD (SQLite en dev, PostgreSQL en prod). |
+| `ENVIRONMENT` | `development`, `test`, `staging` o `production` (los dos últimos exigen `SECRET_KEY` fuerte y `TRUSTED_HOSTS` explícitos). |
+| `DATABASE_URL` | Conexión PostgreSQL (`postgresql+psycopg://...`). Obligatoria. |
+| `TEST_DATABASE_URL` | Solo pruebas: PostgreSQL con nombre terminado en `_test`. |
+| `TRUSTED_HOSTS` / `LOG_LEVEL` / `DEFAULT_TIMEZONE` | Hosts permitidos, nivel de log y zona IANA por defecto (`America/Santo_Domingo`). |
 | `CORS_ORIGINS` | Orígenes permitidos, separados por coma. |
 | `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` | Correo saliente (recuperación de contraseña). |
 | `PAYPAL_CLIENT_ID` / `PAYPAL_SECRET` | Credenciales de PayPal. |
@@ -107,7 +100,8 @@ uv run alembic upgrade head
 ```
 
 ```bash
-uv run python -m unittest tests.test_api
+export TEST_DATABASE_URL=postgresql+psycopg://moneyfast:moneyfast@127.0.0.1:5432/moneyfast_test
+uv run python -m pytest -q
 ```
 
 ## 📂 Estructura
@@ -129,9 +123,11 @@ app/
   models/         Modelos SQLAlchemy
   schemas/        Esquemas Pydantic
   services/       Lógica de negocio (préstamos, rutas, planes, PayPal, correo)
-  core/           Configuración, seguridad y base de datos
+  core/           config, db, errors, logging, time, context (T-001) + security
+  modules/        Fronteras de módulos del monolito modular (placeholders)
 alembic/          Migraciones
 scripts/          Utilidades (seed)
+docs/             Documentación técnica
 tests/            Pruebas
 ```
 

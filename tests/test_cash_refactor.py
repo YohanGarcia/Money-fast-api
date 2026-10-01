@@ -36,7 +36,7 @@ class CashRefactorTests(unittest.TestCase):
             user = self.req('/users', dict(full_name=role + ' QA', email=email, password='workerpass123', role=api_role, branch_id=self.branch), code=201)
             self.users[role] = user
             self.roles[role] = self.auth_headers(self.login(email, 'workerpass123')['access_token'])
-        self.admin_id = self.req('/users')[0]['id']
+        self.admin_id = next(u['id'] for u in self.req('/users') if u['role'] == 'admin')  # name ordering is collation-dependent on PostgreSQL
         # This test needs an existing loan before activating Caja; POST /loans
         # intentionally rejects legacy disbursements after activation.
         if self._testMethodName in ('test_composed_transfer_is_pending_and_preserves_exact_amount',

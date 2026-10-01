@@ -24,4 +24,32 @@ package = false
 [dependency-groups]
 dev = [
   "pytest>=8.3,<9",
+  "ruff>=0.16.9",
 ]
+
+# Lint/format apply to the T-001 foundation code only; legacy modules are not reformatted here.
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+include = [
+  "app/core/config/**/*.py",
+  "app/core/context/**/*.py",
+  "app/core/db/**/*.py",
+  "app/core/errors/**/*.py",
+  "app/core/logging/**/*.py",
+  "app/core/time/**/*.py",
+  "app/core/database.py",
+  "app/modules/**/*.py",
+  "app/shared/**/*.py",
+  "app/api/system.py",
+  "app/main.py",
+  "tests/pg_env.py",
+  "tests/conftest.py",
+  "tests/test_t001_foundation.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]

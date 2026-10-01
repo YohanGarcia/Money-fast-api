@@ -6,7 +6,7 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
 from sqlalchemy.orm import Session
 
-from app.core.database import SessionLocal
+from app.core.db import get_session
 from app.core.security import decode_token
 from app.models.session import UserSession
 from app.models.user import User
@@ -16,11 +16,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
 def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    yield from get_session()
 
 
 def get_current_user(

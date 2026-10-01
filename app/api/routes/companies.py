@@ -106,8 +106,8 @@ def platform_overview(
     soon_limit = now + timedelta(days=7)
 
     def _as_aware(dt: datetime) -> datetime:
-        # SQLite returns naive datetimes; assume they are UTC so comparisons
-        # against timezone-aware ``now`` don't raise.
+        # Defensive: treat naive datetimes as UTC so comparisons against
+        # timezone-aware ``now`` never raise.
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
     expiring = [

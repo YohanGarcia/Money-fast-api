@@ -65,7 +65,7 @@ class CashCustodyTransfer(Base):
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Link identifiers are intentionally application-level links: adding database
     # FKs in both directions would create a cyclic dependency between the three
-    # ledger tables and complicate portable SQLite/PostgreSQL migrations.
+    # ledger tables and complicate migrations.
     cash_movement_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
     capital_movement_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
     notes: Mapped[str] = mapped_column(Text, default='')

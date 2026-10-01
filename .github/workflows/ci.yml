@@ -2,9 +2,9 @@ name: API CI
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [main, "codex/**", "refactor/**", "feat/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "refactor/**"]
 
 permissions:
   contents: read
@@ -24,9 +24,11 @@ jobs:
           --health-cmd="pg_isready -U moneyfast -d moneyfast_test"
           --health-interval=10s --health-timeout=5s --health-retries=5
     env:
+      # PostgreSQL only (ADR-003). The test database name must end in _test.
       DATABASE_URL: postgresql+psycopg://moneyfast:moneyfast@localhost:5432/moneyfast_test
-      SECRET_KEY: ci-only-secret-key-for-github-actions
-      ENVIRONMENT: production
+      TEST_DATABASE_URL: postgresql+psycopg://moneyfast:moneyfast@localhost:5432/moneyfast_test
+      SECRET_KEY: ci-only-secret-key-for-github-actions-0123456789
+      ENVIRONMENT: test
       CORS_ORIGINS: http://localhost:5173
       SMTP_HOST: ""
       SMTP_USER: ""
@@ -41,11 +43,17 @@ jobs:
           python-version: "3.12"
       - name: Install locked dependencies
         run: uv sync --locked --dev
-      - name: Bootstrap the legacy schema baseline
-        run: |
-          uv run python -c "import app.models; from app.core.database import Base, engine; Base.metadata.create_all(bind=engine)"
-          uv run alembic stamp head
+      - name: Lint
+        run: uv run ruff check
+      - name: Format check
+        run: uv run ruff format --check
+      - name: Alembic upgrade on PostgreSQL
+        run: uv run alembic upgrade head
       - name: Validate Alembic schema consistency
         run: uv run alembic check
-      - name: Run API tests
+      - name: Alembic downgrade and re-upgrade
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      - name: Run API tests (PostgreSQL only, includes the engine guard)
         run: uv run python -m pytest -q

@@ -1,20 +1,8 @@
-import os
-import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
-temp_db = Path(tempfile.gettempdir()) / f"moneyfast_test_suite_{os.getpid()}.db"
-if temp_db.exists():
-    temp_db.unlink()
-
-os.environ["DATABASE_URL"] = f"sqlite:///{temp_db.as_posix()}"
-os.environ["SECRET_KEY"] = "test-secret-key"
-os.environ["ENVIRONMENT"] = "development"
-# Keep tests hermetic: never hit real SMTP even if a .env configures it.
-os.environ["SMTP_HOST"] = ""
-os.environ["SMTP_USER"] = ""
-os.environ["SMTP_PASSWORD"] = ""
+from tests import pg_env  # noqa: F401  (PostgreSQL-only test environment; must precede app imports)
 
 from fastapi.testclient import TestClient
 
@@ -34,8 +22,6 @@ class MoneyFastApiTests(unittest.TestCase):
         cls.client.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
-        if temp_db.exists():
-            temp_db.unlink()
 
     def setUp(self) -> None:
         Base.metadata.drop_all(bind=engine)
@@ -1214,36 +1200,6 @@ class MoneyFastApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["data"], a["data"])
         self.assertEqual(response.json()["status"], "signed")
-
-    def test_customer_profile_migration_preserves_legacy_records(self):
-        import importlib.util
-        import json
-        import sqlalchemy as sa
-        from alembic.migration import MigrationContext
-        from alembic.operations import Operations
-        from unittest.mock import patch
-        path = Path(__file__).resolve().parents[1] / "alembic/versions/d9e0f1a2b3c4_customer_profiles.py"
-        spec = importlib.util.spec_from_file_location("customer_profile_migration", path)
-        migration = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(migration)
-        legacy_engine = sa.create_engine("sqlite://")
-        notes = json.dumps([{"nombre":"Referencia histórica", "telefono":"8095554444"}])
-        with legacy_engine.begin() as connection:
-            connection.execute(sa.text("CREATE TABLE customers (id INTEGER PRIMARY KEY, company_id INTEGER, document_id TEXT, notes TEXT)"))
-            connection.execute(sa.text("CREATE TABLE loan_applications (id INTEGER PRIMARY KEY, customer_id INTEGER, data TEXT)"))
-            connection.execute(sa.text("INSERT INTO customers VALUES (1, 1, '001-1', :notes), (2, 1, '0011', 'Notas libres'), (3, 2, '0011', NULL)"), {"notes":notes})
-            connection.execute(sa.text("INSERT INTO loan_applications VALUES (1, 1, 'snapshot original')"))
-            with patch.object(migration, "op", Operations(MigrationContext.configure(connection))):
-                migration.upgrade()
-            rows = connection.execute(sa.text('SELECT id, document_key, notes, "references", version FROM customers ORDER BY id')).mappings().all()
-            self.assertEqual(len(rows), 3)
-            self.assertEqual([r["document_key"] for r in rows], [None, None, "0011"])
-            self.assertEqual(rows[0]["notes"], notes)
-            self.assertEqual(json.loads(rows[0]["references"])[0]["nombre"], "Referencia histórica")
-            self.assertEqual(rows[1]["notes"], "Notas libres")
-            app_row = connection.execute(sa.text("SELECT data, customer_version FROM loan_applications")).one()
-            self.assertEqual(tuple(app_row), ("snapshot original", 1))
-        legacy_engine.dispose()
 
     def test_selected_legacy_duplicate_remains_usable_without_merging(self):
         from app.core.database import SessionLocal

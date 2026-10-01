@@ -1,4 +1,4 @@
-"""Cash lifecycle integration tests against an isolated SQLite database."""
+"""Cash lifecycle integration tests against an isolated PostgreSQL test database."""
 import base64
 import unittest
 import uuid
@@ -40,7 +40,7 @@ class CashTests(unittest.TestCase):
             u=self.req('/users',dict(full_name=role+' QA',email=role+'@example.com',password='workerpass123',role=role,branch_id=self.branch),code=201)
             self.users[role]=u
             self.roles[role]=self.auth_headers(self.login(role+'@example.com','workerpass123')['access_token'])
-        self.admin_id=self.req('/users')[0]['id']
+        self.admin_id=next(u['id'] for u in self.req('/users') if u['role']=='admin')  # ordering by name is collation-dependent on PostgreSQL
         self.customer=self.create_customer(self.admin,collector_id=self.users['collector']['id'])
         self.loan=self.create_loan(self.admin,self.customer['id'])
         for bid in (self.branch,self.other): self.req('/cash/setup',dict(branch_id=bid,initial_balance='1000',notes='Prueba inicial'))
