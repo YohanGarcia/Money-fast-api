@@ -13,6 +13,9 @@ from app.modules.credit.api import router as credit_router
 from app.modules.customers.api import router as customers_router
 from app.modules.identity.api import router as identity_router
 from app.modules.organization.api import router as organization_router
+from app.modules.origination.api import limit_router as origination_limit_router
+from app.modules.origination.api import policy_router as origination_policy_router
+from app.modules.origination.api import router as origination_router
 
 
 def create_app() -> FastAPI:
@@ -38,6 +41,9 @@ def create_app() -> FastAPI:
     application.include_router(organization_router)
     application.include_router(customers_router)
     application.include_router(credit_router)
+    application.include_router(origination_router)
+    application.include_router(origination_policy_router)
+    application.include_router(origination_limit_router)
 
     @application.get("/")
     def root() -> dict[str, str]:

@@ -55,6 +55,7 @@ include = [
   "tests/test_t005_engine.py",
   "tests/test_t005_credit_products.py",
   "tests/test_t005_races.py",
+  "tests/test_t006_origination.py",
 ]
 
 [tool.ruff.lint]
@@ -67,3 +68,5 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 "tests/test_t00[0-9]_*.py" = ["F811"]  # pytest fixture re-use via import
 "tests/test_t005_credit_products.py" = ["E501"]  # long inline SQL literals
 "tests/test_t005_races.py" = ["E501"]  # long inline SQL literals
+"tests/test_t006_origination.py" = ["E501", "E731"]  # inline SQL literals, small test lambdas
+"app/modules/origination/models.py" = ["E501"]  # long inline SQL (immutability trigger functions)

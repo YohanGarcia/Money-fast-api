@@ -89,6 +89,8 @@ class CreditProductVersion(Base):
         ),
         UniqueConstraint("tenant_id", "product_id", "version_number", name="uq_credit_product_versions_number"),
         UniqueConstraint("tenant_id", "id", name="uq_credit_product_versions_tenant_id"),
+        # target of the composite FKs that pin "this version of this product" (origination, T-006)
+        UniqueConstraint("tenant_id", "product_id", "id", name="uq_credit_product_versions_tenant_product_id"),
         # at most one open-ended published version per product: the one currently offered
         Index(
             "uq_credit_product_versions_open",

@@ -92,6 +92,31 @@ def raw_write_in_thread(sql: str, params: dict, out: dict):
     return t
 
 
+_TRACKED: list = []
+
+
+def tracked_connect():
+    """A raw connection that is ALWAYS rolled back and closed at teardown, even when an assertion fails while it
+    holds a row lock (otherwise the schema drop of the next fixture would wait on it forever)."""
+    conn = engine.connect()
+    _TRACKED.append(conn)
+    return conn
+
+
+@pytest.fixture(autouse=True)
+def _release_tracked_connections(client):
+    # depends on `client` so it is torn down BEFORE it: the TestClient waits for in-flight request threads,
+    # which may be blocked behind the very lock this releases
+    yield
+    for conn in _TRACKED:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:  # already closed by the test
+            pass
+    _TRACKED.clear()
+
+
 @pytest.fixture()
 def hold_publish(monkeypatch):
     """Pause the publish transaction right after it took its locks and before it reads rules/currencies' validation."""
@@ -145,7 +170,7 @@ def revalidate_and_publish(client, adm, p, v):
 def test_currency_change_wins_the_lock_first_publish_waits_and_uses_the_final_content(client, tenant_a):
     adm = admin_headers(client, tenant_a)
     p, v = draft(client, adm, "RACE-C1")
-    a = engine.connect()
+    a = tracked_connect()
     a.execute(text("UPDATE credit_product_currencies SET max_amount = 400000 WHERE version_id = :v"), {"v": v["id"]})
     out: dict = {}
     t = publish_in_thread(client, adm, p, v, out)
@@ -190,7 +215,7 @@ def test_rules_change_wins_first_hash_neutral_change_is_published_as_final_conte
     adm = admin_headers(client, tenant_a)
     p, v = draft(client, adm, "RACE-R1")
     reordered = '["2026-04-01", "2026-03-20"]'  # same logical rules, different stored array order
-    a = engine.connect()
+    a = tracked_connect()
     a.execute(
         text(
             "UPDATE credit_product_versions SET rules = jsonb_set(rules, '{calendar,holidays}', CAST(:h AS jsonb)) WHERE id = :v"
@@ -213,7 +238,7 @@ def test_rules_change_wins_first_hash_neutral_change_is_published_as_final_conte
 def test_rules_change_wins_first_content_change_forces_revalidation(client, tenant_a):
     adm = admin_headers(client, tenant_a)
     p, v = draft(client, adm, "RACE-R2")
-    a = engine.connect()
+    a = tracked_connect()
     a.execute(
         text(
             "UPDATE credit_product_versions SET rules = jsonb_set(rules, '{method,rate,value}', '\"24\"') WHERE id = :v"
@@ -359,7 +384,7 @@ def usd_draft(client, adm, code):
 def test_disable_wins_the_currency_lock_first_publish_waits_then_is_refused(client, tenant_a):
     adm = admin_headers(client, tenant_a)
     p, v = usd_draft(client, adm, "RACE-T1")  # validated while USD is enabled
-    a = engine.connect()
+    a = tracked_connect()
     a.execute(text(DISABLE_USD), {"t": tenant_a["tenant_id"]})  # open, uncommitted
     out: dict = {}
     t = publish_in_thread(client, adm, p, v, out)

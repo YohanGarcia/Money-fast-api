@@ -635,3 +635,14 @@ def simulate(db: Session, actor: Principal, product_id: int, version_id: int, bo
         "rules_hash": version.rules_hash if version.status != "draft" else compute_rules_hash(rules, currencies),
         "timezone": tz,
     }
+
+
+# --- read-only helpers shared with the origination module (T-006 consumes the T-005 contract) --------------
+def version_currencies(db: Session, version_id: int) -> list[dict]:
+    """[{code, min_amount, max_amount}] of a version (plain decimal strings)."""
+    return _currency_rows(db, version_id)
+
+
+def verify_version_integrity(db: Session, version: CreditProductVersion) -> bool:
+    """True when the published version's stored rules/currencies/snapshot all still match its ``rules_hash``."""
+    return _verify(version, _currency_rows(db, version.id))

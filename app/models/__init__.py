@@ -76,3 +76,16 @@ __all__ = [
 ]
 
 from app.modules.credit.models import CreditProduct, CreditProductCurrency, CreditProductVersion  # noqa: F401
+
+from app.modules.origination.models import (  # noqa: F401
+    CreditApplication,
+    CreditApplicationCondition,
+    CreditApplicationDocumentLink,
+    CreditApplicationEvaluation,
+    CreditApplicationSubmission,
+    CreditApprovalLimit,
+    CreditApprovalPolicy,
+    CreditApproval,
+    CreditDecision,
+    CreditFormalization,
+)
