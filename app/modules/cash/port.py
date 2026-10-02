@@ -44,20 +44,10 @@ class CashWithdrawal:
     balance_after: Decimal
 
 
-def withdraw(
-    db: Session,
-    *,
-    tenant_id: int,
-    branch_id: int,
-    session_id: int,
-    amount: Decimal,
-    currency: str,
-    actor_user_id: int,
-    kind: str,
-    reference: str,
-    notes: str,
-) -> CashWithdrawal:
-    """Cash out of one open custody session of the branch. Locks box then session (the legacy order)."""
+def _open_custody(
+    db: Session, *, tenant_id: int, branch_id: int, session_id: int, amount: Decimal, currency: str
+) -> tuple[CashBox, CashSession]:
+    """Validate and lock (box, then session: the legacy order) the open custody session of the branch's box."""
     if currency != CASH_CURRENCY:
         raise CashCurrencyUnsupported()
     if db.get(CashConfig, tenant_id) is None:
@@ -68,21 +58,33 @@ def withdraw(
         select(CashBox).where(CashBox.company_id == tenant_id, CashBox.branch_id == branch_id).with_for_update()
     )
     if box is None:
-        raise CashUnavailable("La sucursal de desembolso no tiene caja configurada.")
+        raise CashUnavailable("La sucursal indicada no tiene caja configurada.")
     session = db.scalar(
         select(CashSession).where(CashSession.id == session_id, CashSession.box_id == box.id).with_for_update()
     )
     if session is None or session.state != "open":
-        raise CashUnavailable("La jornada indicada no esta abierta en la caja de la sucursal de desembolso.")
-    if session.balance - amount < 0:
-        raise InsufficientCash()
-    session.balance -= amount
+        raise CashUnavailable("La jornada indicada no esta abierta en la caja de la sucursal indicada.")
+    return box, session
+
+
+def _record(
+    db: Session,
+    box: CashBox,
+    session: CashSession,
+    *,
+    signed: Decimal,
+    actor_user_id: int,
+    kind: str,
+    reference: str,
+    notes: str,
+) -> CashWithdrawal:
+    session.balance += signed
     session.version += 1
     movement = CashMovement(
         box_id=box.id,
         session_id=session.id,
         kind=kind,
-        amount=-amount,
+        amount=signed,
         actor_id=actor_user_id,
         notes=notes,
         reference=reference,
@@ -97,9 +99,58 @@ def withdraw(
             details={
                 "movement_id": movement.id,
                 "session_id": session.id,
-                "amount": str(amount),
+                "amount": str(signed),
                 "reference": reference,
             },
         )
     )
-    return CashWithdrawal(movement.id, box.id, session.id, amount, session.balance)
+    return CashWithdrawal(movement.id, box.id, session.id, abs(signed), session.balance)
+
+
+def withdraw(
+    db: Session,
+    *,
+    tenant_id: int,
+    branch_id: int,
+    session_id: int,
+    amount: Decimal,
+    currency: str,
+    actor_user_id: int,
+    kind: str,
+    reference: str,
+    notes: str,
+) -> CashWithdrawal:
+    """Cash OUT of one open custody session of the branch."""
+    box, session = _open_custody(
+        db, tenant_id=tenant_id, branch_id=branch_id, session_id=session_id, amount=amount, currency=currency
+    )
+    if session.balance - amount < 0:
+        raise InsufficientCash()
+    return _record(
+        db, box, session, signed=-amount, actor_user_id=actor_user_id, kind=kind, reference=reference, notes=notes
+    )
+
+
+def deposit(
+    db: Session,
+    *,
+    tenant_id: int,
+    branch_id: int,
+    session_id: int,
+    amount: Decimal,
+    currency: str,
+    actor_user_id: int,
+    kind: str,
+    reference: str,
+    notes: str,
+) -> CashWithdrawal:
+    """Cash IN to one open custody session of the branch (e.g. a loan payment received at the counter).
+
+    ``kind`` must be a kind the legacy cash reversal does not accept (``credit_payment_receipt``): reversing only the cash
+    would leave the debt applied. Never commits."""
+    box, session = _open_custody(
+        db, tenant_id=tenant_id, branch_id=branch_id, session_id=session_id, amount=amount, currency=currency
+    )
+    return _record(
+        db, box, session, signed=amount, actor_user_id=actor_user_id, kind=kind, reference=reference, notes=notes
+    )

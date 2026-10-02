@@ -665,7 +665,9 @@ def test_loans_obligations_and_disbursements_are_immutable_in_the_database(clien
         db.commit()
     assert client.get(f"{LOANS}/{out['id']}", headers=adm).json()["status"] == "past_due"
     bal = client.get(f"{LOANS}/{out['id']}", headers=adm).json()["balances"]
-    assert Decimal(bal["outstanding_principal"]) < Decimal("7000")  # balances are re-derived, never stored
+    # T-008: balances are derived from obligations minus payment APPLICATIONS. A status flag is a projection, not the
+    # truth: flipping it by hand must not move any balance.
+    assert bal["outstanding_principal"] == "7000.0000" and bal["total_paid"] == "0.0000"
     # one loan / one disbursement per contract, one movement per disbursement, one key per tenant: DB constraints
     for sql in ("INSERT INTO credit_loan_disbursements SELECT * FROM credit_loan_disbursements",):
         with SessionLocal() as db:

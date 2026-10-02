@@ -57,6 +57,7 @@ include = [
   "tests/test_t005_races.py",
   "tests/test_t006_origination.py",
   "tests/test_t007_disbursement.py",
+  "tests/test_t008_payments.py",
 ]
 
 [tool.ruff.lint]
@@ -74,3 +75,4 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 "app/modules/loans/*.py" = ["E501"]  # long inline SQL and messages
 "app/modules/cash/port.py" = ["E501"]  # long BLOCKED_BY_EVIDENCE message
 "tests/test_t007_disbursement.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t008_payments.py" = ["E501", "E731"]  # inline SQL literals

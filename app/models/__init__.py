@@ -90,4 +90,10 @@ from app.modules.origination.models import (  # noqa: F401
     CreditFormalization,
 )
 
-from app.modules.loans.models import CreditLoan, CreditLoanDisbursement, CreditLoanObligation  # noqa: F401
+from app.modules.loans.models import (  # noqa: F401
+    CreditLoan,
+    CreditLoanDisbursement,
+    CreditLoanObligation,
+    CreditPayment,
+    CreditPaymentApplication,
+)

@@ -26,6 +26,7 @@ from app.modules.customers.service import visible_branch_ids
 from app.modules.identity.audit import record_event
 from app.modules.identity.authorization import Principal, require
 from app.modules.identity.errors import PermissionDenied, TenantMismatch
+from app.modules.loans import ledger
 from app.modules.loans.errors import (
     AlreadyDisbursed,
     ContractIntegrityFailed,
@@ -95,8 +96,15 @@ def _summary(loan: CreditLoan) -> dict:
     }
 
 
-def _obligation_out(o: CreditLoanObligation) -> dict:
+def _obligation_out(o: CreditLoanObligation, view=None) -> dict:
+    derived = {}
+    if view is not None:  # derived from the applications, never stored
+        derived = {
+            "paid_amount": _amt(sum((view.applied.get(c, Decimal(0)) for c in view.due), Decimal(0))),
+            "outstanding_amount": _amt(view.outstanding_total),
+        }
     return {
+        **derived,
         "sequence": o.sequence,
         "contractual_date": o.contractual_date,
         "due_date": o.due_date,
@@ -108,22 +116,6 @@ def _obligation_out(o: CreditLoanObligation) -> dict:
         "total_due": _amt(o.total_due),
         "currency_code": o.currency_code,
         "status": o.status,
-    }
-
-
-def _balances(loan: CreditLoan, obligations: list[CreditLoanObligation]) -> dict:
-    """Derived, never stored: rebuilt from the obligations. original_principal != outstanding_principal != total_debt.
-    No payment exists yet, so nothing is paid; once payments exist this is rebuilt from their applications."""
-    open_ = [o for o in obligations if o.status != "paid"]
-    zero = Decimal(0)
-    return {
-        "original_principal": _amt(loan.original_principal),
-        "outstanding_principal": _amt(sum((o.principal_due for o in open_), zero)),
-        "interest_scheduled_pending": _amt(sum((o.interest_due for o in open_), zero)),
-        "fees_scheduled_pending": _amt(sum((o.fees_due for o in open_), zero)),
-        "delinquency_pending": _amt(sum((o.delinquency_due for o in open_), zero)),
-        "total_debt": _amt(sum((o.total_due for o in open_), zero)),
-        "currency_code": loan.currency_code,
     }
 
 
@@ -146,11 +138,7 @@ def _disbursement_out(d: CreditLoanDisbursement) -> dict:
 
 
 def _detail(db: Session, loan: CreditLoan) -> dict:
-    obligations = db.scalars(
-        select(CreditLoanObligation)
-        .where(CreditLoanObligation.loan_id == loan.id)
-        .order_by(CreditLoanObligation.sequence)
-    ).all()
+    obligations, views = ledger.views(db, loan.id)  # derived: contractual obligations minus payment applications
     disbursement = db.scalar(select(CreditLoanDisbursement).where(CreditLoanDisbursement.loan_id == loan.id))
     return {
         **_summary(loan),
@@ -158,7 +146,9 @@ def _detail(db: Session, loan: CreditLoan) -> dict:
         "rules_hash": loan.rules_hash,
         "contract_hash": loan.contract_hash,
         "disbursement": _disbursement_out(disbursement) if disbursement else None,
-        "balances": _balances(loan, list(obligations)),
+        "balances": ledger.balances_out(
+            views, ledger.business_date(db, loan, now_utc()), loan.original_principal, loan.currency_code
+        ),
         "obligation_count": len(obligations),
     }
 
@@ -391,16 +381,13 @@ def get_loan(db: Session, actor: Principal, loan_id: int) -> dict:
 
 def get_schedule(db: Session, actor: Principal, loan_id: int) -> dict:
     loan = _loan(db, actor, loan_id)
-    rows = db.scalars(
-        select(CreditLoanObligation)
-        .where(CreditLoanObligation.loan_id == loan.id)
-        .order_by(CreditLoanObligation.sequence)
-    ).all()
+    rows, views = ledger.views(db, loan.id)
+    by_id = {v.id: v for v in views}
     return {
         "loan_id": loan.id,
         "currency_code": loan.currency_code,
         "original_principal": _amt(loan.original_principal),
-        "obligations": [_obligation_out(o) for o in rows],
+        "obligations": [_obligation_out(o, by_id[o.id]) for o in rows],
         "totals": {
             "principal": _amt(sum((o.principal_due for o in rows), Decimal(0))),
             "interest": _amt(sum((o.interest_due for o in rows), Decimal(0))),
@@ -408,3 +395,11 @@ def get_schedule(db: Session, actor: Principal, loan_id: int) -> dict:
             "total": _amt(sum((o.total_due for o in rows), Decimal(0))),
         },
     }
+
+
+def get_balances(db: Session, actor: Principal, loan_id: int) -> dict:
+    loan = _loan(db, actor, loan_id)
+    _rows, views = ledger.views(db, loan.id)
+    return ledger.balances_out(
+        views, ledger.business_date(db, loan, now_utc()), loan.original_principal, loan.currency_code
+    ) | {"loan_id": loan.id, "loan_status": loan.status}

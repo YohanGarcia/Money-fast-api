@@ -25,6 +25,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -108,6 +109,9 @@ class CreditLoan(Base):
         UniqueConstraint("tenant_id", "loan_number", name="uq_credit_loans_tenant_number"),
         UniqueConstraint("formalization_id", name="uq_credit_loans_formalization"),  # one loan per formalized contract
         UniqueConstraint("tenant_id", "id", name="uq_credit_loans_tenant_id"),
+        UniqueConstraint(
+            "tenant_id", "id", "currency_code", name="uq_credit_loans_tenant_id_currency"
+        ),  # T-008 FK target
         Index("ix_credit_loans_customer", "customer_id"),
         Index("ix_credit_loans_status", "tenant_id", "status"),
     )
@@ -205,6 +209,9 @@ class CreditLoanObligation(Base):
             name="fk_credit_loan_obligations_loan",
         ),
         UniqueConstraint("loan_id", "sequence", name="uq_credit_loan_obligations_sequence"),
+        UniqueConstraint(
+            "tenant_id", "id", "loan_id", name="uq_credit_loan_obligations_tenant_id_loan"
+        ),  # T-008 FK target
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -284,4 +291,177 @@ for _table_name, _fn_name, _fn_sql, _events in GUARDS:
     event.listen(_t, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
     event.listen(
         _t, "after_create", DDL(guard_trigger_sql(_table_name, _fn_name, _events)).execute_if(dialect="postgresql")
+    )
+
+
+# =============================== T-008: payments and their applications ===============================
+PAYMENT_STATUSES = (
+    "confirmed",
+    "pending",
+    "failed",
+    "reversed",
+)  # T-008 only ever creates 'confirmed' and never updates
+PAYMENT_METHODS = ("cash",)
+PAYMENT_ORIGINS = ("counter", "field")
+APPLICATION_COMPONENTS = ("fee", "delinquency", "interest", "principal")
+
+
+class CreditPayment(Base):
+    """A confirmed receipt of money on a loan. Immutable: an economic record is never edited (reversal is a later package).
+    ``payment_number`` is a TECHNICAL reference only: it is not a fiscal or legal receipt."""
+
+    __tablename__ = "credit_payments"
+    __table_args__ = (
+        CheckConstraint(_in("status", PAYMENT_STATUSES), name="status_valid"),
+        CheckConstraint(_in("method", PAYMENT_METHODS), name="method_valid"),
+        CheckConstraint(_in("origin", PAYMENT_ORIGINS), name="origin_valid"),
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint(
+            "((origin = 'counter') = (cash_session_id IS NOT NULL)) AND ((origin = 'counter') = (cash_movement_id IS NOT NULL))",
+            name="cash_matches_origin",  # counter -> exactly one cash movement; field -> none
+        ),
+        # the payment currency IS the loan's currency (composite FK on (tenant, loan, currency))
+        ForeignKeyConstraint(
+            ["tenant_id", "loan_id", "currency_code"],
+            ["credit_loans.tenant_id", "credit_loans.id", "credit_loans.currency_code"],
+            name="fk_credit_payments_loan_currency",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "receiving_branch_id"],
+            ["branches.company_id", "branches.id"],
+            name="fk_credit_payments_receiving_branch",
+        ),
+        UniqueConstraint("tenant_id", "payment_number", name="uq_credit_payments_tenant_number"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_payments_tenant_key"),
+        UniqueConstraint("cash_movement_id", name="uq_credit_payments_cash_movement"),
+        UniqueConstraint("tenant_id", "id", "loan_id", name="uq_credit_payments_tenant_id_loan"),
+        Index(
+            "uq_credit_payments_external_reference",
+            "tenant_id",
+            "method",
+            "external_reference",
+            unique=True,
+            postgresql_where=text("external_reference IS NOT NULL"),
+        ),
+        Index("ix_credit_payments_loan", "loan_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    payment_number: Mapped[str] = mapped_column(String(20))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency_code: Mapped[str] = mapped_column(String(3))
+    method: Mapped[str] = mapped_column(String(10), default="cash")
+    origin: Mapped[str] = mapped_column(String(10))
+    status: Mapped[str] = mapped_column(String(10), default="confirmed")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    business_date: Mapped[date] = mapped_column(Date)  # in the contract's timezone, never the UTC date
+    receiving_branch_id: Mapped[int] = mapped_column(Integer)
+    cash_session_id: Mapped[int | None] = mapped_column(ForeignKey("cash_sessions.id"), nullable=True)
+    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"), nullable=True)
+    collected_by: Mapped[int] = mapped_column(Integer)  # the user who received the money (cashier or collector)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+    external_reference: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CreditPaymentApplication(Base):
+    """How a payment was used: payment -> obligation -> component -> amount. Append-only. Together with the contractual
+    obligations these rows are the ONLY source of truth for what is paid and what is outstanding."""
+
+    __tablename__ = "credit_payment_applications"
+    __table_args__ = (
+        CheckConstraint(_in("component", APPLICATION_COMPONENTS), name="component_valid"),
+        CheckConstraint("amount > 0", name="amount_positive"),
+        # payment and obligation must belong to the SAME loan of the same tenant (two composite FKs share loan_id)
+        ForeignKeyConstraint(
+            ["tenant_id", "payment_id", "loan_id"],
+            ["credit_payments.tenant_id", "credit_payments.id", "credit_payments.loan_id"],
+            name="fk_credit_payment_applications_payment",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "obligation_id", "loan_id"],
+            ["credit_loan_obligations.tenant_id", "credit_loan_obligations.id", "credit_loan_obligations.loan_id"],
+            name="fk_credit_payment_applications_obligation",
+        ),
+        UniqueConstraint("payment_id", "obligation_id", "component", name="uq_credit_payment_applications_row"),
+        Index("ix_credit_payment_applications_obligation", "obligation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    payment_id: Mapped[int] = mapped_column(Integer, index=True)
+    obligation_id: Mapped[int] = mapped_column(Integer)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    component: Mapped[str] = mapped_column(String(12))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+PAYMENT_SUM_FN = """
+CREATE OR REPLACE FUNCTION credit_payment_sum_check() RETURNS trigger AS $$
+DECLARE v_id integer; v_amount numeric; v_sum numeric;
+BEGIN
+  IF TG_TABLE_NAME = 'credit_payments' THEN v_id := NEW.id; ELSE v_id := NEW.payment_id; END IF;
+  SELECT amount INTO v_amount FROM credit_payments WHERE id = v_id;
+  SELECT COALESCE(SUM(amount), 0) INTO v_sum FROM credit_payment_applications WHERE payment_id = v_id;
+  IF v_amount IS NULL OR v_sum <> v_amount THEN
+    RAISE EXCEPTION 'credit payment % applications (%) must equal its amount (%)', v_id, v_sum, v_amount;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql
+"""
+# Runs at COMMIT. It locks the obligation row first, so two transactions applying to the same obligation serialise here
+# and the second one re-reads the first one's committed rows (READ COMMITTED): no over-application can commit.
+PAYMENT_COMPONENT_FN = """
+CREATE OR REPLACE FUNCTION credit_payment_component_check() RETURNS trigger AS $$
+DECLARE v_due numeric; v_sum numeric;
+BEGIN
+  SELECT CASE NEW.component WHEN 'fee' THEN fees_due WHEN 'delinquency' THEN delinquency_due
+                            WHEN 'interest' THEN interest_due ELSE principal_due END
+    INTO v_due FROM credit_loan_obligations WHERE id = NEW.obligation_id FOR UPDATE;
+  SELECT COALESCE(SUM(amount), 0) INTO v_sum FROM credit_payment_applications
+    WHERE obligation_id = NEW.obligation_id AND component = NEW.component;
+  IF v_sum > v_due THEN
+    RAISE EXCEPTION 'credit obligation % component % over-applied (% > %)', NEW.obligation_id, NEW.component, v_sum, v_due;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql
+"""
+# (table, trigger name, function)
+PAYMENT_CONSTRAINT_TRIGGERS = (
+    ("credit_payment_applications", "trg_credit_payment_applications_sum", "credit_payment_sum_check"),
+    ("credit_payments", "trg_credit_payments_sum", "credit_payment_sum_check"),
+    ("credit_payment_applications", "trg_credit_payment_applications_component", "credit_payment_component_check"),
+)
+
+
+def payment_constraint_trigger_sql(table: str, name: str, fn: str) -> str:
+    return (
+        f"CREATE CONSTRAINT TRIGGER {name} AFTER INSERT ON {table} DEFERRABLE INITIALLY DEFERRED "
+        f"FOR EACH ROW EXECUTE FUNCTION {fn}()"
+    )
+
+
+PAYMENT_GUARDS = (
+    ("credit_payments", "origination_append_only", IMMUTABLE_FN, "UPDATE OR DELETE"),
+    ("credit_payment_applications", "origination_append_only", IMMUTABLE_FN, "UPDATE OR DELETE"),
+)
+for _table_name, _fn_name, _fn_sql, _events in PAYMENT_GUARDS:
+    _t = Base.metadata.tables[_table_name]
+    event.listen(_t, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+    event.listen(
+        _t, "after_create", DDL(guard_trigger_sql(_table_name, _fn_name, _events)).execute_if(dialect="postgresql")
+    )
+# credit_payments is created before credit_payment_applications: the functions (late-bound plpgsql) go with the FIRST table
+_payments_table = Base.metadata.tables["credit_payments"]
+for _fn_sql in (PAYMENT_SUM_FN, PAYMENT_COMPONENT_FN):
+    event.listen(_payments_table, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+for _table_name, _trigger, _fn in PAYMENT_CONSTRAINT_TRIGGERS:
+    event.listen(
+        Base.metadata.tables[_table_name],
+        "after_create",
+        DDL(payment_constraint_trigger_sql(_table_name, _trigger, _fn)).execute_if(dialect="postgresql"),
     )

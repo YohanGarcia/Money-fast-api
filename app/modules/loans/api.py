@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import service
+from app.modules.loans import payments, service
+from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.loans.schemas import DisburseIn
 
 router = APIRouter(prefix="/api/v2", tags=["loans"])
@@ -49,3 +50,29 @@ def get_loan(loan_id: int, actor: Principal = Actor, db: Session = Db):
 @router.get("/loans/{loan_id}/schedule")
 def get_schedule(loan_id: int, actor: Principal = Actor, db: Session = Db):
     return service.get_schedule(db, actor, loan_id)
+
+
+@router.get("/loans/{loan_id}/balances")
+def get_balances(loan_id: int, actor: Principal = Actor, db: Session = Db):
+    return service.get_balances(db, actor, loan_id)
+
+
+@router.post("/loans/{loan_id}/payments")
+def create_payment(loan_id: int, body: PaymentIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    return payments.pay(db, actor, loan_id, body, client_ip(request))
+
+
+@router.get("/loans/{loan_id}/payments")
+def list_payments(
+    loan_id: int,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    return payments.list_payments(db, actor, loan_id, limit=limit, offset=offset)
+
+
+@router.get("/payments/{payment_id}")
+def get_payment(payment_id: int, actor: Principal = Actor, db: Session = Db):
+    return payments.get_payment(db, actor, payment_id)
