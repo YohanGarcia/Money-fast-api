@@ -30,6 +30,11 @@ class CashCurrencyUnsupported(AppError):
     default_message = "BLOCKED_BY_EVIDENCE: la caja actual opera solo en RD$ (DOP); no hay soporte de otras monedas hasta el paquete de Caja."
 
 
+class CashSessionNotOwned(AppError):
+    status_code, code = 403, "cash_session_not_owned"
+    default_message = "La jornada indicada no pertenece al usuario que ejecuta la operacion."
+
+
 class InsufficientCash(AppError):
     status_code, code = 409, "insufficient_cash"
     default_message = "El efectivo disponible en la jornada no alcanza para esta salida."
@@ -45,7 +50,14 @@ class CashWithdrawal:
 
 
 def _open_custody(
-    db: Session, *, tenant_id: int, branch_id: int, session_id: int, amount: Decimal, currency: str
+    db: Session,
+    *,
+    tenant_id: int,
+    branch_id: int,
+    session_id: int,
+    amount: Decimal,
+    currency: str,
+    cashier_id: int | None = None,
 ) -> tuple[CashBox, CashSession]:
     """Validate and lock (box, then session: the legacy order) the open custody session of the branch's box."""
     if currency != CASH_CURRENCY:
@@ -64,6 +76,8 @@ def _open_custody(
     )
     if session is None or session.state != "open":
         raise CashUnavailable("La jornada indicada no esta abierta en la caja de la sucursal indicada.")
+    if cashier_id is not None and session.cashier_id != cashier_id:
+        raise CashSessionNotOwned()  # the cash physically leaves the drawer of the person executing the operation
     return box, session
 
 
@@ -77,6 +91,7 @@ def _record(
     kind: str,
     reference: str,
     notes: str,
+    reverses_id: int | None = None,
 ) -> CashWithdrawal:
     session.balance += signed
     session.version += 1
@@ -88,6 +103,7 @@ def _record(
         actor_id=actor_user_id,
         notes=notes,
         reference=reference,
+        reverses_id=reverses_id,
     )
     db.add(movement)
     db.flush()
@@ -119,15 +135,34 @@ def withdraw(
     kind: str,
     reference: str,
     notes: str,
+    reverses_id: int | None = None,
+    require_cashier_id: int | None = None,
 ) -> CashWithdrawal:
-    """Cash OUT of one open custody session of the branch."""
+    """Cash OUT of one open custody session of the branch.
+
+    ``reverses_id`` links a compensating movement to the one it compensates (T-009); ``require_cashier_id`` demands that
+    the session belongs to that user. Never commits."""
     box, session = _open_custody(
-        db, tenant_id=tenant_id, branch_id=branch_id, session_id=session_id, amount=amount, currency=currency
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        session_id=session_id,
+        amount=amount,
+        currency=currency,
+        cashier_id=require_cashier_id,
     )
     if session.balance - amount < 0:
         raise InsufficientCash()
     return _record(
-        db, box, session, signed=-amount, actor_user_id=actor_user_id, kind=kind, reference=reference, notes=notes
+        db,
+        box,
+        session,
+        signed=-amount,
+        actor_user_id=actor_user_id,
+        kind=kind,
+        reference=reference,
+        notes=notes,
+        reverses_id=reverses_id,
     )
 
 

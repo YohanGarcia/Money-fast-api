@@ -6,8 +6,9 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import payments, service
+from app.modules.loans import payments, reversals, service
 from app.modules.loans.payment_schemas import PaymentIn
+from app.modules.loans.reversal_schemas import ReversalIn
 from app.modules.loans.schemas import DisburseIn
 
 router = APIRouter(prefix="/api/v2", tags=["loans"])
@@ -76,3 +77,13 @@ def list_payments(
 @router.get("/payments/{payment_id}")
 def get_payment(payment_id: int, actor: Principal = Actor, db: Session = Db):
     return payments.get_payment(db, actor, payment_id)
+
+
+@router.post("/payments/{payment_id}/reversals")
+def reverse_payment(payment_id: int, body: ReversalIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    return reversals.reverse(db, actor, payment_id, body, client_ip(request))
+
+
+@router.get("/payments/{payment_id}/reversal")
+def get_reversal(payment_id: int, actor: Principal = Actor, db: Session = Db):
+    return reversals.get_reversal(db, actor, payment_id)

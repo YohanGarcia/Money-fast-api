@@ -1039,7 +1039,7 @@ def test_migration_0010_upgrade_downgrade_reupgrade(scratch_db):
                     "SELECT id, 'Administrador de agencia', 'x', 'active', true, now(), now() FROM companies"
                 )
             )
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0010")
         assert up.returncode == 0, up.stderr
         with eng.connect() as c:
             assert (

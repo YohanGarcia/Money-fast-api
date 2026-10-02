@@ -12,7 +12,12 @@ from sqlalchemy.orm import Session
 
 from app.core.time import to_zone
 from app.modules.loans import allocation
-from app.modules.loans.models import CreditLoan, CreditLoanObligation, CreditPaymentApplication
+from app.modules.loans.models import (
+    CreditLoan,
+    CreditLoanObligation,
+    CreditPaymentApplication,
+    CreditPaymentReversalApplication,
+)
 from app.modules.origination.models import CreditFormalization
 
 
@@ -21,7 +26,9 @@ def _amt(value: Decimal) -> str:
 
 
 def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Decimal]]:
-    rows = db.execute(
+    """NET applied per obligation and component: applications - reversal applications (T-009). THE only place where the
+    paid amount of a loan is computed: nothing else may read the gross applications as "paid"."""
+    gross = db.execute(
         select(
             CreditPaymentApplication.obligation_id,
             CreditPaymentApplication.component,
@@ -30,10 +37,35 @@ def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Deci
         .where(CreditPaymentApplication.loan_id == loan_id)
         .group_by(CreditPaymentApplication.obligation_id, CreditPaymentApplication.component)
     )
+    reversed_ = {
+        (oid, component): total
+        for oid, component, total in db.execute(
+            select(
+                CreditPaymentReversalApplication.obligation_id,
+                CreditPaymentReversalApplication.component,
+                func.sum(CreditPaymentReversalApplication.amount),
+            )
+            .where(CreditPaymentReversalApplication.loan_id == loan_id)
+            .group_by(CreditPaymentReversalApplication.obligation_id, CreditPaymentReversalApplication.component)
+        )
+    }
     out: dict[int, dict[str, Decimal]] = {}
-    for oid, component, total in rows:
-        out.setdefault(oid, {})[component] = total
+    for oid, component, total in gross:
+        out.setdefault(oid, {})[component] = total - reversed_.get((oid, component), Decimal(0))
     return out
+
+
+def project(db: Session, loan: CreditLoan, obligations: list[CreditLoanObligation]) -> None:
+    """Re-derive every obligation's status from its amounts and the NET applications ONLY, then the loan flag:
+    all paid -> ``paid``; a ``paid`` loan whose debt reappeared (a reversal) -> ``active``. Nothing else moves the loan."""
+    _o, views_ = views(db, loan.id)  # re-read: includes the rows just flushed
+    by_id = {v.id: v for v in views_}
+    for ob in obligations:
+        ob.status = allocation.obligation_status(by_id[ob.id])
+    if all(ob.status == "paid" for ob in obligations):
+        loan.status = "paid"
+    elif loan.status == "paid":
+        loan.status = "active"  # T-009: the debt reappeared; past_due / restructured / refinanced stay out of scope
 
 
 def views(

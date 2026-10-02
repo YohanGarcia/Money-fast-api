@@ -58,3 +58,28 @@ class PaymentInvariantViolation(AppError):
     default_message = (
         "La base de datos rechazo el pago por violar un invariante (aplicacion exacta o sobre-aplicacion)."
     )
+
+
+class PaymentAlreadyReversed(AppError):
+    status_code, code = 409, "payment_already_reversed"
+    default_message = "Este pago ya fue revertido."
+
+
+class ReversalBranchMismatch(AppError):
+    status_code, code = 422, "reversal_branch_mismatch"
+    default_message = "La reversion debe ocurrir en la sucursal que recibio el pago."
+
+
+class LoanNotReversible(AppError):
+    status_code, code = 409, "loan_not_reversible"
+    default_message = "El prestamo no admite reversiones de pagos en su estado actual."
+
+
+class PaymentNotReversed(AppError):
+    status_code, code = 404, "payment_not_reversed"
+    default_message = "El pago no tiene reversion."
+
+
+class ReversalSessionMismatch(AppError):
+    status_code, code = 422, "reversal_cash_session_mismatch"
+    default_message = "cash_session_id es obligatorio al revertir un cobro de ventanilla y no aplica a uno de campo."

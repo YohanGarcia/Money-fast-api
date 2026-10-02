@@ -335,6 +335,17 @@ class CreditPayment(Base):
         UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_payments_tenant_key"),
         UniqueConstraint("cash_movement_id", name="uq_credit_payments_cash_movement"),
         UniqueConstraint("tenant_id", "id", "loan_id", name="uq_credit_payments_tenant_id_loan"),
+        # target of the T-009 reversal FK: a reversal can only exist for the SAME amount / origin / currency / branch
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "loan_id",
+            "amount",
+            "origin",
+            "currency_code",
+            "receiving_branch_id",
+            name="uq_credit_payments_reversal_target",
+        ),
         Index(
             "uq_credit_payments_external_reference",
             "tenant_id",
@@ -387,6 +398,17 @@ class CreditPaymentApplication(Base):
             name="fk_credit_payment_applications_obligation",
         ),
         UniqueConstraint("payment_id", "obligation_id", "component", name="uq_credit_payment_applications_row"),
+        # target of the T-009 mirror FK: a reversal application repeats obligation / component / amount EXACTLY
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "payment_id",
+            "obligation_id",
+            "loan_id",
+            "component",
+            "amount",
+            name="uq_credit_payment_applications_mirror",
+        ),
         Index("ix_credit_payment_applications_obligation", "obligation_id"),
     )
 
@@ -413,7 +435,7 @@ BEGIN
   RETURN NULL;
 END $$ LANGUAGE plpgsql
 """
-# Runs at COMMIT. It locks the obligation row first, so two transactions applying to the same obligation serialise here
+# T-009: the sum is NET (applications - reversal applications). Runs at COMMIT. It locks the obligation row first, so two transactions applying to the same obligation serialise here
 # and the second one re-reads the first one's committed rows (READ COMMITTED): no over-application can commit.
 PAYMENT_COMPONENT_FN = """
 CREATE OR REPLACE FUNCTION credit_payment_component_check() RETURNS trigger AS $$
@@ -423,6 +445,8 @@ BEGIN
                             WHEN 'interest' THEN interest_due ELSE principal_due END
     INTO v_due FROM credit_loan_obligations WHERE id = NEW.obligation_id FOR UPDATE;
   SELECT COALESCE(SUM(amount), 0) INTO v_sum FROM credit_payment_applications
+    WHERE obligation_id = NEW.obligation_id AND component = NEW.component;
+  SELECT v_sum - COALESCE(SUM(amount), 0) INTO v_sum FROM credit_payment_reversal_applications
     WHERE obligation_id = NEW.obligation_id AND component = NEW.component;
   IF v_sum > v_due THEN
     RAISE EXCEPTION 'credit obligation % component % over-applied (% > %)', NEW.obligation_id, NEW.component, v_sum, v_due;
@@ -460,6 +484,185 @@ _payments_table = Base.metadata.tables["credit_payments"]
 for _fn_sql in (PAYMENT_SUM_FN, PAYMENT_COMPONENT_FN):
     event.listen(_payments_table, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
 for _table_name, _trigger, _fn in PAYMENT_CONSTRAINT_TRIGGERS:
+    event.listen(
+        Base.metadata.tables[_table_name],
+        "after_create",
+        DDL(payment_constraint_trigger_sql(_table_name, _trigger, _fn)).execute_if(dialect="postgresql"),
+    )
+
+
+# =============================== T-009: full payment reversal ===============================
+REVERSAL_ORIGINS = PAYMENT_ORIGINS
+
+
+class CreditPaymentReversal(Base):
+    """The FULL reversal of one confirmed payment. Append-only; at most one per payment (``UNIQUE(payment_id)``).
+    The original payment is never touched: "reversed" is DERIVED from the existence of this row. The composite FK ties
+    amount, origin, currency and ``reversal_branch_id`` to the payment's own (amount, origin, currency, receiving branch):
+    a partial reversal or a reversal at another branch cannot exist."""
+
+    __tablename__ = "credit_payment_reversals"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint(_in("origin", REVERSAL_ORIGINS), name="origin_valid"),
+        CheckConstraint("char_length(btrim(reason)) BETWEEN 3 AND 500", name="reason_length"),
+        CheckConstraint(
+            "((origin = 'counter') = (cash_session_id IS NOT NULL)) AND ((origin = 'counter') = (cash_movement_id IS NOT NULL))",
+            name="cash_matches_origin",  # counter -> exactly one cash movement; field -> none
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "payment_id", "loan_id", "amount", "origin", "currency_code", "reversal_branch_id"],
+            [
+                "credit_payments.tenant_id",
+                "credit_payments.id",
+                "credit_payments.loan_id",
+                "credit_payments.amount",
+                "credit_payments.origin",
+                "credit_payments.currency_code",
+                "credit_payments.receiving_branch_id",
+            ],
+            name="fk_credit_payment_reversals_payment",
+        ),
+        UniqueConstraint("payment_id", name="uq_credit_payment_reversals_payment"),
+        UniqueConstraint("tenant_id", "reversal_number", name="uq_credit_payment_reversals_tenant_number"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_payment_reversals_tenant_key"),
+        UniqueConstraint("cash_movement_id", name="uq_credit_payment_reversals_cash_movement"),
+        UniqueConstraint(
+            "tenant_id", "id", "payment_id", "loan_id", name="uq_credit_payment_reversals_tenant_id_payment"
+        ),
+        Index("ix_credit_payment_reversals_loan", "loan_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    payment_id: Mapped[int] = mapped_column(Integer)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    reversal_number: Mapped[str] = mapped_column(String(20))  # REV-000001: technical reference, not a fiscal document
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))  # always the payment's amount: full reversal only
+    currency_code: Mapped[str] = mapped_column(String(3))
+    origin: Mapped[str] = mapped_column(String(10))
+    reason: Mapped[str] = mapped_column(String(500))
+    reversed_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    reversed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    business_date: Mapped[date] = mapped_column(Date)  # in the contract's timezone
+    reversal_branch_id: Mapped[int] = mapped_column(Integer)  # == the payment's receiving branch (database-enforced)
+    cash_session_id: Mapped[int | None] = mapped_column(ForeignKey("cash_sessions.id"), nullable=True)
+    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CreditPaymentReversalApplication(Base):
+    """One row per original application, mirroring it EXACTLY (obligation, component, amount: composite FK). Net paid =
+    applications - reversal applications."""
+
+    __tablename__ = "credit_payment_reversal_applications"
+    __table_args__ = (
+        CheckConstraint(_in("component", APPLICATION_COMPONENTS), name="component_valid"),
+        CheckConstraint("amount > 0", name="amount_positive"),
+        ForeignKeyConstraint(
+            [
+                "tenant_id",
+                "original_application_id",
+                "payment_id",
+                "obligation_id",
+                "loan_id",
+                "component",
+                "amount",
+            ],
+            [
+                "credit_payment_applications.tenant_id",
+                "credit_payment_applications.id",
+                "credit_payment_applications.payment_id",
+                "credit_payment_applications.obligation_id",
+                "credit_payment_applications.loan_id",
+                "credit_payment_applications.component",
+                "credit_payment_applications.amount",
+            ],
+            name="fk_credit_payment_reversal_applications_original",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "reversal_id", "payment_id", "loan_id"],
+            [
+                "credit_payment_reversals.tenant_id",
+                "credit_payment_reversals.id",
+                "credit_payment_reversals.payment_id",
+                "credit_payment_reversals.loan_id",
+            ],
+            name="fk_credit_payment_reversal_applications_reversal",
+        ),
+        UniqueConstraint("original_application_id", name="uq_credit_payment_reversal_applications_original"),
+        Index("ix_credit_payment_reversal_applications_obligation", "obligation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    reversal_id: Mapped[int] = mapped_column(Integer, index=True)
+    payment_id: Mapped[int] = mapped_column(Integer)
+    original_application_id: Mapped[int] = mapped_column(Integer)
+    obligation_id: Mapped[int] = mapped_column(Integer)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    component: Mapped[str] = mapped_column(String(12))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+REVERSAL_SUM_FN = """
+CREATE OR REPLACE FUNCTION credit_reversal_sum_check() RETURNS trigger AS $$
+DECLARE v_id integer; v_amount numeric; v_sum numeric;
+BEGIN
+  IF TG_TABLE_NAME = 'credit_payment_reversals' THEN v_id := NEW.id; ELSE v_id := NEW.reversal_id; END IF;
+  SELECT amount INTO v_amount FROM credit_payment_reversals WHERE id = v_id;
+  SELECT COALESCE(SUM(amount), 0) INTO v_sum FROM credit_payment_reversal_applications WHERE reversal_id = v_id;
+  IF v_amount IS NULL OR v_sum <> v_amount THEN
+    RAISE EXCEPTION 'credit payment reversal % applications (%) must equal its amount (%)', v_id, v_sum, v_amount;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql
+"""
+# A counter reversal MUST be backed by exactly the compensating cash movement: right kind, negative amount, same session,
+# and ``reverses_id`` = the original receipt. Checked at COMMIT: debt and cash cannot diverge.
+REVERSAL_CASH_FN = """
+CREATE OR REPLACE FUNCTION credit_reversal_cash_check() RETURNS trigger AS $$
+DECLARE v_receipt integer; m_kind text; m_amount numeric; m_session integer; m_reverses integer;
+BEGIN
+  IF NEW.origin = 'counter' THEN
+    SELECT cash_movement_id INTO v_receipt FROM credit_payments WHERE id = NEW.payment_id;
+    SELECT kind, amount, session_id, reverses_id INTO m_kind, m_amount, m_session, m_reverses
+      FROM cash_movements WHERE id = NEW.cash_movement_id;
+    IF m_kind IS DISTINCT FROM 'credit_payment_reversal' OR m_amount IS DISTINCT FROM -NEW.amount
+       OR m_session IS DISTINCT FROM NEW.cash_session_id OR m_reverses IS DISTINCT FROM v_receipt THEN
+      RAISE EXCEPTION 'credit payment reversal % is not backed by its compensating cash movement', NEW.id;
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql
+"""
+REVERSAL_CONSTRAINT_TRIGGERS = (
+    (
+        "credit_payment_reversal_applications",
+        "trg_credit_payment_reversal_applications_sum",
+        "credit_reversal_sum_check",
+    ),
+    ("credit_payment_reversals", "trg_credit_payment_reversals_sum", "credit_reversal_sum_check"),
+    ("credit_payment_reversals", "trg_credit_payment_reversals_cash", "credit_reversal_cash_check"),
+)
+REVERSAL_GUARDS = (
+    ("credit_payment_reversals", "origination_append_only", IMMUTABLE_FN, "UPDATE OR DELETE"),
+    ("credit_payment_reversal_applications", "origination_append_only", IMMUTABLE_FN, "UPDATE OR DELETE"),
+)
+for _table_name, _fn_name, _fn_sql, _events in REVERSAL_GUARDS:
+    _t = Base.metadata.tables[_table_name]
+    event.listen(_t, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+    event.listen(
+        _t, "after_create", DDL(guard_trigger_sql(_table_name, _fn_name, _events)).execute_if(dialect="postgresql")
+    )
+# the functions (late-bound plpgsql) go with the FIRST created table, before any trigger that uses them
+_reversals_table = Base.metadata.tables["credit_payment_reversals"]
+for _fn_sql in (REVERSAL_SUM_FN, REVERSAL_CASH_FN):
+    event.listen(_reversals_table, "after_create", DDL(_fn_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+for _table_name, _trigger, _fn in REVERSAL_CONSTRAINT_TRIGGERS:
     event.listen(
         Base.metadata.tables[_table_name],
         "after_create",

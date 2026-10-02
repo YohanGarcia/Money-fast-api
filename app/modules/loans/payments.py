@@ -36,7 +36,7 @@ from app.modules.loans.errors import (
     PaymentExceedsDueAmount,
     PaymentInvariantViolation,
 )
-from app.modules.loans.models import CreditLoan, CreditPayment, CreditPaymentApplication
+from app.modules.loans.models import CreditLoan, CreditPayment, CreditPaymentApplication, CreditPaymentReversal
 from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.origination.models import CreditFormalization
 from app.modules.origination.service import _amt, _next_number, verify_formalization_contract
@@ -65,7 +65,17 @@ def _digest(loan_id: int, body: PaymentIn, amount: Decimal) -> str:
 
 
 # --- serialisation ----------------------------------------------------------------------------------
-def _payment_out(db: Session, p: CreditPayment, *, with_applications: bool = True) -> dict:
+def _payment_out(
+    db: Session, p: CreditPayment, *, with_applications: bool = True, reversal: tuple[int, str] | None | bool = False
+) -> dict:
+    """``reversal``: (id, number) of the payment's reversal, None if it has none, False = look it up."""
+    if reversal is False:
+        row = db.execute(
+            select(CreditPaymentReversal.id, CreditPaymentReversal.reversal_number).where(
+                CreditPaymentReversal.payment_id == p.id
+            )
+        ).first()
+        reversal = (row[0], row[1]) if row else None
     out = {
         "id": p.id,
         "loan_id": p.loan_id,
@@ -82,6 +92,10 @@ def _payment_out(db: Session, p: CreditPayment, *, with_applications: bool = Tru
         "cash_movement_id": p.cash_movement_id,
         "collected_by": p.collected_by,
         "external_reference": p.external_reference,
+        # DERIVED from the existence of the reversal row: the payment itself is immutable and its status never changes
+        "reversed": reversal is not None,
+        "reversal_id": reversal[0] if reversal else None,
+        "reversal_number": reversal[1] if reversal else None,
     }
     if with_applications:
         rows = db.scalars(
@@ -276,13 +290,8 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
 
 
 def _project(db: Session, loan: CreditLoan, obligations: list) -> None:
-    """Re-derive each obligation's status from its amounts and applications ONLY, then the loan's ``paid`` flag."""
-    _o, views = ledger.views(db, loan.id)  # re-read: includes the rows just flushed
-    by_id = {v.id: v for v in views}
-    for ob in obligations:
-        ob.status = allocation.obligation_status(by_id[ob.id])
-    if all(ob.status == "paid" for ob in obligations):
-        loan.status = "paid"  # the only loan transition of this package; past_due belongs to the delinquency package
+    """Re-derive statuses from the NET applications (see ``ledger.project``); past_due belongs to the delinquency package."""
+    ledger.project(db, loan, obligations)
 
 
 # --- reads ------------------------------------------------------------------------------------------
@@ -318,4 +327,12 @@ def list_payments(db: Session, actor: Principal, loan_id: int, *, limit: int, of
         else:
             stmt = stmt.where(CreditPayment.receiving_branch_id.in_(visible))
     rows = db.scalars(stmt.order_by(CreditPayment.id.desc()).limit(limit).offset(offset)).all()
-    return [_payment_out(db, p, with_applications=False) for p in rows]
+    reversals = {
+        pid: (rid, num)
+        for pid, rid, num in db.execute(
+            select(
+                CreditPaymentReversal.payment_id, CreditPaymentReversal.id, CreditPaymentReversal.reversal_number
+            ).where(CreditPaymentReversal.payment_id.in_([p.id for p in rows]))
+        )
+    }
+    return [_payment_out(db, p, with_applications=False, reversal=reversals.get(p.id)) for p in rows]
