@@ -65,6 +65,8 @@ CATALOG: tuple[PermissionDef, ...] = (
     PermissionDef("credit.applications.formalize", "tenant", "Formalizar solicitudes aprobadas", True),
     PermissionDef("credit.approval_policy.manage", "tenant", "Configurar la politica de aprobacion de credito", True),
     PermissionDef("credit.approval_limits.manage", "tenant", "Configurar limites de aprobacion", True),
+    PermissionDef("loans.read", "tenant", "Consultar prestamos, desembolsos y cronogramas"),
+    PermissionDef("loans.disburse", "tenant", "Desembolsar un contrato formalizado (sale dinero)", True),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

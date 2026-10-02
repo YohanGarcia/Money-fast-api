@@ -46,7 +46,7 @@ CONDITION_KINDS = ("guarantee_required", "guarantor_required", "document_pending
 CONDITION_STATUSES = ("pending", "fulfilled", "waived")
 DOCUMENT_STATUSES = ("pending", "provided", "verified", "rejected")
 DECISION_OUTCOMES = ("approved", "rejected")
-FORMALIZATION_STATUSES = ("ready_for_disbursement",)  # T-007 extends this with the disbursement lifecycle
+FORMALIZATION_STATUSES = ("ready_for_disbursement", "disbursed")  # T-007: the only transition is ready -> disbursed
 
 
 class CreditApplication(Base):
@@ -333,6 +333,9 @@ class CreditFormalization(Base):
         ),
         UniqueConstraint("application_id", name="uq_credit_formalizations_application"),
         UniqueConstraint("approval_id", name="uq_credit_formalizations_approval"),
+        UniqueConstraint(
+            "tenant_id", "id", name="uq_credit_formalizations_tenant_id"
+        ),  # target of the loan FKs (T-007)
         UniqueConstraint("tenant_id", "reference", name="uq_credit_formalizations_tenant_reference"),
     )
 
@@ -459,6 +462,9 @@ BEGIN
      OR NEW.contract_snapshot IS DISTINCT FROM OLD.contract_snapshot OR NEW.contract_hash IS DISTINCT FROM OLD.contract_hash
      OR NEW.formalized_by IS DISTINCT FROM OLD.formalized_by OR NEW.formalized_at IS DISTINCT FROM OLD.formalized_at THEN
     RAISE EXCEPTION 'credit formalization % is immutable: the frozen contract cannot change', OLD.id;
+  END IF;
+  IF NEW.status IS DISTINCT FROM OLD.status AND NOT (OLD.status = 'ready_for_disbursement' AND NEW.status = 'disbursed') THEN
+    RAISE EXCEPTION 'credit formalization % status transition % -> % is not allowed', OLD.id, OLD.status, NEW.status;
   END IF;
   RETURN NEW;
 END $$ LANGUAGE plpgsql

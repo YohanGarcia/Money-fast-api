@@ -89,3 +89,5 @@ from app.modules.origination.models import (  # noqa: F401
     CreditDecision,
     CreditFormalization,
 )
+
+from app.modules.loans.models import CreditLoan, CreditLoanDisbursement, CreditLoanObligation  # noqa: F401

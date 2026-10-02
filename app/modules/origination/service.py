@@ -24,7 +24,7 @@ from app.models.company import Company
 from app.modules.credit import service as credit_service
 from app.modules.credit.errors import RulesIntegrityFailed
 from app.modules.credit.models import CreditProduct, CreditProductVersion
-from app.modules.credit.rules import canonical_json, parse_rules
+from app.modules.credit.rules import canonical_json, compute_rules_hash, parse_rules
 from app.modules.customers.models import CustomerProfile
 from app.modules.customers.service import visible_branch_ids
 from app.modules.identity.audit import record_event
@@ -1438,3 +1438,31 @@ def get_formalization(db: Session, actor: Principal, application_id: int) -> dic
     if row is None:
         raise TenantMismatch("La solicitud no esta formalizada.")
     return _formalization_out(db, row)
+
+
+def verify_formalization_contract(db: Session, f: CreditFormalization) -> bool:
+    """Integrity of a formalized contract WITHOUT consulting the live product: the frozen contract, its hash, the T-005
+    snapshot it embeds (hashed again from its own content) and the approved terms must all agree (T-007 uses this)."""
+    approval = db.get(CreditApproval, f.approval_id)
+    try:
+        contract = f.contract_snapshot
+        product = contract["product"]
+        snap = product["snapshot"]
+        return (
+            approval is not None
+            and approval.approved_amount == f.approved_amount
+            and approval.currency_code == f.currency_code
+            and approval.approved_term == f.term
+            and approval.approved_frequency == f.frequency
+            and _contract_hash(contract) == f.contract_hash
+            and product["rules_hash"] == f.rules_hash == snap["rules_hash"]
+            and compute_rules_hash(snap["rules"], snap["currencies"]) == f.rules_hash
+            and contract["tenant_id"] == f.tenant_id
+            and contract["approved"]["amount"] == _amt(f.approved_amount)
+            and contract["approved"]["currency_code"] == f.currency_code
+            and contract["approved"]["term_periods"] == f.term
+            and contract["approved"]["frequency"] == f.frequency
+            and product["product_version_id"] == f.product_version_id
+        )
+    except (KeyError, TypeError):
+        return False
