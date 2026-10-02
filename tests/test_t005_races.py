@@ -30,6 +30,8 @@ from tests.test_t005_engine import rules
 HOLIDAYS = ["2026-03-20", "2026-04-01"]
 BLOCKED_PUBLISH = "%FROM credit_product_versions%FOR UPDATE%"  # publish waiting for the version row lock
 BLOCKED_CURRENCY = "%UPDATE credit_product_currencies%"  # currency write waiting inside the guard trigger
+BLOCKED_TENANT_CURRENCY_LOCK = "%FROM tenant_currencies%FOR SHARE%"  # publish waiting for the currency row
+BLOCKED_DISABLE = "%UPDATE tenant_currencies%"  # a disable waiting for publish
 BLOCKED_RULES = "%UPDATE credit_product_versions SET rules%"  # direct rules write waiting for the row lock
 
 
@@ -51,9 +53,10 @@ def wait_blocked(pattern: str, timeout: float = 20.0) -> None:
     raise AssertionError(f"nobody became blocked on {pattern}")
 
 
-def draft(client, adm, code, raw=None, validate=True):
+def draft(client, adm, code, raw=None, validate=True, cur=None):
     p = mk_product(client, adm, code)
-    v = mk_version(client, adm, p["id"], raw=raw or rules(calendar=rules()["calendar"] | {"holidays": HOLIDAYS}))
+    default = rules(calendar=rules()["calendar"] | {"holidays": HOLIDAYS})
+    v = mk_version(client, adm, p["id"], raw=raw or default, cur=cur)
     if validate:
         assert client.post(f"{P}/{p['id']}/versions/{v['id']}/validate", headers=adm).json()["valid"] is True
     return p, v
@@ -110,7 +113,10 @@ def assert_published_coherent(client, adm, p, v, *, expected_published=1):
     base = f"{P}/{p['id']}/versions/{v['id']}"
     snap = client.get(f"{base}/snapshot", headers=adm).json()
     assert snap["hash_verified"] is True
-    assert client.post(f"{base}/simulate", headers=adm, json=SIM).status_code == 200
+    with SessionLocal() as db:
+        currencies = service._currency_rows(db, v["id"])
+    sim = client.post(f"{base}/simulate", headers=adm, json=SIM | {"currency": currencies[0]["code"]})
+    assert sim.status_code == 200, sim.text  # simulated in the version's own currency
     with SessionLocal() as db:
         row = db.get(CreditProductVersion, v["id"])
         currencies = service._currency_rows(db, v["id"])
@@ -338,3 +344,130 @@ def test_repeated_publish_vs_currency_writes_is_never_corrupt_and_never_deadlock
             assert status == 422
             outcomes["draft"] += 1
     assert sum(outcomes.values()) == 10
+
+
+# ============================== fix 03 - publish vs tenant currency enable/disable =====================
+USD = [{"code": "USD", "min_amount": "10", "max_amount": "99999"}]
+DISABLE_USD = "UPDATE tenant_currencies SET disabled_at = now() WHERE tenant_id = :t AND currency_code = 'USD'"
+
+
+def usd_draft(client, adm, code):
+    assert client.post("/api/v2/tenant/currencies", headers=adm, json={"code": "USD"}).status_code == 201
+    return draft(client, adm, code, cur=USD)
+
+
+def test_disable_wins_the_currency_lock_first_publish_waits_then_is_refused(client, tenant_a):
+    adm = admin_headers(client, tenant_a)
+    p, v = usd_draft(client, adm, "RACE-T1")  # validated while USD is enabled
+    a = engine.connect()
+    a.execute(text(DISABLE_USD), {"t": tenant_a["tenant_id"]})  # open, uncommitted
+    out: dict = {}
+    t = publish_in_thread(client, adm, p, v, out)
+    wait_blocked(BLOCKED_TENANT_CURRENCY_LOCK)  # publish is parked on the tenant_currencies row
+    assert "resp" not in out
+    a.commit()
+    a.close()
+    t.join(30)
+    resp = out["resp"]
+    assert resp.status_code == 422 and resp.json()["error"]["code"] == "product_validation_failed"
+    assert any(i["code"] == "currency_not_enabled" for i in resp.json()["error"]["details"])
+    got = client.get(f"{P}/{p['id']}/versions/{v['id']}", headers=adm).json()
+    assert got["status"] == "draft" and got["rules_hash"] is None and got["effective_from"] is None
+    assert client.get(f"{P}/{p['id']}/versions/{v['id']}/snapshot", headers=adm).status_code == 409  # no snapshot
+    with SessionLocal() as db:
+        row = db.get(CreditProductVersion, v["id"])
+        assert row.status == "draft" and row.snapshot is None and row.rules_hash is None
+
+
+def test_publish_wins_the_currency_lock_first_disable_waits_and_history_is_unchanged(client, tenant_a, hold_publish):
+    locked, release, armed = hold_publish
+    adm = admin_headers(client, tenant_a)
+    p, v = usd_draft(client, adm, "RACE-T2")
+    out_pub: dict = {}
+    armed.set()
+    t_pub = publish_in_thread(client, adm, p, v, out_pub)
+    assert locked.wait(30)  # publish owns product, version and the USD enablement row
+    out_a: dict = {}
+    t_a = raw_write_in_thread(DISABLE_USD, {"t": tenant_a["tenant_id"]}, out_a)
+    wait_blocked(BLOCKED_DISABLE)
+    assert "result" not in out_a  # the disable waits for the publication
+    release.set()
+    t_pub.join(30)
+    t_a.join(30)
+    assert out_pub["resp"].status_code == 200, out_pub["resp"].text
+    assert out_a["result"] == "ok"  # it completes afterwards: that is legitimate
+    base = f"{P}/{p['id']}/versions/{v['id']}"
+    before = client.get(f"{base}/snapshot", headers=adm).json()
+    with SessionLocal() as db:
+        disabled = db.execute(text("SELECT disabled_at IS NOT NULL FROM tenant_currencies WHERE currency_code = 'USD'"))
+        assert disabled.scalar()
+    snap, currencies = assert_published_coherent(client, adm, p, v)  # hash verified, simulation still works
+    assert snap == before and currencies[0]["code"] == "USD"
+    got = client.get(base, headers=adm).json()  # the historical version stays queryable, rules and hash untouched
+    assert got["status"] == "published" and got["rules_hash"] == before["rules_hash"]
+    assert client.get(f"{P}/{p['id']}/effective", headers=adm).json()["id"] == v["id"]
+
+
+def test_sequential_disable_after_validate_still_blocks_publish(client, tenant_a):
+    adm = admin_headers(client, tenant_a)
+    p, v = usd_draft(client, adm, "RACE-T3")
+    assert client.delete("/api/v2/tenant/currencies/USD", headers=adm).status_code == 204
+    row = client.get(f"{P}/{p['id']}/versions/{v['id']}", headers=adm).json()["row_version"]
+    r = client.post(
+        f"{P}/{p['id']}/versions/{v['id']}/publish",
+        headers=adm,
+        json={"row_version": row, "effective_from": str(today())},
+    )
+    assert r.status_code == 422 and any(i["code"] == "currency_not_enabled" for i in r.json()["error"]["details"])
+
+
+def test_publish_vs_disable_stress_never_500_deadlock_or_stale_publication(client, tenant_a):
+    adm = admin_headers(client, tenant_a)
+    assert client.post("/api/v2/tenant/currencies", headers=adm, json={"code": "USD"}).status_code == 201
+    wins = {"publish_first": 0, "disable_first": 0}
+    for i in range(12):
+        p, v = draft(client, adm, f"RACE-X{i}", cur=USD)
+        barrier = threading.Barrier(2)
+        out_a: dict = {}
+        out_b: dict = {}
+
+        def disable(out=out_a, barrier=barrier):
+            with engine.connect() as c:
+                barrier.wait(10)
+                try:
+                    c.execute(text(DISABLE_USD), {"t": tenant_a["tenant_id"]})
+                    c.commit()
+                    out["result"] = "ok"
+                except DBAPIError as exc:
+                    c.rollback()
+                    out["result"] = str(exc.orig)
+
+        def publish(out=out_b, barrier=barrier, p=p, v=v):
+            barrier.wait(10)
+            row = client.get(f"{P}/{p['id']}/versions/{v['id']}", headers=adm).json()["row_version"]
+            out["resp"] = client.post(
+                f"{P}/{p['id']}/versions/{v['id']}/publish",
+                headers=adm,
+                json={"row_version": row, "effective_from": str(today())},
+            )
+
+        ts = [threading.Thread(target=disable, daemon=True), threading.Thread(target=publish, daemon=True)]
+        [t.start() for t in ts]
+        [t.join(60) for t in ts]
+        assert out_a["result"] == "ok", out_a  # never a deadlock / serialization error
+        status = out_b["resp"].status_code
+        assert status in (200, 422), out_b["resp"].text  # never a 500
+        with SessionLocal() as db:
+            row = db.get(CreditProductVersion, v["id"])
+            state, snapshot, rules_hash = row.status, row.snapshot, row.rules_hash
+        if status == 200:
+            assert state == "published"
+            wins["publish_first"] += 1
+            assert_published_coherent(client, adm, p, v, expected_published=1)
+        else:
+            assert state == "draft" and snapshot is None and rules_hash is None
+            assert any(d["code"] == "currency_not_enabled" for d in out_b["resp"].json()["error"]["details"])
+            wins["disable_first"] += 1
+        with engine.begin() as c:  # re-enable for the next round
+            c.execute(text("UPDATE tenant_currencies SET disabled_at = NULL WHERE currency_code = 'USD'"))
+    assert sum(wins.values()) == 12

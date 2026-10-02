@@ -432,6 +432,28 @@ def _verify(version: CreditProductVersion, currencies: list[dict]) -> bool:
     return from_columns == from_snapshot == version.rules_hash == snap.get("rules_hash")
 
 
+def _lock_tenant_currencies(db: Session, tenant_id: int, version_id: int) -> None:
+    """Pin the enablement of the version's currencies for the rest of the publish transaction.
+
+    Third lock of the protocol (product -> version -> tenant currencies). The rows are selected by key
+    (tenant, code) REGARDLESS of their state and locked ``FOR SHARE`` in ``currency_code`` order; only afterwards
+    is ``disabled_at`` evaluated. A ``disable`` in flight therefore makes publish wait and then see its final
+    state; one that arrives later waits for this transaction and may only take effect after the contract froze.
+    """
+    codes = db.scalars(
+        select(CreditProductCurrency.currency_code)
+        .where(CreditProductCurrency.version_id == version_id)
+        .order_by(CreditProductCurrency.currency_code)
+    ).all()
+    for code in codes:
+        db.scalar(
+            select(TenantCurrency.currency_code)
+            .where(TenantCurrency.tenant_id == tenant_id, TenantCurrency.currency_code == code)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+
+
 def publish_version(
     db: Session, actor: Principal, product_id: int, version_id: int, body: PublishIn, client_ip: str | None
 ) -> dict:
@@ -444,7 +466,8 @@ def publish_version(
         raise RowVersionConflict()
     if product.status == "inactive":
         raise InvalidStateTransition("El producto esta inactivo: reactivalo antes de publicar.")
-    result, currencies = _run_validation(db, actor, version)
+    _lock_tenant_currencies(db, actor.tenant_id, version.id)
+    result, currencies = _run_validation(db, actor, version)  # always re-validated, whatever validate said before
     if not result.valid:
         _audit(
             db,

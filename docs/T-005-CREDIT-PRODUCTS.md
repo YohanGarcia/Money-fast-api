@@ -127,3 +127,14 @@ drops keys containing `hash`, so the digest is stored under `rules_digest`.
   the ascending-id order is defence in depth (a mutation that removes it is NOT detected by tests, deliberately noted).
 * A publish after a content change keeps the old `validated_hash` and is refused (422) until the draft is validated again,
   unless the change was hash-neutral (e.g. holiday order), in which case the final stored content is what gets frozen.
+
+### Locking protocol, final form (review fix 03)
+
+Publish takes **product row `FOR UPDATE` → version row `FOR UPDATE` → `tenant_currencies` rows `FOR SHARE`** (the version's
+currencies, selected by `(tenant_id, currency_code)` irrespective of state, in `currency_code` order) and only then
+evaluates `disabled_at`, re-validates (always, whatever `validate` said earlier) and freezes. A disable in flight makes publish
+wait and then observe the final state (422 `currency_not_enabled`, version stays draft, no snapshot); a disable that arrives
+later waits for the publication and may complete afterwards: the frozen snapshot/hash never change when a currency is
+disabled later. Refusing a disabled currency for NEW originations is T-006/T-007's job. The tenant-currency lock lives in
+T-005 (the package that needs the dependency stable); T-003 is unchanged. The `currencies` catalogue (exponent/is_active)
+is code-defined reference data and is read without a lock.
