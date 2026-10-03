@@ -69,6 +69,11 @@ CATALOG: tuple[PermissionDef, ...] = (
     PermissionDef("loans.disburse", "tenant", "Desembolsar un contrato formalizado (sale dinero)", True),
     PermissionDef("payments.read", "tenant", "Consultar pagos de prestamos y sus aplicaciones"),
     PermissionDef(
+        "collections.read",
+        "tenant",
+        "Consultar la cartera vencida (worklist de cobranza); solo lectura, sin datos personales",
+    ),
+    PermissionDef(
         "loans.delinquency.assess",
         "tenant",
         "Evaluar el vencimiento de un prestamo y proyectar su estado (no calcula cargos de mora)",

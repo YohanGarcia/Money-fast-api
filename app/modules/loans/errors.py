@@ -88,3 +88,8 @@ class ReversalSessionMismatch(AppError):
 class LoanNotAssessable(AppError):
     status_code, code = 409, "loan_not_assessable"
     default_message = "El prestamo no admite evaluacion de vencimiento en su estado actual."
+
+
+class InvalidCursor(AppError):
+    status_code, code = 422, "invalid_cursor"
+    default_message = "El cursor de paginacion no es valido para esta consulta."

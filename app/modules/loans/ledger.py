@@ -25,16 +25,18 @@ def _amt(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.0001")), "f")
 
 
-def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Decimal]]:
-    """NET applied per obligation and component: applications - reversal applications (T-009). THE only place where the
-    paid amount of a loan is computed: nothing else may read the gross applications as "paid"."""
+def applied_by_obligation_many(db: Session, loan_ids: list[int]) -> dict[int, dict[str, Decimal]]:
+    """NET applied per obligation and component for SEVERAL loans in two queries: applications - reversal applications
+    (T-009). THE only place where the paid amount is computed: nothing else may read the gross applications as "paid"."""
+    if not loan_ids:
+        return {}
     gross = db.execute(
         select(
             CreditPaymentApplication.obligation_id,
             CreditPaymentApplication.component,
             func.sum(CreditPaymentApplication.amount),
         )
-        .where(CreditPaymentApplication.loan_id == loan_id)
+        .where(CreditPaymentApplication.loan_id.in_(loan_ids))
         .group_by(CreditPaymentApplication.obligation_id, CreditPaymentApplication.component)
     )
     reversed_ = {
@@ -45,13 +47,48 @@ def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Deci
                 CreditPaymentReversalApplication.component,
                 func.sum(CreditPaymentReversalApplication.amount),
             )
-            .where(CreditPaymentReversalApplication.loan_id == loan_id)
+            .where(CreditPaymentReversalApplication.loan_id.in_(loan_ids))
             .group_by(CreditPaymentReversalApplication.obligation_id, CreditPaymentReversalApplication.component)
         )
     }
     out: dict[int, dict[str, Decimal]] = {}
     for oid, component, total in gross:
         out.setdefault(oid, {})[component] = total - reversed_.get((oid, component), Decimal(0))
+    return out
+
+
+def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Decimal]]:
+    return applied_by_obligation_many(db, [loan_id])
+
+
+def _view(o: CreditLoanObligation, applied: dict[str, Decimal]) -> allocation.ObligationView:
+    return allocation.ObligationView(
+        id=o.id,
+        sequence=o.sequence,
+        due_date=o.due_date,
+        due={
+            "fee": o.fees_due,
+            "delinquency": o.delinquency_due,
+            "interest": o.interest_due,
+            "principal": o.principal_due,
+        },
+        applied=applied,
+    )
+
+
+def views_many(db: Session, loan_ids: list[int]) -> dict[int, list[allocation.ObligationView]]:
+    """Obligation views of SEVERAL loans (no N+1): the worklist reads the same net ledger as every single-loan read."""
+    out: dict[int, list[allocation.ObligationView]] = {lid: [] for lid in loan_ids}
+    if not loan_ids:
+        return out
+    applied = applied_by_obligation_many(db, loan_ids)
+    rows = db.scalars(
+        select(CreditLoanObligation)
+        .where(CreditLoanObligation.loan_id.in_(loan_ids))
+        .order_by(CreditLoanObligation.loan_id, CreditLoanObligation.sequence)
+    )
+    for o in rows:
+        out[o.loan_id].append(_view(o, applied.get(o.id, {})))
     return out
 
 
@@ -82,21 +119,7 @@ def views(
         stmt = stmt.with_for_update().execution_options(populate_existing=True)  # ascending sequence: one lock order
     obligations = list(db.scalars(stmt))
     applied = applied_by_obligation(db, loan_id)
-    return obligations, [
-        allocation.ObligationView(
-            id=o.id,
-            sequence=o.sequence,
-            due_date=o.due_date,
-            due={
-                "fee": o.fees_due,
-                "delinquency": o.delinquency_due,
-                "interest": o.interest_due,
-                "principal": o.principal_due,
-            },
-            applied=applied.get(o.id, {}),
-        )
-        for o in obligations
-    ]
+    return obligations, [_view(o, applied.get(o.id, {})) for o in obligations]
 
 
 def contract_timezone(db: Session, loan: CreditLoan) -> str:
@@ -106,7 +129,12 @@ def contract_timezone(db: Session, loan: CreditLoan) -> str:
 
 
 def business_date(db: Session, loan: CreditLoan, now: datetime) -> date:
-    return to_zone(now, contract_timezone(db, loan)).date()
+    return business_date_in(contract_timezone(db, loan), now)
+
+
+def business_date_in(timezone: str, now: datetime) -> date:
+    """The business date of an instant in a contract timezone (never the UTC date)."""
+    return to_zone(now, timezone).date()
 
 
 def balances_out(

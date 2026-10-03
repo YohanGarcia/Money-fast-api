@@ -123,3 +123,17 @@ def loan_status(obligations: list[ObligationView], business_date: date) -> str:
     if any(is_overdue(o, business_date) for o in obligations):
         return "past_due"
     return "active"
+
+
+# =============================== T-011: collection worklist facts (pure, derived) ===============================
+def oldest_overdue_date(obligations: list[ObligationView], business_date: date) -> date | None:
+    """The smallest EFFECTIVE due date among the currently overdue obligations (never the contractual date)."""
+    return min((o.due_date for o in obligations if is_overdue(o, business_date)), default=None)
+
+
+def next_due_date(obligations: list[ObligationView], business_date: date) -> date | None:
+    """The smallest effective due date of an obligation that is NOT overdue yet (due_date >= business date) and still has
+    net debt. Fully paid future obligations are ignored; the overdue debt is not part of it."""
+    return min(
+        (o.due_date for o in obligations if o.due_date >= business_date and net_outstanding(o) > 0), default=None
+    )

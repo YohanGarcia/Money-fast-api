@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import overdue, payments, reversals, service
+from app.modules.loans import overdue, payments, reversals, service, worklist
 from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.loans.reversal_schemas import ReversalIn
 from app.modules.loans.schemas import DisburseIn
@@ -93,3 +93,29 @@ def get_reversal(payment_id: int, actor: Principal = Actor, db: Session = Db):
 def assess_loan(loan_id: int, request: Request, actor: Principal = Actor, db: Session = Db):
     """Projects the stored loan status from the net ledger. Calculates NO delinquency charge (T-010)."""
     return overdue.assess(db, actor, loan_id, client_ip(request))
+
+
+@router.get("/collections/overdue-loans")
+def overdue_loans(
+    branch_id: int | None = Query(default=None, gt=0),
+    min_days_overdue: int | None = Query(default=None, ge=0),
+    currency: str | None = Query(default=None, min_length=3, max_length=3),
+    sort: worklist.Sort = "days_overdue",
+    order: worklist.Order = "desc",
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=300),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    """READ-ONLY collection worklist (T-011): loans with overdue net debt. Zero writes, no PII, no score, no bucket."""
+    return worklist.overdue_loans(
+        db,
+        actor,
+        branch_id=branch_id,
+        min_days_overdue=min_days_overdue,
+        currency=currency,
+        sort=sort,
+        order=order,
+        limit=limit,
+        cursor=cursor,
+    )
