@@ -64,6 +64,7 @@ from tests.test_t010_overdue_projection import (
 )
 
 W = f"{V2}/collections/overdue-loans"
+FP = "0123456789abcdef"  # any fingerprint: the cursor only has to carry the one of its query
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_KEYS = {
     "loan_id",
@@ -78,6 +79,7 @@ EXPECTED_KEYS = {
     "oldest_overdue_date",
     "next_due_date",
     "last_net_payment",
+    "current_assignment",  # T-013: ids + timestamp of the OPEN assignment, or null
 }
 
 
@@ -146,8 +148,8 @@ def test_the_cursor_is_parseable_validated_and_bound_to_its_ordering():
 
     from app.modules.loans.errors import InvalidCursor
 
-    c = worklist_service.encode_cursor("overdue_outstanding", "desc", Decimal("12.5000"), 7)
-    assert worklist_service.decode_cursor(c, "overdue_outstanding", "desc") == (Decimal("12.5000"), 7)
+    c = worklist_service.encode_cursor("overdue_outstanding", "desc", Decimal("12.5000"), 7, FP)
+    assert worklist_service.decode_cursor(c, "overdue_outstanding", "desc", FP) == (Decimal("12.5000"), 7)
     for bad in (
         "",
         "%%%",
@@ -156,16 +158,16 @@ def test_the_cursor_is_parseable_validated_and_bound_to_its_ordering():
         base64.urlsafe_b64encode(b'{"s":"x"}').decode(),
     ):
         with pytest.raises(InvalidCursor):
-            worklist_service.decode_cursor(bad, "overdue_outstanding", "desc")
+            worklist_service.decode_cursor(bad, "overdue_outstanding", "desc", FP)
     with pytest.raises(InvalidCursor):  # another sort / order never reuses it
-        worklist_service.decode_cursor(c, "days_overdue", "desc")
+        worklist_service.decode_cursor(c, "days_overdue", "desc", FP)
     with pytest.raises(InvalidCursor):
-        worklist_service.decode_cursor(c, "overdue_outstanding", "asc")
+        worklist_service.decode_cursor(c, "overdue_outstanding", "asc", FP)
     tampered = base64.urlsafe_b64encode(
-        json.dumps({"s": "days_overdue", "o": "asc", "v": "abc", "i": 1}).encode()
+        json.dumps({"s": "days_overdue", "o": "asc", "v": "abc", "i": 1, "f": FP}).encode()
     ).decode()
     with pytest.raises(InvalidCursor):
-        worklist_service.decode_cursor(tampered, "days_overdue", "asc")
+        worklist_service.decode_cursor(tampered, "days_overdue", "asc", FP)
 
 
 # ================================ the overdue rule over real loans ====================================
@@ -516,7 +518,11 @@ def test_the_worklist_is_read_only_pii_free_and_cheap(client, tenant_a, monkeypa
     for pii in ("Juan", "Perez", "001-0000001-1", "NombreBeta", "ApellidoGama", "@", "phone", "address", "document"):
         assert pii not in raw, pii
     assert set(body["items"][0]) == EXPECTED_KEYS
-    assert not [k for k in EXPECTED_KEYS if re.search(r"bucket|score|priority|rank|risk|assign|collector|custody", k)]
+    assert not [
+        k
+        for k in EXPECTED_KEYS - {"current_assignment"}
+        if re.search(r"bucket|score|priority|rank|risk|assign|collector|custody", k)
+    ]
     # zero writes, stored statuses untouched, no assessment, no cash, no legacy, no contractual change
     states = {t: count(t) for t in ("security_events",)}
     stored_before = loan_states()
@@ -560,7 +566,9 @@ def test_the_worklist_code_has_no_legacy_assignment_score_scheduler_or_new_depen
         "delinquency_starts_on",
     ):
         assert banned not in names, banned
-    assert not [n for n in names if n.startswith(("cash_", "route", "assign"))]
+    assert not [
+        n for n in names if n.startswith(("cash_", "route"))
+    ]  # T-013 reads the OPEN assignment: no legacy pointer
     with SessionLocal() as db:
         names = {r[0] for r in db.execute(text("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"))}
     assert not {

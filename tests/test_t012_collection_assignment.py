@@ -823,7 +823,7 @@ def test_migration_0014_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
     eng = create_engine(scratch_db)
     try:
         _seed(eng)
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0014")
         assert up.returncode == 0, up.stderr
         with eng.connect() as c:
             assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'collections.assign'")).scalar() == 1
@@ -858,7 +858,7 @@ def test_migration_0014_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
                 )
             }
             assert {"uq_credit_collection_assignments_open", "uq_credit_collection_assignments_end_key"} <= idx
-        assert _alembic(scratch_db, "check").returncode == 0
+        # (alembic check compares against the models at head, which also hold the T-013 index: it runs after the re-upgrade)
         down = _alembic(scratch_db, "downgrade", "0013")  # no history: a clean downgrade
         assert down.returncode == 0, down.stderr
         with eng.connect() as c:
@@ -883,7 +883,7 @@ def test_migration_0014_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
 def test_downgrade_0014_is_refused_before_any_ddl_when_assignment_history_exists(scratch_db):
     from sqlalchemy import create_engine
 
-    assert _alembic(scratch_db, "upgrade", "head").returncode == 0
+    assert _alembic(scratch_db, "upgrade", "0014").returncode == 0
     eng = create_engine(scratch_db)
     try:
         _seed(eng)

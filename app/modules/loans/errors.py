@@ -120,3 +120,8 @@ class NoActiveAssignment(AppError):
 class AssignmentInvariantViolation(AppError):
     status_code, code = 409, "assignment_invariant_violation"
     default_message = "La base de datos rechazo la asignacion por violar un invariante."
+
+
+class ConflictingAssignmentFilters(AppError):
+    status_code, code = 422, "conflicting_assignment_filters"
+    default_message = "Use 'assignment' o 'assignee_id', no ambos."

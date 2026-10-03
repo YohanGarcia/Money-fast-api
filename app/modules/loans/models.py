@@ -720,6 +720,14 @@ class CreditCollectionAssignment(Base):
             unique=True,
             postgresql_where=text("ended_at IS NULL"),
         ),
+        # T-013: serves the worklist filter by current assignee (EXPLAIN evidence in docs/T-013-*.md)
+        Index(
+            "ix_credit_collection_assignments_open_assignee",
+            "tenant_id",
+            "assignee_user_id",
+            "loan_id",
+            postgresql_where=text("ended_at IS NULL"),
+        ),
         Index(
             "uq_credit_collection_assignments_end_key",
             "tenant_id",
