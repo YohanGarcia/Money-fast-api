@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import assignments, overdue, payments, reversals, service, worklist
+from app.modules.loans import activities, assignments, overdue, payments, reversals, service, worklist
+from app.modules.loans.activity_schemas import CreateActivityIn
 from app.modules.loans.assignment_schemas import AssignIn, EndAssignmentIn
 from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.loans.reversal_schemas import ReversalIn
@@ -147,3 +148,28 @@ def get_collection_assignment(loan_id: int, actor: Principal = Actor, db: Sessio
 @router.get("/loans/{loan_id}/collection-assignment/history")
 def get_collection_assignment_history(loan_id: int, actor: Principal = Actor, db: Session = Db):
     return assignments.get_history(db, actor, loan_id)
+
+
+@router.post("/loans/{loan_id}/collection-activities")
+def create_collection_activity(
+    loan_id: int, body: CreateActivityIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    """Records one collection management on the loan (append-only history, no money, no outcome, no free text; T-014)."""
+    return activities.create(db, actor, loan_id, body, client_ip(request))
+
+
+@router.get("/loans/{loan_id}/collection-activities")
+def list_collection_activities(
+    loan_id: int,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=100),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    """READ-ONLY, newest first (keyset on id)."""
+    return activities.list_activities(db, actor, loan_id, limit=limit, cursor=cursor)
+
+
+@router.get("/loans/{loan_id}/collection-activities/{activity_id}")
+def get_collection_activity(loan_id: int, activity_id: int, actor: Principal = Actor, db: Session = Db):
+    return activities.get_activity(db, actor, loan_id, activity_id)

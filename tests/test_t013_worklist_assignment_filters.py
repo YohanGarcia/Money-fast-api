@@ -524,7 +524,7 @@ def test_the_code_reads_only_the_open_modern_assignment_and_adds_no_permission_i
     assert "ASSIGN" not in names and "collections.assign" not in src  # collections.assign is a WRITE permission only
     assert "ended_at" in src  # the open row only
     versions = sorted(p.name for p in (ROOT / "alembic/versions").glob("0*.py"))
-    assert versions[-1].startswith("0015_")  # the index is justified by the EXPLAIN evidence documented for T-013
+    assert any(v.startswith("0015_") for v in versions)  # the index is justified by the EXPLAIN evidence documented for T-013
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
     assert "collections.work" not in catalog
 
@@ -550,9 +550,9 @@ def test_migration_0015_only_adds_the_partial_index_and_is_reversible_even_with_
                     "'t013-key-00000001', 'd' FROM companies"
                 )
             )
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0015")
         assert up.returncode == 0, up.stderr
-        assert _alembic(scratch_db, "check").returncode == 0
+        # (alembic check compares against the models at head, which also hold T-014: it runs after the final re-upgrade)
         with eng.connect() as c:
             d = c.execute(
                 text("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_credit_collection_assignments_open_assignee'")

@@ -125,3 +125,8 @@ class AssignmentInvariantViolation(AppError):
 class ConflictingAssignmentFilters(AppError):
     status_code, code = 422, "conflicting_assignment_filters"
     default_message = "Use 'assignment' o 'assignee_id', no ambos."
+
+
+class ActivityInvariantViolation(AppError):
+    status_code, code = 409, "activity_invariant_violation"
+    default_message = "La base de datos rechazo la gestion de cobranza por violar un invariante."

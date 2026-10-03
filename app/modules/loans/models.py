@@ -736,6 +736,8 @@ class CreditCollectionAssignment(Base):
             postgresql_where=text("end_idempotency_key IS NOT NULL"),
         ),
         Index("ix_credit_collection_assignments_loan", "loan_id"),
+        # T-014: target of the tenant-safe FK of an activity's assignment snapshot (relational support, no new rule)
+        UniqueConstraint("tenant_id", "id", "loan_id", name="uq_credit_collection_assignments_tenant_id_loan"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -799,3 +801,97 @@ ASSIGNMENT_TRIGGERS = (
 _assignments_table = Base.metadata.tables["credit_collection_assignments"]
 for _sql in (ASSIGNMENT_GUARD_FN, ASSIGNMENT_INSERT_FN, *ASSIGNMENT_TRIGGERS):
     event.listen(_assignments_table, "after_create", DDL(_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+
+
+# =============================== T-014: collection activity (append-only history) ===============================
+ACTIVITY_TYPES = (
+    "phone_call",
+    "whatsapp",
+    "sms",
+    "email",
+    "in_person_visit",
+    "office_visit",
+    "no_contact",
+    "other",
+)
+
+
+class CreditCollectionActivity(Base):
+    """One collection management (call, visit, ...) recorded on ONE loan. Append-only business history: no outcome, no free
+    text, no contact data, no client time. ``managing_branch_id`` and ``assignment_id`` are server-side snapshots (the open
+    T-012 assignment at that instant, or NULL) checked by an INSERT trigger. Moves no money and changes no status."""
+
+    __tablename__ = "credit_collection_activities"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "loan_id"],
+            ["credit_loans.tenant_id", "credit_loans.id"],
+            name="fk_credit_collection_activities_loan",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "recorded_by"], ["users.company_id", "users.id"], name="fk_credit_collection_activities_actor"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "managing_branch_id"],
+            ["branches.company_id", "branches.id"],
+            name="fk_credit_collection_activities_branch",
+        ),
+        # the snapshot of the assignment must belong to the SAME tenant and the SAME loan (NULL = no open assignment)
+        ForeignKeyConstraint(
+            ["tenant_id", "assignment_id", "loan_id"],
+            [
+                "credit_collection_assignments.tenant_id",
+                "credit_collection_assignments.id",
+                "credit_collection_assignments.loan_id",
+            ],
+            name="fk_credit_collection_activities_assignment",
+        ),
+        CheckConstraint(
+            "activity_type IN (" + ", ".join(f"'{t}'" for t in ACTIVITY_TYPES) + ")", name="activity_type_valid"
+        ),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_collection_activities_tenant_key"),
+        Index("ix_credit_collection_activities_loan_id_id", "tenant_id", "loan_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"))
+    loan_id: Mapped[int] = mapped_column(Integer)
+    managing_branch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recorded_by: Mapped[int] = mapped_column(Integer)
+    assignment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    activity_type: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+
+
+ACTIVITY_GUARD_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_activities_guard() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'collection activity % is append-only history: it cannot be % ', OLD.id, lower(TG_OP);
+END $$ LANGUAGE plpgsql
+"""
+# The snapshots cannot differ from the loan's managing branch and the loan's open assignment at INSERT time.
+ACTIVITY_INSERT_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_activities_insert_check() RETURNS trigger AS $$
+BEGIN
+  IF NEW.managing_branch_id IS DISTINCT FROM
+     (SELECT managing_branch_id FROM credit_loans WHERE id = NEW.loan_id AND tenant_id = NEW.tenant_id) THEN
+    RAISE EXCEPTION 'collection activity managing branch must be the loan''s own managing branch';
+  END IF;
+  IF NEW.assignment_id IS DISTINCT FROM
+     (SELECT id FROM credit_collection_assignments
+       WHERE tenant_id = NEW.tenant_id AND loan_id = NEW.loan_id AND ended_at IS NULL) THEN
+    RAISE EXCEPTION 'collection activity assignment snapshot must be the loan''s open assignment (or NULL)';
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+ACTIVITY_TRIGGERS = (
+    "CREATE TRIGGER trg_credit_collection_activities_insert_check BEFORE INSERT ON credit_collection_activities "
+    "FOR EACH ROW EXECUTE FUNCTION credit_collection_activities_insert_check()",
+    guard_trigger_sql("credit_collection_activities", "credit_collection_activities_guard", "UPDATE OR DELETE"),
+)
+_activities_table = Base.metadata.tables["credit_collection_activities"]
+for _sql in (ACTIVITY_GUARD_FN, ACTIVITY_INSERT_FN, *ACTIVITY_TRIGGERS):
+    event.listen(_activities_table, "after_create", DDL(_sql.replace("%", "%%")).execute_if(dialect="postgresql"))

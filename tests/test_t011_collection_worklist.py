@@ -574,7 +574,11 @@ def test_the_worklist_code_has_no_legacy_assignment_score_scheduler_or_new_depen
     assert not {
         n
         for n in names
-        if n != "credit_collection_assignments"  # the T-012 history table: it arrives later, not part of T-011
+        if n
+        not in (
+            "credit_collection_assignments",
+            "credit_collection_activities",
+        )  # the T-012 / T-014 history tables: they arrive later, not part of T-011
         and (
             any(x in n for x in ("bucket", "score", "rendition", "promise", "collection"))
             or (n.startswith(("credit_", "collector")) and any(x in n for x in ("assign", "custody", "activity")))

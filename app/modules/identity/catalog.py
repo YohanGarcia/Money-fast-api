@@ -80,6 +80,12 @@ CATALOG: tuple[PermissionDef, ...] = (
         True,
     ),
     PermissionDef(
+        "collections.actions.create",
+        "tenant",
+        "Registrar gestiones de cobranza sobre prestamos (no concede acceso de lectura)",
+        True,
+    ),
+    PermissionDef(
         "loans.delinquency.assess",
         "tenant",
         "Evaluar el vencimiento de un prestamo y proyectar su estado (no calcula cargos de mora)",
