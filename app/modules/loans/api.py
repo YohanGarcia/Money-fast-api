@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import overdue, payments, reversals, service, worklist
+from app.modules.loans import assignments, overdue, payments, reversals, service, worklist
+from app.modules.loans.assignment_schemas import AssignIn, EndAssignmentIn
 from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.loans.reversal_schemas import ReversalIn
 from app.modules.loans.schemas import DisburseIn
@@ -119,3 +120,26 @@ def overdue_loans(
         limit=limit,
         cursor=cursor,
     )
+
+
+@router.post("/loans/{loan_id}/collection-assignment")
+def assign_collection(loan_id: int, body: AssignIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    """Assigns (or reassigns) the loan's collection responsibility. Metadata only: no access, no money (T-012)."""
+    return assignments.assign(db, actor, loan_id, body, client_ip(request))
+
+
+@router.post("/loans/{loan_id}/collection-assignment/end")
+def end_collection_assignment(
+    loan_id: int, body: EndAssignmentIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    return assignments.end(db, actor, loan_id, body, client_ip(request))
+
+
+@router.get("/loans/{loan_id}/collection-assignment")
+def get_collection_assignment(loan_id: int, actor: Principal = Actor, db: Session = Db):
+    return assignments.get_current(db, actor, loan_id)
+
+
+@router.get("/loans/{loan_id}/collection-assignment/history")
+def get_collection_assignment_history(loan_id: int, actor: Principal = Actor, db: Session = Db):
+    return assignments.get_history(db, actor, loan_id)

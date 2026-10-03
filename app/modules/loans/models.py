@@ -668,3 +668,126 @@ for _table_name, _trigger, _fn in REVERSAL_CONSTRAINT_TRIGGERS:
         "after_create",
         DDL(payment_constraint_trigger_sql(_table_name, _trigger, _fn)).execute_if(dialect="postgresql"),
     )
+
+
+# =============================== T-012: collection assignment (history) ===============================
+class CreditCollectionAssignment(Base):
+    """Who is responsible for collecting ONE loan, as effective-dated history. Open row (``ended_at IS NULL``) = current; at
+    most one per loan (partial UNIQUE). Rows are never deleted nor rewritten: a reassignment closes the open row and inserts
+    a new one. Assignment is operational metadata: it grants no access and moves no money, status or debt."""
+
+    __tablename__ = "credit_collection_assignments"
+    __table_args__ = (
+        # tenant-safe references: loan, assignee, who assigned, who ended, the managing-branch snapshot
+        ForeignKeyConstraint(
+            ["tenant_id", "loan_id"],
+            ["credit_loans.tenant_id", "credit_loans.id"],
+            name="fk_credit_collection_assignments_loan",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "assignee_user_id"],
+            ["users.company_id", "users.id"],
+            name="fk_credit_collection_assignments_assignee",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "assigned_by"],
+            ["users.company_id", "users.id"],
+            name="fk_credit_collection_assignments_assigned_by",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "ended_by"],
+            ["users.company_id", "users.id"],
+            name="fk_credit_collection_assignments_ended_by",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "managing_branch_id"],
+            ["branches.company_id", "branches.id"],
+            name="fk_credit_collection_assignments_branch",
+        ),
+        # the end transition is all-or-nothing: ended_at, ended_by and the end idempotency pair appear together
+        CheckConstraint(
+            "(ended_at IS NULL) = (ended_by IS NULL) AND (ended_at IS NULL) = (end_idempotency_key IS NULL) "
+            "AND (ended_at IS NULL) = (end_request_digest IS NULL)",
+            name="end_fields_together",
+        ),
+        CheckConstraint("ended_at IS NULL OR ended_at >= assigned_at", name="end_not_before_start"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_collection_assignments_tenant_key"),
+        # at most ONE open assignment per loan (the database backstop of the loan lock)
+        Index(
+            "uq_credit_collection_assignments_open",
+            "tenant_id",
+            "loan_id",
+            unique=True,
+            postgresql_where=text("ended_at IS NULL"),
+        ),
+        Index(
+            "uq_credit_collection_assignments_end_key",
+            "tenant_id",
+            "end_idempotency_key",
+            unique=True,
+            postgresql_where=text("end_idempotency_key IS NOT NULL"),
+        ),
+        Index("ix_credit_collection_assignments_loan", "loan_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    assignee_user_id: Mapped[int] = mapped_column(Integer)
+    managing_branch_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # snapshot of the loan's, may be NULL
+    assigned_by: Mapped[int] = mapped_column(Integer)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+    ended_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    end_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+ASSIGNMENT_GUARD_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_assignments_guard() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'collection assignment % cannot be deleted: it is history', OLD.id;
+  END IF;
+  IF OLD.ended_at IS NOT NULL THEN
+    RAISE EXCEPTION 'collection assignment % is closed: history is immutable', OLD.id;
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+     OR NEW.loan_id IS DISTINCT FROM OLD.loan_id OR NEW.assignee_user_id IS DISTINCT FROM OLD.assignee_user_id
+     OR NEW.managing_branch_id IS DISTINCT FROM OLD.managing_branch_id OR NEW.assigned_by IS DISTINCT FROM OLD.assigned_by
+     OR NEW.assigned_at IS DISTINCT FROM OLD.assigned_at OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+     OR NEW.request_digest IS DISTINCT FROM OLD.request_digest THEN
+    RAISE EXCEPTION 'collection assignment % is immutable: only its single end transition may change', OLD.id;
+  END IF;
+  IF NEW.ended_at IS NULL THEN
+    RAISE EXCEPTION 'collection assignment % is open: the only allowed change is to close it', OLD.id;
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+# An assignment is born open, under the loan's own managing branch (the snapshot cannot differ from the loan's).
+ASSIGNMENT_INSERT_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_assignments_insert_check() RETURNS trigger AS $$
+BEGIN
+  IF NEW.ended_at IS NOT NULL THEN
+    RAISE EXCEPTION 'a collection assignment is born open: it cannot be inserted already closed';
+  END IF;
+  IF NEW.managing_branch_id IS DISTINCT FROM
+     (SELECT managing_branch_id FROM credit_loans WHERE id = NEW.loan_id AND tenant_id = NEW.tenant_id) THEN
+    RAISE EXCEPTION 'collection assignment managing branch must be the loan''s own managing branch';
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+ASSIGNMENT_TRIGGERS = (
+    "CREATE TRIGGER trg_credit_collection_assignments_insert_check BEFORE INSERT ON credit_collection_assignments "
+    "FOR EACH ROW EXECUTE FUNCTION credit_collection_assignments_insert_check()",
+    guard_trigger_sql("credit_collection_assignments", "credit_collection_assignments_guard", "UPDATE OR DELETE"),
+)
+_assignments_table = Base.metadata.tables["credit_collection_assignments"]
+for _sql in (ASSIGNMENT_GUARD_FN, ASSIGNMENT_INSERT_FN, *ASSIGNMENT_TRIGGERS):
+    event.listen(_assignments_table, "after_create", DDL(_sql.replace("%", "%%")).execute_if(dialect="postgresql"))

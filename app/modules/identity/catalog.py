@@ -74,6 +74,12 @@ CATALOG: tuple[PermissionDef, ...] = (
         "Consultar la cartera vencida (worklist de cobranza); solo lectura, sin datos personales",
     ),
     PermissionDef(
+        "collections.assign",
+        "tenant",
+        "Asignar, reasignar y terminar la responsabilidad de cobranza de un prestamo (no concede acceso)",
+        True,
+    ),
+    PermissionDef(
         "loans.delinquency.assess",
         "tenant",
         "Evaluar el vencimiento de un prestamo y proyectar su estado (no calcula cargos de mora)",

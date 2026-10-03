@@ -98,4 +98,5 @@ from app.modules.loans.models import (  # noqa: F401
     CreditPaymentApplication,
     CreditPaymentReversal,
     CreditPaymentReversalApplication,
+    CreditCollectionAssignment,
 )

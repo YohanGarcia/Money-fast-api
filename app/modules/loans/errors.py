@@ -93,3 +93,30 @@ class LoanNotAssessable(AppError):
 class InvalidCursor(AppError):
     status_code, code = 422, "invalid_cursor"
     default_message = "El cursor de paginacion no es valido para esta consulta."
+
+
+class LoanNotAssignable(AppError):
+    status_code, code = 409, "loan_not_assignable"
+    default_message = "Solo un prestamo activo o vencido (active/past_due) admite una nueva asignacion de cobranza."
+
+
+class AssigneeNotEligible(AppError):
+    status_code, code = 422, "assignee_not_eligible"
+    default_message = (
+        "El responsable debe ser un usuario activo del mismo tenant con collections.read sobre el alcance del prestamo."
+    )
+
+
+class AlreadyAssigned(AppError):
+    status_code, code = 409, "already_assigned"
+    default_message = "El prestamo ya esta asignado a ese usuario; no hay nada que cambiar."
+
+
+class NoActiveAssignment(AppError):
+    status_code, code = 409, "no_active_assignment"
+    default_message = "El prestamo no tiene una asignacion de cobranza vigente."
+
+
+class AssignmentInvariantViolation(AppError):
+    status_code, code = 409, "assignment_invariant_violation"
+    default_message = "La base de datos rechazo la asignacion por violar un invariante."

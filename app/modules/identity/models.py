@@ -133,6 +133,9 @@ class UserAccount(Base):
             "uq_users_tenant_email", "company_id", "email", unique=True, postgresql_where=text("company_id IS NOT NULL")
         ),
         Index("uq_users_platform_email", "email", unique=True, postgresql_where=text("company_id IS NULL")),
+        # T-012: target of tenant-safe composite FKs that point at a user (``id`` is already globally unique; this only
+        # lets PostgreSQL reference the pair, it changes no identity semantics).
+        UniqueConstraint("company_id", "id", name="uq_users_tenant_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

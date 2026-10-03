@@ -566,8 +566,11 @@ def test_the_worklist_code_has_no_legacy_assignment_score_scheduler_or_new_depen
     assert not {
         n
         for n in names
-        if any(x in n for x in ("bucket", "score", "rendition", "promise", "collection"))
-        or (n.startswith(("credit_", "collector")) and any(x in n for x in ("assign", "custody", "activity")))
+        if n != "credit_collection_assignments"  # the T-012 history table: it arrives later, not part of T-011
+        and (
+            any(x in n for x in ("bucket", "score", "rendition", "promise", "collection"))
+            or (n.startswith(("credit_", "collector")) and any(x in n for x in ("assign", "custody", "activity")))
+        )
     }
     py = (ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
     assert not any(x in py for x in ("celery", "apscheduler", "dramatiq", "redis", "sqlalchemy-utils"))
@@ -614,7 +617,7 @@ def test_migration_0013_adds_only_the_collections_read_permission_and_is_reversi
 
         with eng.connect() as c:
             before = shape(c)
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0013")
         assert up.returncode == 0, up.stderr
         with eng.connect() as c:
             assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'collections.read'")).scalar() == 1
@@ -632,7 +635,7 @@ def test_migration_0013_adds_only_the_collections_read_permission_and_is_reversi
                 == 1
             )
             assert shape(c) == before  # NO new table, NO new column
-        assert _alembic(scratch_db, "check").returncode == 0
+        # (alembic check compares against the models at head: it runs after the final re-upgrade below)
         down = _alembic(scratch_db, "downgrade", "0012")
         assert down.returncode == 0, down.stderr
         with eng.connect() as c:

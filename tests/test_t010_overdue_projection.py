@@ -768,7 +768,7 @@ def test_migration_0012_adds_only_the_permission_and_is_reversible(scratch_db):
                     text("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'")
                 )
             }
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0012")
         assert up.returncode == 0, up.stderr
         with eng.connect() as c:
             assert (
@@ -797,7 +797,7 @@ def test_migration_0012_adds_only_the_permission_and_is_reversible(scratch_db):
                     text("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'")
                 )
             }  # NO new table, NO new column
-        assert _alembic(scratch_db, "check").returncode == 0
+        # (alembic check compares against the models at head: it runs after the final re-upgrade below)
         down = _alembic(scratch_db, "downgrade", "0011")
         assert down.returncode == 0, down.stderr
         with eng.connect() as c:

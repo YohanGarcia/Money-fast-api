@@ -61,6 +61,7 @@ include = [
   "tests/test_t009_payment_reversal.py",
   "tests/test_t010_overdue_projection.py",
   "tests/test_t011_collection_worklist.py",
+  "tests/test_t012_collection_assignment.py",
 ]
 
 [tool.ruff.lint]
@@ -82,3 +83,4 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 "tests/test_t009_payment_reversal.py" = ["E501", "E731"]  # inline SQL literals
 "tests/test_t010_overdue_projection.py" = ["E501", "E731"]  # inline SQL literals
 "tests/test_t011_collection_worklist.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t012_collection_assignment.py" = ["E501", "E731"]  # inline SQL literals
