@@ -121,3 +121,7 @@ Bank/provider/transfer reversal; non-DOP cash; accounting and outbox; mature ren
 * **Delinquency**: reads the net source of truth, so a reversal makes overdue base reappear without any special case.
 * **Accounting**: the facts it can consume are the original payment, its applications, the reversal, the reversal
   applications, the movement pair linked by `reverses_id`, and the audit events — no GL entries are created here.
+
+> **T-010 update**: the loan status after a reversal now comes from the common projection (`paid > past_due > active`), so a
+> reopened debt that is already overdue (`business_date > effective due_date`) ends directly in `past_due`; otherwise
+> `paid → active`. See `T-010-CREDIT-OVERDUE-PROJECTION.md`.

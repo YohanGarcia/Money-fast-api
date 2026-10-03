@@ -82,3 +82,44 @@ def balances(obligations: list[ObligationView], business_date: date) -> dict[str
     out["due_to_date_outstanding"] = due_to_date_outstanding(obligations, business_date)
     out["total_paid"] = sum((sum((o.applied.get(c, ZERO) for c in COMPONENTS), ZERO) for o in obligations), ZERO)
     return out
+
+
+# =============================== T-010: overdue projection (pure, derived, never stored) ===============================
+# OVERDUE != DELINQUENCY CHARGE. An obligation is overdue when ``business_date > effective due_date`` AND its NET outstanding
+# is > 0. The delinquency grace days, ``delinquency_starts_on`` and ``delinquency.enabled`` play NO role here: they can only
+# affect a future late-fee package. Nothing in this section creates money.
+def net_outstanding(view: ObligationView) -> Decimal:
+    """Net outstanding of one obligation (contractual - (applications - reversal applications)); never negative per component."""
+    return sum((max(view.outstanding(c), ZERO) for c in COMPONENTS), ZERO)
+
+
+def is_overdue(view: ObligationView, business_date: date) -> bool:
+    return business_date > view.due_date and net_outstanding(view) > 0
+
+
+def days_overdue(view: ObligationView, business_date: date) -> int:
+    """Age of the due date: 0 on the due date itself, 1 the day after. The grace days are NOT subtracted."""
+    return (business_date - view.due_date).days if is_overdue(view, business_date) else 0
+
+
+def overdue_outstanding(view: ObligationView, business_date: date) -> Decimal:
+    return net_outstanding(view) if is_overdue(view, business_date) else ZERO
+
+
+def overdue_summary(obligations: list[ObligationView], business_date: date) -> dict:
+    late = [o for o in obligations if is_overdue(o, business_date)]
+    return {
+        "overdue_obligations": len(late),
+        "overdue_outstanding": sum((net_outstanding(o) for o in late), ZERO),
+        "max_days_overdue": max((days_overdue(o, business_date) for o in late), default=0),
+    }
+
+
+def loan_status(obligations: list[ObligationView], business_date: date) -> str:
+    """THE single rule for the economic status of a loan, from the net ledger and the business date only:
+    1. fully settled -> paid   2. any overdue net debt -> past_due   3. otherwise active."""
+    if all(net_outstanding(o) == 0 for o in obligations):
+        return "paid"
+    if any(is_overdue(o, business_date) for o in obligations):
+        return "past_due"
+    return "active"

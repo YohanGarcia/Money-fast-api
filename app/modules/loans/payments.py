@@ -42,6 +42,7 @@ from app.modules.origination.models import CreditFormalization
 from app.modules.origination.service import _amt, _next_number, verify_formalization_contract
 
 CREATE, READ = "payments.create", "payments.read"
+PAYABLE_STATUSES = ("active", "past_due")
 RECEIPT_KIND = "credit_payment_receipt"  # NOT 'counter_payment': the legacy cash reversal must never see it
 
 
@@ -170,7 +171,10 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
     ):
         raise DuplicateExternalReference()
 
-    if loan.status != "active":
+    previous_status = loan.status
+    if (
+        loan.status not in PAYABLE_STATUSES
+    ):  # T-010: a past_due loan IS payable (oldest effective due first, no mora generated)
         raise LoanNotPayable()
     if body.currency_code != loan.currency_code:
         raise CurrencyMismatch()
@@ -246,7 +250,7 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
                 )
             )
         db.flush()
-        _project(db, loan, obligations)
+        _project(db, loan, obligations, business_date)
         db.flush()
     except IntegrityError as exc:
         db.rollback()
@@ -280,6 +284,7 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
             "cash_session_id": payment.cash_session_id,
             "cash_movement_id": payment.cash_movement_id,
             "component_totals": {k: _amt(v) for k, v in sorted(totals.items())},
+            "previous_loan_status": previous_status,
             "loan_status": loan.status,
             "rules_digest": f.rules_hash,
             "contract_digest": f.contract_hash,
@@ -289,9 +294,9 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
     return {**_payment_out(db, payment), "replayed": False}
 
 
-def _project(db: Session, loan: CreditLoan, obligations: list) -> None:
-    """Re-derive statuses from the NET applications (see ``ledger.project``); past_due belongs to the delinquency package."""
-    ledger.project(db, loan, obligations)
+def _project(db: Session, loan: CreditLoan, obligations: list, business_date) -> None:
+    """Re-derive statuses from the NET applications (see ``ledger.project``); T-010: the common projection (paid > past_due > active)."""
+    ledger.project(db, loan, obligations, business_date)
 
 
 # --- reads ------------------------------------------------------------------------------------------

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import payments, reversals, service
+from app.modules.loans import overdue, payments, reversals, service
 from app.modules.loans.payment_schemas import PaymentIn
 from app.modules.loans.reversal_schemas import ReversalIn
 from app.modules.loans.schemas import DisburseIn
@@ -87,3 +87,9 @@ def reverse_payment(payment_id: int, body: ReversalIn, request: Request, actor: 
 @router.get("/payments/{payment_id}/reversal")
 def get_reversal(payment_id: int, actor: Principal = Actor, db: Session = Db):
     return reversals.get_reversal(db, actor, payment_id)
+
+
+@router.post("/loans/{loan_id}/delinquency/assess")
+def assess_loan(loan_id: int, request: Request, actor: Principal = Actor, db: Session = Db):
+    """Projects the stored loan status from the net ledger. Calculates NO delinquency charge (T-010)."""
+    return overdue.assess(db, actor, loan_id, client_ip(request))

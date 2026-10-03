@@ -131,7 +131,8 @@ def reverse(db: Session, actor: Principal, payment_id: int, body: ReversalIn, cl
         raise ReversalBranchMismatch()  # D2: the compensation happens where the money was received
     if (head.origin == "counter") != (body.cash_session_id is not None):
         raise ReversalSessionMismatch()
-    if loan.status not in ("active", "paid"):
+    previous_status = loan.status
+    if loan.status not in ("active", "past_due", "paid"):
         raise LoanNotReversible()
 
     f, _rules = _contract(db, loan)  # contract integrity BEFORE any money moves
@@ -174,7 +175,7 @@ def reverse(db: Session, actor: Principal, payment_id: int, body: ReversalIn, cl
     try:
         _mirror_applications(db, reversal, originals)
         db.flush()
-        ledger.project(db, loan, obligations)
+        ledger.project(db, loan, obligations, business_date)
         db.flush()
     except IntegrityError:
         db.rollback()
@@ -207,6 +208,7 @@ def reverse(db: Session, actor: Principal, payment_id: int, body: ReversalIn, cl
             "original_cash_movement_id": payment.cash_movement_id,
             "reversal_cash_movement_id": reversal.cash_movement_id,
             "component_totals": {k: _amt(v) for k, v in sorted(totals.items())},
+            "previous_loan_status": previous_status,
             "loan_status": loan.status,
             "rules_digest": f.rules_hash,
             "contract_digest": f.contract_hash,

@@ -26,7 +26,7 @@ from app.modules.customers.service import visible_branch_ids
 from app.modules.identity.audit import record_event
 from app.modules.identity.authorization import Principal, require
 from app.modules.identity.errors import PermissionDenied, TenantMismatch
-from app.modules.loans import ledger
+from app.modules.loans import allocation, ledger
 from app.modules.loans.errors import (
     AlreadyDisbursed,
     ContractIntegrityFailed,
@@ -96,12 +96,20 @@ def _summary(loan: CreditLoan) -> dict:
     }
 
 
-def _obligation_out(o: CreditLoanObligation, view=None) -> dict:
+def _obligation_out(o: CreditLoanObligation, view=None, business_date=None) -> dict:
     derived = {}
     if view is not None:  # derived from the applications, never stored
         derived = {
             "paid_amount": _amt(sum((view.applied.get(c, Decimal(0)) for c in view.due), Decimal(0))),
             "outstanding_amount": _amt(view.outstanding_total),
+        }
+    if (
+        view is not None and business_date is not None
+    ):  # T-010: overdue facts, DERIVED (effective due date + net ledger), never stored
+        derived |= {
+            "is_overdue": allocation.is_overdue(view, business_date),
+            "days_overdue": allocation.days_overdue(view, business_date),
+            "overdue_outstanding": _amt(allocation.overdue_outstanding(view, business_date)),
         }
     return {
         **derived,
@@ -383,11 +391,13 @@ def get_schedule(db: Session, actor: Principal, loan_id: int) -> dict:
     loan = _loan(db, actor, loan_id)
     rows, views = ledger.views(db, loan.id)
     by_id = {v.id: v for v in views}
+    today = ledger.business_date(db, loan, now_utc())  # the contract timezone, never the UTC date
     return {
         "loan_id": loan.id,
         "currency_code": loan.currency_code,
         "original_principal": _amt(loan.original_principal),
-        "obligations": [_obligation_out(o, by_id[o.id]) for o in rows],
+        "business_date": today.isoformat(),
+        "obligations": [_obligation_out(o, by_id[o.id], today) for o in rows],
         "totals": {
             "principal": _amt(sum((o.principal_due for o in rows), Decimal(0))),
             "interest": _amt(sum((o.interest_due for o in rows), Decimal(0))),

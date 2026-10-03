@@ -55,17 +55,19 @@ def applied_by_obligation(db: Session, loan_id: int) -> dict[int, dict[str, Deci
     return out
 
 
-def project(db: Session, loan: CreditLoan, obligations: list[CreditLoanObligation]) -> None:
-    """Re-derive every obligation's status from its amounts and the NET applications ONLY, then the loan flag:
-    all paid -> ``paid``; a ``paid`` loan whose debt reappeared (a reversal) -> ``active``. Nothing else moves the loan."""
+PROJECTABLE_STATUSES = ("active", "past_due", "paid")  # the only stored statuses this projection may move between
+
+
+def project(db: Session, loan: CreditLoan, obligations: list[CreditLoanObligation], business_date: date) -> None:
+    """Re-derive every obligation's status from its amounts and the NET applications ONLY, then the loan status through
+    the ONE central rule (``allocation.loan_status``: paid > past_due > active) at ``business_date``.
+    Used by payments, payment reversals and the explicit delinquency assessment; never by a read."""
     _o, views_ = views(db, loan.id)  # re-read: includes the rows just flushed
     by_id = {v.id: v for v in views_}
     for ob in obligations:
         ob.status = allocation.obligation_status(by_id[ob.id])
-    if all(ob.status == "paid" for ob in obligations):
-        loan.status = "paid"
-    elif loan.status == "paid":
-        loan.status = "active"  # T-009: the debt reappeared; past_due / restructured / refinanced stay out of scope
+    if loan.status in PROJECTABLE_STATUSES:  # restructured / refinanced / cancelled ... are never touched here
+        loan.status = allocation.loan_status(views_, business_date)
 
 
 def views(
@@ -123,4 +125,11 @@ def balances_out(
         "total_debt": _amt(b["total_outstanding"]),
         "currency_code": currency,
         "business_date": business_date_.isoformat(),
+        **{
+            k: (_amt(v) if k == "overdue_outstanding" else v)
+            for k, v in allocation.overdue_summary(views_, business_date_).items()
+        },
+        "projected_status": allocation.loan_status(
+            views_, business_date_
+        ),  # DERIVED from the net ledger; stored status may lag
     }

@@ -377,7 +377,7 @@ def test_loan_is_paid_only_when_every_obligation_is_settled(client, tenant_a, mo
     rows = schedule(client, adm, w.loan["id"])
     total = sum(r["total_due"] for r in rows)
     pay(client, adm, w, rows[0]["total_due"], origin="field")
-    assert client.get(f"{LOANS}/{w.loan['id']}", headers=adm).json()["status"] == "active"
+    assert client.get(f"{LOANS}/{w.loan['id']}", headers=adm).json()["status"] == "past_due"
     last = pay(client, adm, w, total - rows[0]["total_due"], origin="field")
     assert Decimal(last["amount"]) == total - rows[0]["total_due"]
     loan = client.get(f"{LOANS}/{w.loan['id']}", headers=adm).json()

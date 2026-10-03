@@ -234,7 +234,7 @@ def test_counter_full_reversal_restores_cash_and_debt_and_keeps_the_history(clie
     bal = balances(client, adm, w.loan["id"])
     assert Decimal(bal["total_paid"]) == 0 and Decimal(bal["due_to_date_outstanding"]) == first["total_due"]
     assert Decimal(bal["outstanding_principal"]) == Decimal("7000")
-    assert statuses(client, adm, w)[0] == "pending" and loan_status(client, adm, w) == "active"
+    assert statuses(client, adm, w)[0] == "pending" and loan_status(client, adm, w) == "past_due"
     assert {t: count(t) for t in LEGACY} == legacy_before  # no legacy payment / cash / capital row
 
 
@@ -281,16 +281,18 @@ def test_a_paid_loan_reopens_to_active_and_the_debt_can_be_paid_again(client, te
     p2 = pay(client, adm, w, total - rows[0]["total_due"], origin="field")
     assert loan_status(client, adm, w) == "paid" and set(statuses(client, adm, w)) == {"paid"}
     rev(client, adm, p2["id"], w, session=None)
-    assert loan_status(client, adm, w) == "active"  # paid -> active: the debt reappeared
+    assert (
+        loan_status(client, adm, w) == "past_due"
+    )  # T-010 D3: paid -> past_due directly (the reopened debt is already overdue at day 400)
     bal = balances(client, adm, w.loan["id"])
-    assert Decimal(bal["total_outstanding"]) == total - rows[0]["total_due"] and bal["loan_status"] == "active"
+    assert Decimal(bal["total_outstanding"]) == total - rows[0]["total_due"] and bal["loan_status"] == "past_due"
     assert statuses(client, adm, w)[0] == "paid" and set(statuses(client, adm, w)[1:]) == {"pending"}
     # capacity reappears (net over-application): the very same amount can be paid again, and the loan is paid again
     p3 = pay(client, adm, w, total - rows[0]["total_due"], origin="field")
     assert loan_status(client, adm, w) == "paid" and p3["id"] not in (p1["id"], p2["id"])
     # a reversed payment cannot reopen anything twice; reversing the first one reopens obligation 1 only
     rev(client, adm, p1["id"], w, session=None)
-    assert loan_status(client, adm, w) == "active" and statuses(client, adm, w)[0] == "pending"
+    assert loan_status(client, adm, w) == "past_due" and statuses(client, adm, w)[0] == "pending"
     assert (
         client.post(f"{LOANS}/{w.loan['id']}/payments", headers=adm, json=pbody(w, "1.00", origin="field")).status_code
         == 200
@@ -576,7 +578,7 @@ def test_double_and_triple_reversal_races_produce_exactly_one_reversal(client, t
     s = rstate()
     assert (s["credit_payment_reversals"], s["credit_payment_reversal_applications"], s["seq"]) == (1, 2, 1)
     assert count("cash_movements", "kind = :k", k=REVERSAL) == 1 and session_balance(w.cash.session_id) == start
-    assert loan_status(client, adm, w) == "active" and statuses(client, adm, w)[0] == "pending"
+    assert loan_status(client, adm, w) == "past_due" and statuses(client, adm, w)[0] == "pending"
     # two simultaneous clients, two different keys, another payment
     p2 = pay(client, adm, w, "20.00")
     barrier = threading.Barrier(3)
@@ -663,7 +665,9 @@ def test_the_last_payment_racing_a_reversal_ends_in_the_same_state_either_way(cl
     assert Decimal(bal["total_paid"]) == Decimal("10.00") and Decimal(bal["total_outstanding"]) == total - Decimal(
         "10.00"
     )
-    assert loan_status(client, adm, w) == "active"  # never left `paid` by the interleaving
+    assert (
+        loan_status(client, adm, w) == "past_due"
+    )  # the debt is overdue (day 400): the common projection ends in past_due either way
     assert Decimal(client.get(f"{LOANS}/{w.loan['id']}", headers=adm).json()["original_principal"]) == Decimal("7000")
 
 
@@ -1225,6 +1229,7 @@ def test_downgrade_0011_is_refused_while_reversal_history_exists(scratch_db):
                     "'downgrade-key-0001', 'd', now() FROM companies"
                 )
             )
+        assert _alembic(scratch_db, "downgrade", "0011").returncode == 0  # T-010 (0012) holds no economic rows: clean
         refused = _alembic(scratch_db, "downgrade", "0010")
         assert refused.returncode != 0 and "Cannot downgrade 0011" in refused.stderr
         with eng.connect() as c:  # nothing was dropped, nothing was falsified

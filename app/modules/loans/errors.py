@@ -83,3 +83,8 @@ class PaymentNotReversed(AppError):
 class ReversalSessionMismatch(AppError):
     status_code, code = 422, "reversal_cash_session_mismatch"
     default_message = "cash_session_id es obligatorio al revertir un cobro de ventanilla y no aplica a uno de campo."
+
+
+class LoanNotAssessable(AppError):
+    status_code, code = 409, "loan_not_assessable"
+    default_message = "El prestamo no admite evaluacion de vencimiento en su estado actual."
