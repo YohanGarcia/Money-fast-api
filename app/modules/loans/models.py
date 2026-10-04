@@ -895,3 +895,169 @@ ACTIVITY_TRIGGERS = (
 _activities_table = Base.metadata.tables["credit_collection_activities"]
 for _sql in (ACTIVITY_GUARD_FN, ACTIVITY_INSERT_FN, *ACTIVITY_TRIGGERS):
     event.listen(_activities_table, "after_create", DDL(_sql.replace("%", "%%")).execute_if(dialect="postgresql"))
+
+
+# =============================== T-015: collection promise-to-pay (history, derived outcome) ===============================
+PROMISE_CLOSED_KINDS = ("cancelled", "superseded")
+
+
+class CreditCollectionPromise(Base):
+    """A customer's declared commitment to pay ``promised_amount`` on one loan by ``promise_date`` (contract timezone). The
+    commercial terms are immutable; the only change a row ever gets is ONE closing transition (cancelled / superseded).
+    Fulfilled / broken are NEVER stored: they are derived on read from the net payment ledger. At most one row per loan is
+    not closed. A promise moves no money, reduces no debt and changes no status."""
+
+    __tablename__ = "credit_collection_promises"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "loan_id"],
+            ["credit_loans.tenant_id", "credit_loans.id"],
+            name="fk_credit_collection_promises_loan",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by"], ["users.company_id", "users.id"], name="fk_credit_collection_promises_creator"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "closed_by"], ["users.company_id", "users.id"], name="fk_credit_collection_promises_closer"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "managing_branch_id"],
+            ["branches.company_id", "branches.id"],
+            name="fk_credit_collection_promises_branch",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "assignment_id", "loan_id"],
+            [
+                "credit_collection_assignments.tenant_id",
+                "credit_collection_assignments.id",
+                "credit_collection_assignments.loan_id",
+            ],
+            name="fk_credit_collection_promises_assignment",
+        ),
+        # a replacement points to the promise it superseded: same tenant AND same loan (target below)
+        ForeignKeyConstraint(
+            ["tenant_id", "supersedes_promise_id", "loan_id"],
+            [
+                "credit_collection_promises.tenant_id",
+                "credit_collection_promises.id",
+                "credit_collection_promises.loan_id",
+            ],
+            name="fk_credit_collection_promises_supersedes",
+        ),
+        UniqueConstraint("tenant_id", "id", "loan_id", name="uq_credit_collection_promises_tenant_id_loan"),
+        CheckConstraint("promised_amount > 0", name="amount_positive"),
+        CheckConstraint("supersedes_promise_id IS NULL OR supersedes_promise_id <> id", name="not_self_superseding"),
+        # the closing transition is all-or-nothing, and only these two kinds exist (fulfilled / broken are derived)
+        CheckConstraint(
+            "(closed_at IS NULL) = (closed_by IS NULL) AND (closed_at IS NULL) = (closed_kind IS NULL) "
+            "AND (closed_at IS NULL) = (close_idempotency_key IS NULL) "
+            "AND (closed_at IS NULL) = (close_request_digest IS NULL)",
+            name="closure_fields_together",
+        ),
+        CheckConstraint(
+            "closed_kind IS NULL OR closed_kind IN (" + ", ".join(f"'{k}'" for k in PROMISE_CLOSED_KINDS) + ")",
+            name="closed_kind_valid",
+        ),
+        CheckConstraint("closed_at IS NULL OR closed_at >= created_at", name="close_not_before_creation"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_collection_promises_tenant_key"),
+        # at most ONE promise per loan that is not closed (the database backstop of the loan lock)
+        Index(
+            "uq_credit_collection_promises_current",
+            "tenant_id",
+            "loan_id",
+            unique=True,
+            postgresql_where=text("closed_at IS NULL"),
+        ),
+        Index(
+            "uq_credit_collection_promises_close_key",
+            "tenant_id",
+            "close_idempotency_key",
+            unique=True,
+            postgresql_where=text("close_idempotency_key IS NOT NULL"),
+        ),
+        Index("ix_credit_collection_promises_loan_id_id", "tenant_id", "loan_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"))
+    loan_id: Mapped[int] = mapped_column(Integer)
+    managing_branch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assignment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_by: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    currency_code: Mapped[str] = mapped_column(String(3))
+    promised_amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    promise_date: Mapped[date] = mapped_column(Date)
+    supersedes_promise_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    closed_kind: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    close_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    close_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+PROMISE_GUARD_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_promises_guard() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'collection promise % cannot be deleted: it is history', OLD.id;
+  END IF;
+  IF OLD.closed_at IS NOT NULL THEN
+    RAISE EXCEPTION 'collection promise % is closed: history is immutable', OLD.id;
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+     OR NEW.loan_id IS DISTINCT FROM OLD.loan_id OR NEW.managing_branch_id IS DISTINCT FROM OLD.managing_branch_id
+     OR NEW.assignment_id IS DISTINCT FROM OLD.assignment_id OR NEW.created_by IS DISTINCT FROM OLD.created_by
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.currency_code IS DISTINCT FROM OLD.currency_code
+     OR NEW.promised_amount IS DISTINCT FROM OLD.promised_amount OR NEW.promise_date IS DISTINCT FROM OLD.promise_date
+     OR NEW.supersedes_promise_id IS DISTINCT FROM OLD.supersedes_promise_id
+     OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key OR NEW.request_digest IS DISTINCT FROM OLD.request_digest THEN
+    RAISE EXCEPTION 'collection promise % terms are immutable: only its single closing transition may change', OLD.id;
+  END IF;
+  IF NEW.closed_at IS NULL THEN
+    RAISE EXCEPTION 'collection promise % is open: the only allowed change is to close it', OLD.id;
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+# Born open, with the loan's own snapshots and currency, and a valid supersede relation.
+PROMISE_INSERT_FN = """
+CREATE OR REPLACE FUNCTION credit_collection_promises_insert_check() RETURNS trigger AS $$
+DECLARE
+  loan_row RECORD;
+BEGIN
+  IF NEW.closed_at IS NOT NULL THEN
+    RAISE EXCEPTION 'a collection promise is born open: it cannot be inserted already closed';
+  END IF;
+  SELECT managing_branch_id, currency_code INTO loan_row
+    FROM credit_loans WHERE id = NEW.loan_id AND tenant_id = NEW.tenant_id;
+  IF NEW.managing_branch_id IS DISTINCT FROM loan_row.managing_branch_id THEN
+    RAISE EXCEPTION 'collection promise managing branch must be the loan''s own managing branch';
+  END IF;
+  IF NEW.currency_code IS DISTINCT FROM loan_row.currency_code THEN
+    RAISE EXCEPTION 'collection promise currency must be the loan''s currency';
+  END IF;
+  IF NEW.assignment_id IS DISTINCT FROM
+     (SELECT id FROM credit_collection_assignments
+       WHERE tenant_id = NEW.tenant_id AND loan_id = NEW.loan_id AND ended_at IS NULL) THEN
+    RAISE EXCEPTION 'collection promise assignment snapshot must be the loan''s open assignment (or NULL)';
+  END IF;
+  IF NEW.supersedes_promise_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM credit_collection_promises
+        WHERE id = NEW.supersedes_promise_id AND tenant_id = NEW.tenant_id AND loan_id = NEW.loan_id
+          AND closed_kind = 'superseded') THEN
+    RAISE EXCEPTION 'a replacement must supersede a promise of the same loan that is closed as superseded';
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+PROMISE_TRIGGERS = (
+    "CREATE TRIGGER trg_credit_collection_promises_insert_check BEFORE INSERT ON credit_collection_promises "
+    "FOR EACH ROW EXECUTE FUNCTION credit_collection_promises_insert_check()",
+    guard_trigger_sql("credit_collection_promises", "credit_collection_promises_guard", "UPDATE OR DELETE"),
+)
+_promises_table = Base.metadata.tables["credit_collection_promises"]
+for _sql in (PROMISE_GUARD_FN, PROMISE_INSERT_FN, *PROMISE_TRIGGERS):
+    event.listen(_promises_table, "after_create", DDL(_sql.replace("%", "%%")).execute_if(dialect="postgresql"))

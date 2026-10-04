@@ -130,3 +130,50 @@ class ConflictingAssignmentFilters(AppError):
 class ActivityInvariantViolation(AppError):
     status_code, code = 409, "activity_invariant_violation"
     default_message = "La base de datos rechazo la gestion de cobranza por violar un invariante."
+
+
+class PromiseAmountInvalid(AppError):
+    status_code, code = 422, "promise_amount_invalid"
+    default_message = "El monto prometido debe ser positivo y expresarse en centavos."
+
+
+class PromiseDateInPast(AppError):
+    status_code, code = 422, "promise_date_in_the_past"
+    default_message = "La fecha prometida no puede ser anterior a la fecha de negocio actual del contrato."
+
+
+class PromiseNotApplicable(AppError):
+    status_code, code = 422, "promise_not_applicable"
+    default_message = "No hay saldo exigible a la fecha prometida: no se puede registrar una promesa de pago."
+
+
+class PromiseAmountExceedsDueByDate(AppError):
+    status_code, code = 422, "promise_amount_exceeds_due_by_date"
+    default_message = (
+        "El monto prometido supera lo exigible a la fecha prometida (el pago maximo cobrable a esa fecha)."
+    )
+
+
+class AlreadyHasOpenPromise(AppError):
+    status_code, code = 409, "already_has_open_promise"
+    default_message = "El prestamo ya tiene una promesa vigente: use el reemplazo explicito o cancelela primero."
+
+
+class NoOpenPromise(AppError):
+    status_code, code = 409, "no_open_promise"
+    default_message = "El prestamo no tiene una promesa vigente que reemplazar."
+
+
+class PromiseNotCancellable(AppError):
+    status_code, code = 409, "promise_not_cancellable"
+    default_message = "Solo una promesa vigente cuyo resultado sigue abierto puede cancelarse."
+
+
+class PromiseAlreadyClosed(AppError):
+    status_code, code = 409, "promise_already_closed"
+    default_message = "La promesa ya esta cerrada."
+
+
+class PromiseInvariantViolation(AppError):
+    status_code, code = 409, "promise_invariant_violation"
+    default_message = "La base de datos rechazo la promesa por violar un invariante."

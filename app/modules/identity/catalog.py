@@ -86,6 +86,12 @@ CATALOG: tuple[PermissionDef, ...] = (
         True,
     ),
     PermissionDef(
+        "collections.promises.create",
+        "tenant",
+        "Registrar, reemplazar y cancelar promesas de pago de cobranza sobre prestamos (no concede acceso de lectura)",
+        True,
+    ),
+    PermissionDef(
         "loans.delinquency.assess",
         "tenant",
         "Evaluar el vencimiento de un prestamo y proyectar su estado (no calcula cargos de mora)",

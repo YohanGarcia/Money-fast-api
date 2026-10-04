@@ -6,10 +6,11 @@ from sqlalchemy.orm import Session
 from app.core.db import get_session
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
-from app.modules.loans import activities, assignments, overdue, payments, reversals, service, worklist
+from app.modules.loans import activities, assignments, overdue, payments, promises, reversals, service, worklist
 from app.modules.loans.activity_schemas import CreateActivityIn
 from app.modules.loans.assignment_schemas import AssignIn, EndAssignmentIn
 from app.modules.loans.payment_schemas import PaymentIn
+from app.modules.loans.promise_schemas import CancelPromiseIn, CreatePromiseIn, ReplacePromiseIn
 from app.modules.loans.reversal_schemas import ReversalIn
 from app.modules.loans.schemas import DisburseIn
 
@@ -173,3 +174,49 @@ def list_collection_activities(
 @router.get("/loans/{loan_id}/collection-activities/{activity_id}")
 def get_collection_activity(loan_id: int, activity_id: int, actor: Principal = Actor, db: Session = Db):
     return activities.get_activity(db, actor, loan_id, activity_id)
+
+
+@router.post("/loans/{loan_id}/collection-promises")
+def create_collection_promise(
+    loan_id: int, body: CreatePromiseIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    """Records a customer's promise to pay (amount + date). A commitment, not a payment: no money, no debt change (T-015)."""
+    return promises.create(db, actor, loan_id, body, client_ip(request))
+
+
+@router.post("/loans/{loan_id}/collection-promises/replace")
+def replace_collection_promise(
+    loan_id: int, body: ReplacePromiseIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    """Explicit renegotiation: supersedes the current promise and inserts the new one in one transaction."""
+    return promises.replace(db, actor, loan_id, body, client_ip(request))
+
+
+@router.post("/loans/{loan_id}/collection-promises/{promise_id}/cancel")
+def cancel_collection_promise(
+    loan_id: int, promise_id: int, body: CancelPromiseIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    return promises.cancel(db, actor, loan_id, promise_id, body, client_ip(request))
+
+
+@router.get("/loans/{loan_id}/collection-promises/current")
+def get_current_collection_promise(loan_id: int, actor: Principal = Actor, db: Session = Db):
+    """READ-ONLY: the promise that is not closed (any projected status), or ``promise: null``."""
+    return promises.get_current(db, actor, loan_id)
+
+
+@router.get("/loans/{loan_id}/collection-promises")
+def list_collection_promises(
+    loan_id: int,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=100),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    """READ-ONLY history, newest first (keyset on id); every row carries its derived ``projected_status``."""
+    return promises.list_promises(db, actor, loan_id, limit=limit, cursor=cursor)
+
+
+@router.get("/loans/{loan_id}/collection-promises/{promise_id}")
+def get_collection_promise(loan_id: int, promise_id: int, actor: Principal = Actor, db: Session = Db):
+    return promises.get_promise(db, actor, loan_id, promise_id)

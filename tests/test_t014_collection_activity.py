@@ -638,9 +638,9 @@ def test_migration_0016_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
     assert _alembic(scratch_db, "upgrade", "0015").returncode == 0
     eng = create_engine(scratch_db)
     try:
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0016")
         assert up.returncode == 0, up.stderr
-        assert _alembic(scratch_db, "check").returncode == 0
+        # (alembic check compares against the models at head, which also hold T-015: it runs after the final re-upgrade)
         with eng.connect() as c:
             assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0016"
             assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'collections.actions.create'")).scalar() == 1
@@ -678,7 +678,7 @@ def test_migration_0016_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
 def test_downgrade_0016_is_refused_before_any_ddl_when_activity_history_exists(scratch_db):
     from sqlalchemy import create_engine
 
-    assert _alembic(scratch_db, "upgrade", "head").returncode == 0
+    assert _alembic(scratch_db, "upgrade", "0016").returncode == 0
     eng = create_engine(scratch_db)
     try:
         _seed(eng)

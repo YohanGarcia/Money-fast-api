@@ -99,5 +99,6 @@ from app.modules.loans.models import (  # noqa: F401
     CreditPaymentReversal,
     CreditPaymentReversalApplication,
     CreditCollectionActivity,
+    CreditCollectionPromise,
     CreditCollectionAssignment,
 )
