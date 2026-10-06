@@ -80,6 +80,8 @@ EXPECTED_KEYS = {
     "next_due_date",
     "last_net_payment",
     "current_assignment",  # T-013: ids + timestamp of the OPEN assignment, or null
+    "current_promise",  # T-016: mini-view of the promise that is not closed, or null
+    "last_collection_activity",  # T-016: mini-view of the newest T-014 activity, or null
 }
 
 

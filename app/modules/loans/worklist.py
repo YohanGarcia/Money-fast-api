@@ -9,6 +9,9 @@
 * Scope: ``collections.read`` on the loan's MANAGING branch. A loan without managing branch needs tenant scope. The
   ``branch_id`` filter can only narrow what the actor already sees. No legacy ``collector`` role, no assignment.
 * The row carries ``customer_id`` only (no PII), no bucket, no priority/score, no custody, no mora charge.
+* T-016 enrichment (page only, after membership / sort / cursor are decided): ``current_promise`` (the T-015 promise that is not
+  closed, with its derived status in the loan's own business date) and ``last_collection_activity`` (the T-014 activity with the
+  greatest id). They never change membership, order, scope or the cursor; both come from shared helpers of those packages.
 * Assignment (T-013): an extra RESTRICTION over what the actor already sees (never a union, never access). Only the
   current/open row of ``credit_collection_assignments`` counts (closed history never does); the assignee is never validated
   against ``users`` (an unknown, foreign or inactive id is simply an empty result); stale assignments are read, never
@@ -36,7 +39,7 @@ from app.models.branch import Branch
 from app.modules.customers.service import visible_branch_ids
 from app.modules.identity.authorization import Principal
 from app.modules.identity.errors import PermissionDenied, TenantMismatch
-from app.modules.loans import allocation, ledger
+from app.modules.loans import activities, allocation, ledger, promises
 from app.modules.loans.errors import ConflictingAssignmentFilters, InvalidCursor
 from app.modules.loans.models import (
     CreditCollectionAssignment,
@@ -282,12 +285,21 @@ def overdue_loans(
     page, more = rows[:limit], len(rows) > limit
     payments = _last_net_payments(db, actor.tenant_id, [r["loan_id"] for r in page])
     current = _current_assignments(db, actor.tenant_id, [r["loan_id"] for r in page])
+    page_ids = [r["loan_id"] for r in page]
+    page_set = set(page_ids)  # T-016: only the PAGE is enriched, never the whole candidate universe
+    tz_by_loan = {c.id: c.tz for c in cands if c.id in page_set}
+    promise_view = promises.current_mini_views(
+        db, actor.tenant_id, {i: ledger.business_date_in(tz_by_loan[i], now) for i in page_ids}
+    )
+    activity_view = activities.latest_by_loan(db, actor.tenant_id, page_ids)
     items = [
         {
             **r,
             "overdue_outstanding": _amt(r["overdue_outstanding"]),
             "last_net_payment": payments.get(r["loan_id"]),
             "current_assignment": current.get(r["loan_id"]),
+            "current_promise": promise_view.get(r["loan_id"]),
+            "last_collection_activity": activity_view.get(r["loan_id"]),
         }
         for r in page
     ]

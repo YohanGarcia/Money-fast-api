@@ -535,7 +535,13 @@ def test_any_loan_status_accepts_an_activity_and_it_changes_nothing_else(client,
         assert _status(lid(w)) == status  # the activity never writes the loan status
     set_loan_status(lid(w), stored)
     assert len(arows()) == 6 and first["activity_id"] == arows()[0][0]
-    assert wl(client, adm, limit=100) == worklist_before  # T-013 / T-011 untouched (no activity field, no filter)
+    after = wl(client, adm, limit=100)  # T-016 shows the newest activity per row, and nothing else of the worklist moves
+    strip = lambda b: {  # noqa: E731
+        **b,
+        "items": [{k: v for k, v in i.items() if k != "last_collection_activity"} for i in b["items"]],
+    }
+    assert strip(after) == strip(worklist_before)  # same membership, order, facts and cursor
+    assert after["items"][0]["last_collection_activity"]["activity_id"] == arows()[-1][0]
     assert client.get(f"{L}/{lid(w)}/balances", headers=adm).json() == balances_before
     assert rows() == assignments_before and _loan_rows() == loan_rows
     assert {t: count(t) for t in LEGACY} == legacy_before and money_counts() == money_before
@@ -611,9 +617,13 @@ def test_the_activity_code_has_no_legacy_money_outcome_text_gps_or_promise():
         "idempotency_key",
         "request_digest",
     }  # exactly these: no outcome, text, status, update/delete marker, customer, assignee, contact, promise or GPS
-    for module in ("payments.py", "reversals.py", "overdue.py", "worklist.py"):
+    for module in ("payments.py", "reversals.py", "overdue.py"):
         module_src = (ROOT / "app/modules/loans" / module).read_text(encoding="utf-8")
         assert "collection_activit" not in module_src and "CreditCollectionActivity" not in module_src, module
+    # T-016: the worklist may only READ the latest activity of its page through the shared helper (never the model, never a write)
+    worklist_src = (ROOT / "app/modules/loans/worklist.py").read_text(encoding="utf-8")
+    assert "CreditCollectionActivity" not in worklist_src and "activities.latest_by_loan(" in worklist_src
+    assert "activities.create" not in worklist_src and "record_event" not in worklist_src
     assert activity_service.CREATE == CREATE
 
 

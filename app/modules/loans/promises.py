@@ -92,8 +92,8 @@ def _money(raw: str) -> Decimal:
 
 
 # --- the derived outcome ------------------------------------------------------------------------------------
-def _qualifying_paid(db: Session, tenant_id: int, promises: list[CreditCollectionPromise]) -> dict[int, Decimal]:
-    """ONE query for any number of promises: net payments of the loan received since the promise was created and dated no later
+def qualifying_paid_amounts(db: Session, tenant_id: int, promises: list[CreditCollectionPromise]) -> dict[int, Decimal]:
+    """THE definition of the qualifying payments (shared by the T-015 reads and the T-016 worklist). ONE query for any number of promises: net payments of the loan received since the promise was created and dated no later
     than the promise date, never reversed (a reversed payment contributes 0), any origin."""
     if not promises:
         return {}
@@ -148,8 +148,38 @@ def _view(row: CreditCollectionPromise, paid: Decimal, today: date) -> dict:
 
 def _views(db: Session, loan: CreditLoan, rows: list[CreditCollectionPromise]) -> list[dict]:
     today = ledger.business_date(db, loan, now_utc())
-    paid = _qualifying_paid(db, loan.tenant_id, rows)
+    paid = qualifying_paid_amounts(db, loan.tenant_id, rows)
     return [_view(r, paid.get(r.id, ZERO), today) for r in rows]
+
+
+def current_mini_views(db: Session, tenant_id: int, business_date_by_loan: dict[int, date]) -> dict[int, dict]:
+    """T-016 worklist enrichment for the loans of ONE PAGE (the keys): the promise that is not closed (never a closed one, never a
+    historical fallback) with its derived status, in the loan's own business date. Two queries at most (none when the page has no
+    current promise): the current rows, then the shared qualifying-payment aggregation. Pure read."""
+    if not business_date_by_loan:
+        return {}
+    rows = list(
+        db.scalars(
+            select(CreditCollectionPromise).where(
+                CreditCollectionPromise.tenant_id == tenant_id,
+                CreditCollectionPromise.loan_id.in_(list(business_date_by_loan)),
+                CreditCollectionPromise.closed_at.is_(None),
+            )
+        )
+    )
+    paid = qualifying_paid_amounts(db, tenant_id, rows)
+    return {
+        r.loan_id: {
+            "promise_id": r.id,
+            "promised_amount": _amt(r.promised_amount),
+            "currency_code": r.currency_code,
+            "promise_date": r.promise_date,
+            "projected_status": projected_status(r, paid.get(r.id, ZERO), business_date_by_loan[r.loan_id]),
+            "qualifying_paid_amount": _amt(paid.get(r.id, ZERO)),
+            "created_at": r.created_at,
+        }
+        for r in rows
+    }
 
 
 def _current(db: Session, tenant_id: int, loan_id: int, *, lock: bool) -> CreditCollectionPromise | None:

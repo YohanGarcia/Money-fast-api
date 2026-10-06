@@ -17,7 +17,7 @@ import base64
 import hashlib
 import json
 
-from sqlalchemy import select
+from sqlalchemy import Integer, column, select, true, values
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -104,6 +104,33 @@ def create(db: Session, actor: Principal, loan_id: int, body: CreateActivityIn, 
     )
     db.commit()
     return {**_out(row), "replayed": False}
+
+
+def latest_by_loan(db: Session, tenant_id: int, loan_ids: list[int]) -> dict[int, dict]:
+    """T-016 worklist enrichment for the loans of ONE PAGE: the activity with the greatest ``id`` of each loan (the canonical
+    ``id DESC`` order of the history), at most one per loan, in ONE query. LATERAL + ``LIMIT 1`` reads one index entry per loan
+    (``(tenant_id, loan_id, id)`` backwards): a global ``DISTINCT ON`` would sort every activity of a busy loan. Pure read; no
+    user, assignment or contact data."""
+    if not loan_ids:
+        return {}
+    wanted = values(column("loan_id", Integer), name="wanted").data([(i,) for i in loan_ids])
+    a = CreditCollectionActivity
+    newest = (
+        select(a.id, a.activity_type, a.created_at)
+        .where(a.tenant_id == tenant_id, a.loan_id == wanted.c.loan_id)
+        .order_by(a.id.desc())
+        .limit(1)
+        .lateral("newest")
+    )
+    stmt = (
+        select(wanted.c.loan_id, newest.c.id, newest.c.activity_type, newest.c.created_at)
+        .select_from(wanted)
+        .join(newest, true())
+    )
+    return {
+        r.loan_id: {"activity_id": r.id, "activity_type": r.activity_type, "created_at": r.created_at}
+        for r in db.execute(stmt)
+    }
 
 
 # --- reads (collections.read, same boundary as the worklist and the assignment reads; pure) ------------------

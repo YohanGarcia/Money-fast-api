@@ -920,9 +920,13 @@ def test_the_promise_code_has_no_legacy_money_activity_text_scheduler_or_stored_
         "close_idempotency_key",
         "close_request_digest",
     }  # no stored financial status, no fulfilled_at / broken_at, no reason / note, no activity link, no updated / deleted marker
-    for module in ("payments.py", "reversals.py", "overdue.py", "worklist.py", "activities.py", "assignments.py"):
+    for module in ("payments.py", "reversals.py", "overdue.py", "activities.py", "assignments.py"):
         module_src = (ROOT / "app/modules/loans" / module).read_text(encoding="utf-8")
         assert "CreditCollectionPromise" not in module_src and "collection_promise" not in module_src, module
+    # T-016: the worklist may only READ the current promise of its page through the shared helper (never the model, never a write)
+    worklist_src = (ROOT / "app/modules/loans/worklist.py").read_text(encoding="utf-8")
+    assert "CreditCollectionPromise" not in worklist_src and "promises.current_mini_views(" in worklist_src
+    assert "promises.create" not in worklist_src and "promises.cancel" not in worklist_src and "record_event" not in worklist_src
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
     assert catalog.count("collections.promises") == 1 and promise_service.CREATE == CREATE
     assert "'fulfilled'" not in model[model.index("PROMISE_CLOSED_KINDS") : model.index("class CreditCollectionPromise")]
