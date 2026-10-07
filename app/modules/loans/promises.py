@@ -24,10 +24,12 @@
 """
 
 import hashlib
-from datetime import date
+from collections.abc import Iterable
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import ARRAY, Integer, and_, any_, bindparam, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -92,10 +94,13 @@ def _money(raw: str) -> Decimal:
 
 
 # --- the derived outcome ------------------------------------------------------------------------------------
-def qualifying_paid_amounts(db: Session, tenant_id: int, promises: list[CreditCollectionPromise]) -> dict[int, Decimal]:
-    """THE definition of the qualifying payments (shared by the T-015 reads and the T-016 worklist). ONE query for any number of promises: net payments of the loan received since the promise was created and dated no later
-    than the promise date, never reversed (a reversed payment contributes 0), any origin."""
-    if not promises:
+def qualifying_paid_amounts(db: Session, tenant_id: int, promise_ids: Iterable[int]) -> dict[int, Decimal]:
+    """THE definition of the qualifying payments, shared by the T-015 reads, the T-016 enrichment and the T-017 filter.
+    ONE query for any number of promises (the ids travel as a single PostgreSQL array): the loan's confirmed payments
+    received since the promise was created and dated no later than the promise date, never reversed (a reversed payment
+    contributes 0), any origin, summed."""
+    promise_ids = list(promise_ids)
+    if not promise_ids:
         return {}
     pay, p = CreditPayment, CreditCollectionPromise
     stmt = (
@@ -112,7 +117,7 @@ def qualifying_paid_amounts(db: Session, tenant_id: int, promises: list[CreditCo
                 ~exists().where(CreditPaymentReversal.payment_id == pay.id),
             ),
         )
-        .where(p.tenant_id == tenant_id, p.id.in_([x.id for x in promises]))
+        .where(p.tenant_id == tenant_id, p.id == any_(bindparam("promise_ids", promise_ids, type_=ARRAY(Integer))))
         .group_by(p.id)
     )
     return {pid: Decimal(total) for pid, total in db.execute(stmt)}
@@ -148,8 +153,22 @@ def _view(row: CreditCollectionPromise, paid: Decimal, today: date) -> dict:
 
 def _views(db: Session, loan: CreditLoan, rows: list[CreditCollectionPromise]) -> list[dict]:
     today = ledger.business_date(db, loan, now_utc())
-    paid = qualifying_paid_amounts(db, loan.tenant_id, rows)
+    paid = qualifying_paid_amounts(db, loan.tenant_id, [r.id for r in rows])
     return [_view(r, paid.get(r.id, ZERO), today) for r in rows]
+
+
+def mini_view(row, paid: Decimal, business_date: date) -> dict:
+    """The worklist mini-view of a promise (T-016): one definition for the page enrichment and for the T-017 filter stage. ``row``
+    only needs ``id, promised_amount, currency_code, promise_date, created_at, closed_kind``."""
+    return {
+        "promise_id": row.id,
+        "promised_amount": _amt(row.promised_amount),
+        "currency_code": row.currency_code,
+        "promise_date": row.promise_date,
+        "projected_status": projected_status(row, paid, business_date),
+        "qualifying_paid_amount": _amt(paid),
+        "created_at": row.created_at,
+    }
 
 
 def current_mini_views(db: Session, tenant_id: int, business_date_by_loan: dict[int, date]) -> dict[int, dict]:
@@ -167,19 +186,60 @@ def current_mini_views(db: Session, tenant_id: int, business_date_by_loan: dict[
             )
         )
     )
-    paid = qualifying_paid_amounts(db, tenant_id, rows)
-    return {
-        r.loan_id: {
-            "promise_id": r.id,
-            "promised_amount": _amt(r.promised_amount),
-            "currency_code": r.currency_code,
-            "promise_date": r.promise_date,
-            "projected_status": projected_status(r, paid.get(r.id, ZERO), business_date_by_loan[r.loan_id]),
-            "qualifying_paid_amount": _amt(paid.get(r.id, ZERO)),
-            "created_at": r.created_at,
-        }
-        for r in rows
-    }
+    paid = qualifying_paid_amounts(db, tenant_id, [r.id for r in rows])
+    return {r.loan_id: mini_view(r, paid.get(r.id, ZERO), business_date_by_loan[r.loan_id]) for r in rows}
+
+
+# --- T-017: the worklist ``promise_status`` filter (membership; decided BEFORE the ledger, the sort and the page) ----------
+PROMISE_STATUSES = ("open", "fulfilled", "broken", "none")
+
+
+def restrict_candidates(stmt, tenant_id: int, loan_id_column, status: str, utc_date: date):
+    """SQL stage of the filter over the worklist's candidate query. ``none`` = no promise that is not closed (history of closed
+    promises never counts). The others join the CURRENT promise (the partial UNIQUE guarantees at most one per loan, so the join
+    never multiplies rows) and add its columns. For ``broken`` / ``open`` a date SUPERSET prefilter only REDUCES: a loan's
+    business date is at most one day ahead of / behind the UTC date in any timezone, so ``broken`` (today > promise date) needs
+    ``promise_date <= UTC date`` and ``open`` (today <= promise date) needs ``promise_date >= UTC date - 1``. It never decides the
+    status: the exact projection below does."""
+    p = CreditCollectionPromise
+    current = and_(p.tenant_id == tenant_id, p.loan_id == loan_id_column, p.closed_at.is_(None))
+    if status == "none":
+        return stmt.where(~exists().where(current))
+    stmt = stmt.add_columns(
+        p.id.label("promise_id"),
+        p.promised_amount.label("promise_amount"),
+        p.promise_date.label("promise_date"),
+        p.created_at.label("promise_created_at"),
+        p.currency_code.label("promise_currency"),
+    ).join(p, current)
+    if status == "broken":
+        stmt = stmt.where(p.promise_date <= utc_date)
+    elif status == "open":
+        stmt = stmt.where(p.promise_date >= utc_date - timedelta(days=1))
+    return stmt
+
+
+def filter_candidates(db: Session, tenant_id: int, candidates: list, status: str, now) -> tuple[list, dict[int, dict]]:
+    """Exact stage: the candidates that came out of ``restrict_candidates`` (rows with ``id``, ``tz`` and the ``promise_*``
+    columns) are projected with the ONE shared definition (``qualifying_paid_amounts`` + ``projected_status``, in each loan's own
+    business date) and only those whose status equals ``status`` survive. Returns the survivors and their mini-views by loan id,
+    which the worklist reuses as ``current_promise`` so the filter and the row can never disagree. One aggregation query."""
+    paid = qualifying_paid_amounts(db, tenant_id, [c.promise_id for c in candidates])
+    survivors, views = [], {}
+    for c in candidates:
+        row = SimpleNamespace(
+            id=c.promise_id,
+            promised_amount=c.promise_amount,
+            currency_code=c.promise_currency,
+            promise_date=c.promise_date,
+            created_at=c.promise_created_at,
+            closed_kind=None,  # these are current promises: never closed
+        )
+        view = mini_view(row, paid.get(c.promise_id, ZERO), ledger.business_date_in(c.tz, now))
+        if view["projected_status"] == status:
+            survivors.append(c)
+            views[c.id] = view
+    return survivors, views
 
 
 def _current(db: Session, tenant_id: int, loan_id: int, *, lock: bool) -> CreditCollectionPromise | None:
