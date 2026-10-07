@@ -23,6 +23,7 @@ from app.models.branch import Branch
 from app.modules.cash import port as cash_port
 from app.modules.credit.rules import canonical_json, parse_rules
 from app.modules.customers.service import visible_branch_ids
+from app.modules.field_custody.receipts import create_receipt
 from app.modules.identity.audit import record_event
 from app.modules.identity.authorization import Principal, require
 from app.modules.identity.errors import PermissionDenied, TenantMismatch
@@ -42,6 +43,7 @@ from app.modules.origination.models import CreditFormalization
 from app.modules.origination.service import _amt, _next_number, verify_formalization_contract
 
 CREATE, READ = "payments.create", "payments.read"
+FIELD_CUSTODY_RENDER = "cash.field_custody.render"  # T-019: a field collector becomes the cash custodian
 PAYABLE_STATUSES = ("active", "past_due")
 RECEIPT_KIND = "credit_payment_receipt"  # NOT 'counter_payment': the legacy cash reversal must never see it
 
@@ -146,6 +148,8 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
     if branch is None or branch.company_id != actor.tenant_id:
         raise TenantMismatch()  # another tenant's branch is a 404
     require(actor, CREATE, tenant_id=actor.tenant_id, branch_id=body.receiving_branch_id)
+    if body.origin == "field":  # T-019: whoever collects in the field holds the cash and must be able to hand it in
+        require(actor, FIELD_CUSTODY_RENDER, tenant_id=actor.tenant_id, branch_id=body.receiving_branch_id)
     try:
         amount = Decimal(body.amount)
     except InvalidOperation:
@@ -252,6 +256,8 @@ def pay(db: Session, actor: Principal, loan_id: int, body: PaymentIn, client_ip:
         db.flush()
         _project(db, loan, obligations, business_date)
         db.flush()
+        if payment.origin == "field":  # T-019: physical custody is born with the payment, same transaction
+            create_receipt(db, payment)
     except IntegrityError as exc:
         db.rollback()
         text_ = str(exc.orig)

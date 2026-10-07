@@ -144,6 +144,14 @@ def disable_user(db: Session, actor: Principal, user_id: int, client_ip: str | N
         raise SelfEscalationDenied("No puedes desactivar tu propia cuenta.")
     require_state(user, ("pending", "active", "locked"))
     _within_actor_authority(db, actor, user)
+    # T-019: the user row is locked FIRST (a field payment / declaration takes it FOR SHARE), then the custody check:
+    # a custodian of field cash cannot be disabled, and custody is never silently transferred.
+    db.execute(select(UserAccount.id).where(UserAccount.id == user.id).with_for_update())
+    from app.modules.field_custody.errors import OutstandingFieldCustody  # late: custody depends on identity
+    from app.modules.field_custody.service import has_open_custody
+
+    if has_open_custody(db, actor.tenant_id, user.id):
+        raise OutstandingFieldCustody()
     now = now_utc()
     user.status = "disabled"
     user.disabled_at = now

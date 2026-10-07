@@ -104,6 +104,23 @@ CATALOG: tuple[PermissionDef, ...] = (
         True,
     ),
     PermissionDef("payments.create", "tenant", "Registrar pagos de prestamos (cobro en ventanilla o campo)", True),
+    PermissionDef(
+        "cash.field_custody.read",
+        "tenant",
+        "Consultar la custodia de efectivo de campo y sus rendiciones (solo lectura)",
+    ),
+    PermissionDef(
+        "cash.field_custody.render",
+        "tenant",
+        "Cobrar en campo como custodio del efectivo y declarar o cancelar su rendicion",
+        True,
+    ),
+    PermissionDef(
+        "cash.field_custody.accept",
+        "tenant",
+        "Aceptar o rechazar rendiciones de efectivo de campo en la propia jornada de caja",
+        True,
+    ),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

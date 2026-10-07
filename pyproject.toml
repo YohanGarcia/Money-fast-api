@@ -77,6 +77,7 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 "tests/test_t006_origination.py" = ["E501", "E731"]  # inline SQL literals, small test lambdas
 "app/modules/origination/models.py" = ["E501"]  # long inline SQL (immutability trigger functions)
 "app/modules/loans/*.py" = ["E501"]  # long inline SQL and messages
+"app/modules/field_custody/*.py" = ["E501"]  # long inline SQL (guard and consistency trigger functions)
 "app/modules/cash/port.py" = ["E501"]  # long BLOCKED_BY_EVIDENCE message
 "tests/test_t007_disbursement.py" = ["E501", "E731"]  # inline SQL literals
 "tests/test_t008_payments.py" = ["E501", "E731"]  # inline SQL literals

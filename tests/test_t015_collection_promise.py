@@ -955,9 +955,8 @@ def test_migration_0017_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
     assert _alembic(scratch_db, "upgrade", "0016").returncode == 0
     eng = create_engine(scratch_db)
     try:
-        up = _alembic(scratch_db, "upgrade", "head")
+        up = _alembic(scratch_db, "upgrade", "0017")  # this revision itself (0018 = T-019 comes after)
         assert up.returncode == 0, up.stderr
-        assert _alembic(scratch_db, "check").returncode == 0
         with eng.connect() as c:
             assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0017"
             assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'collections.promises.create'")).scalar() == 1
@@ -978,7 +977,7 @@ def test_migration_0017_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
             assert c.execute(text("SELECT count(*) FROM pg_proc WHERE proname LIKE 'credit_collection_promises%'")).scalar() == 0
         again = _alembic(scratch_db, "upgrade", "head")
         assert again.returncode == 0, again.stderr
-        assert _alembic(scratch_db, "check").returncode == 0
+        assert _alembic(scratch_db, "check").returncode == 0  # the models match the full chain
     finally:
         eng.dispose()
 
@@ -986,7 +985,7 @@ def test_migration_0017_empty_downgrade_reupgrade_and_alembic_check(scratch_db):
 def test_downgrade_0017_is_refused_before_any_ddl_when_promise_history_exists(scratch_db):
     from sqlalchemy import create_engine
 
-    assert _alembic(scratch_db, "upgrade", "head").returncode == 0
+    assert _alembic(scratch_db, "upgrade", "0017").returncode == 0
     eng = create_engine(scratch_db)
     try:
         _seed(eng)

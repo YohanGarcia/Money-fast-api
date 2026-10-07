@@ -53,8 +53,10 @@ session** (a field reversal stops before Cash; every future debt-changing packag
   `cash_port.withdraw(kind=credit_payment_reversal, reverses_id=<original receipt>, reference=REV-…)` → reversal row →
   mirror applications → projection → audit → one commit. Never the legacy kind `reversal`, never the legacy reversal.
 * **Field**: loan → obligations → payment → reversal row → mirror applications → projection → audit. No Cash movement, no
-  session. The physical return of the money by the collector is outside the current Cash Runtime (no rendition exists);
-  future custody/rendition calculations must use field payments **net of reversals**.
+  session. ~~Future custody/rendition calculations must use field payments net of reversals.~~ This note is
+  **superseded by T-019**: a debt reversal is not a physical refund, so it NEVER changes field custody. The receipt stays
+  outstanding with its custodian (or, once rendered, the cash stays in the session); returning money to the customer is a
+  separate future package. The T-009 runtime is unchanged.
 
 ## Cash session rules (D1, D2)
 

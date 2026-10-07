@@ -274,6 +274,10 @@ def update_user(
     if payload.branch_id != user.branch_id or payload.role != user.role or not payload.is_active:
         db.execute(update(User).where(User.id == user.id).values(full_name=User.full_name))
         if user_has_pending(db, user): raise HTTPException(409, 'Resuelve los saldos, transferencias y entregas pendientes antes de cambiar este usuario.')
+        if not payload.is_active and user.is_active:  # T-019: modern field custody (additive to the legacy check)
+            from app.modules.field_custody.errors import OutstandingFieldCustody
+            from app.modules.field_custody.service import has_open_custody
+            if has_open_custody(db, company_id, user.id): raise HTTPException(409, OutstandingFieldCustody.default_message)
     user.full_name = payload.full_name.strip()
     user.email = payload.email.lower()
     previous_status = user.status

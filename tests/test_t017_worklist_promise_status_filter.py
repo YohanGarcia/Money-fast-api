@@ -515,7 +515,7 @@ def test_the_parameter_is_one_exact_enum_value_and_adds_no_other_surface(client,
     }
     assert worklist_service.SORTS == ("days_overdue", "overdue_outstanding", "oldest_overdue_date")
     versions = sorted(p.name for p in (ROOT / "alembic/versions").glob("0*.py"))
-    assert versions[-1].startswith("0017_") and not [v for v in versions if v.startswith("0018")]
+    assert versions[-1].startswith("0018_") and not [v for v in versions if v.startswith("0019")]  # 0018 = T-019
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
     assert "collections.promise_status" not in catalog and catalog.count("collections.promises.create") == 1
     src = (ROOT / "app/modules/loans/worklist.py").read_text(encoding="utf-8")
@@ -589,4 +589,4 @@ def test_the_alembic_schema_is_unchanged_by_t017(scratch_db):
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0017" in _alembic(scratch_db, "heads").stdout
+    assert "0018" in _alembic(scratch_db, "heads").stdout  # T-019 added 0018

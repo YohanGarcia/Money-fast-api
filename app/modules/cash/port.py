@@ -166,6 +166,47 @@ def withdraw(
     )
 
 
+FIELD_RENDITION_KIND = (
+    "credit_field_rendition"  # T-019; NOT 'delivery' (legacy): the legacy cash reversal never sees it
+)
+
+
+def deposit_field_rendition(
+    db: Session,
+    *,
+    tenant_id: int,
+    branch_id: int,
+    session_id: int,
+    amount: Decimal,
+    currency: str,
+    cashier_user_id: int,
+    reference: str,
+    notes: str,
+) -> CashWithdrawal:
+    """Cash IN of an accepted field rendition (T-019): the collector's physical cash enters the drawer of the cashier who
+    counted it. The session is explicit, must be open, belong to the branch's box AND to ``cashier_user_id``; the kind is
+    fixed. Locks box then session (port order). Never commits."""
+    box, session = _open_custody(
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        session_id=session_id,
+        amount=amount,
+        currency=currency,
+        cashier_id=cashier_user_id,
+    )
+    return _record(
+        db,
+        box,
+        session,
+        signed=amount,
+        actor_user_id=cashier_user_id,
+        kind=FIELD_RENDITION_KIND,
+        reference=reference,
+        notes=notes,
+    )
+
+
 def deposit(
     db: Session,
     *,

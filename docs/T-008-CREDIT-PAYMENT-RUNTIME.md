@@ -38,7 +38,7 @@ is `contractual due − sum(applications)` (`ledger.py`, `allocation.py`). `obli
 |---|---|---|
 | cash | `cash/port.py::deposit` into an open session of the receiving branch's box (kind `credit_payment_receipt`) | none |
 | confirmation | immediate | immediate (DR-002) |
-| custody | cash session | stays with the collector (the future cash package derives it: field payments minus rendition) |
+| custody | cash session | stays with the collector: since T-019 an immutable custody receipt is born with the payment and leaves custody only through an accepted rendition (reversals do not change it) |
 
 `credit_payment_receipt` is deliberately not `counter_payment`: the legacy cash reversal accepts `counter_payment` and would
 reverse only the cash, leaving the debt applied. A test calls the legacy reversal on the new movement and it is refused.

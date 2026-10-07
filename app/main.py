@@ -11,6 +11,7 @@ from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.modules.credit.api import router as credit_router
 from app.modules.customers.api import router as customers_router
+from app.modules.field_custody.api import router as field_custody_router
 from app.modules.identity.api import router as identity_router
 from app.modules.loans.api import router as loans_router
 from app.modules.organization.api import router as organization_router
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     application.include_router(origination_policy_router)
     application.include_router(origination_limit_router)
     application.include_router(loans_router)
+    application.include_router(field_custody_router)
 
     @application.get("/")
     def root() -> dict[str, str]:

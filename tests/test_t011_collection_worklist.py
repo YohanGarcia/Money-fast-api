@@ -581,7 +581,10 @@ def test_the_worklist_code_has_no_legacy_assignment_score_scheduler_or_new_depen
             "credit_collection_assignments",
             "credit_collection_activities",
             "credit_collection_promises",
-        )  # the T-012 / T-014 / T-015 history tables: they arrive later, not part of T-011
+            "credit_field_custody_receipts",
+            "credit_field_renditions",
+            "credit_field_rendition_items",
+        )  # the T-012 / T-014 / T-015 history tables and T-019 custody: they arrive later, not part of T-011
         and (
             any(x in n for x in ("bucket", "score", "rendition", "promise", "collection"))
             or (n.startswith(("credit_", "collector")) and any(x in n for x in ("assign", "custody", "activity")))
