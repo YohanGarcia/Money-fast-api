@@ -505,6 +505,7 @@ def test_the_parameter_is_one_exact_enum_value_and_adds_no_other_surface(client,
         "assignment",
         "assignee_id",
         "promise_status",
+        "activity",  # T-018: activity existence filter
         "sort",
         "order",
         "limit",
@@ -518,7 +519,7 @@ def test_the_parameter_is_one_exact_enum_value_and_adds_no_other_surface(client,
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
     assert "collections.promise_status" not in catalog and catalog.count("collections.promises.create") == 1
     src = (ROOT / "app/modules/loans/worklist.py").read_text(encoding="utf-8")
-    assert "has_activity" not in src and "no_activity" not in src and "activity_type" not in src  # no Activity filter
+    assert "activity_type" not in src  # T-018 adds only an existence filter, never an Activity type filter
     for formula in ("received_at", "promised_amount", "closed_kind", "is_broken", "broken_at", "fulfilled_at"):
         assert formula not in src, formula  # the T-015 rule lives only in promises.py; nothing persisted
 

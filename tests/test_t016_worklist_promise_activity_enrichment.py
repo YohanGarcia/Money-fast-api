@@ -476,6 +476,7 @@ def test_the_enriched_worklist_is_read_only_pii_free_and_adds_no_parameter_sort_
         "assignment",
         "assignee_id",
         "promise_status",  # T-017: the only parameter added after T-016
+        "activity",  # T-018: activity existence filter
         "sort",
         "order",
         "limit",

@@ -17,7 +17,7 @@ import base64
 import hashlib
 import json
 
-from sqlalchemy import Integer, column, select, true, values
+from sqlalchemy import Integer, column, exists, select, true, values
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -131,6 +131,16 @@ def latest_by_loan(db: Session, tenant_id: int, loan_ids: list[int]) -> dict[int
         r.loan_id: {"activity_id": r.id, "activity_type": r.activity_type, "created_at": r.created_at}
         for r in db.execute(stmt)
     }
+
+
+def restrict_candidates(stmt, tenant_id: int, loan_id_column, activity: str):
+    """T-018 worklist membership: ``has_activity`` = at least one activity of the loan ever, ``no_activity`` = none. Exact
+    ``EXISTS`` / ``NOT EXISTS`` correlated on tenant + loan only: type, recorder, date, count and the snapshots
+    (``assignment_id``, ``managing_branch_id``) never matter. One index probe on ``(tenant_id, loan_id, id)`` per loan at most,
+    never a sort of the history. Pure read."""
+    a = CreditCollectionActivity
+    any_activity = exists().where(a.tenant_id == tenant_id, a.loan_id == loan_id_column)
+    return stmt.where(any_activity if activity == "has_activity" else ~any_activity)
 
 
 # --- reads (collections.read, same boundary as the worklist and the assignment reads; pure) ------------------

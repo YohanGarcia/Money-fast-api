@@ -22,6 +22,11 @@
   the last payments of the PAGE only (plus one for the page's assignments); never one query per loan. Sorting/keyset paging
   happen over the derived rows, so the cost grows with the number of candidate loans (those with an obligation due on or
   before today), not with the page. The assignment filter shrinks the candidates BEFORE the ledger is read.
+* Activity existence (T-018): ``has_activity`` / ``no_activity`` = at least one / no T-014 activity of the loan, ever (any type,
+  recorder, date or assignment snapshot). Exact ``EXISTS`` / ``NOT EXISTS`` in the candidate SQL, so it is decided before the
+  promise stage, the ledger and the page. A ``no_activity`` page shows ``last_collection_activity`` null from that membership
+  (no second lookup that a concurrent insert could contradict); ``has_activity`` keeps the T-016 page lookup (append-only:
+  existence never goes back to false).
 """
 
 import base64
@@ -58,6 +63,7 @@ Sort = Literal["days_overdue", "overdue_outstanding", "oldest_overdue_date"]
 Order = Literal["asc", "desc"]
 AssignmentFilter = Literal["mine", "unassigned", "assigned"]
 PromiseStatus = Literal["open", "fulfilled", "broken", "none"]
+ActivityFilter = Literal["has_activity", "no_activity"]
 _TZ_PATH = "{product,snapshot,rules,calendar,timezone}"
 
 
@@ -73,13 +79,22 @@ def resolve_assignment(actor: Principal, assignment: str | None, assignee_id: in
     return assignment or "none"
 
 
-def fingerprint(branch_id, min_days_overdue, currency, assignment: str, promise_status: str | None = None) -> str:
+def fingerprint(
+    branch_id,
+    min_days_overdue,
+    currency,
+    assignment: str,
+    promise_status: str | None = None,
+    activity: str | None = None,
+) -> str:
     """Deterministic (SHA-256 of canonical JSON, never ``hash()``) digest of every filter that changes the membership.
     Not a security mechanism; limit is not part of it."""
     parts = {"b": branch_id, "m": min_days_overdue, "c": currency, "a": assignment}
     # T-017: only a requested filter enters, so every cursor issued without it stays valid
     if promise_status is not None:
         parts["p"] = promise_status
+    if activity is not None:  # T-018: same rule, so every cursor issued without it stays valid
+        parts["ae"] = activity
     canon = json.dumps(parts, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
@@ -118,6 +133,7 @@ def _candidates(
     now: datetime,
     assignment: str = "none",
     promise_status: str | None = None,
+    activity: str | None = None,
 ):
     """Loans of the tenant that may have overdue debt, with their FROZEN contract timezone. Cheap pre-filter only (an
     obligation due on or before today's UTC date: the local date is at most one day ahead of UTC); the exact overdue
@@ -160,6 +176,8 @@ def _candidates(
             open_row.append(CreditCollectionAssignment.assignee_user_id == int(assignment.split(":")[1]))
         has_open = exists().where(*open_row)
         stmt = stmt.where(~has_open if assignment == "unassigned" else has_open)
+    if activity is not None:  # T-018: historical existence of ANY activity of the loan (shared T-014 helper)
+        stmt = activities.restrict_candidates(stmt, actor.tenant_id, CreditLoan.id, activity)
     if promise_status is not None:  # T-017: membership, decided here and in the exact stage, before the ledger
         stmt = promises.restrict_candidates(stmt, actor.tenant_id, CreditLoan.id, promise_status, now.date())
     return db.execute(stmt).all()
@@ -252,6 +270,7 @@ def overdue_loans(
     assignment: str | None = None,
     assignee_id: int | None = None,
     promise_status: str | None = None,
+    activity: str | None = None,
 ) -> dict:
     _gate_tenant(actor)
     scope = visible_branch_ids(actor, READ)  # None = tenant scope; raises 403 without any collections.read grant
@@ -262,16 +281,16 @@ def overdue_loans(
         if not actor.allows(READ, tenant_id=actor.tenant_id, branch_id=branch_id):
             raise PermissionDenied()  # the filter can narrow the actor's scope, never widen it
     canon = resolve_assignment(actor, assignment, assignee_id)
-    fp = fingerprint(branch_id, min_days_overdue, currency, canon, promise_status)
+    fp = fingerprint(branch_id, min_days_overdue, currency, canon, promise_status, activity)
     after = decode_cursor(cursor, sort, order, fp) if cursor else None
     now = now_utc()
-    cands = _candidates(db, actor, scope, branch_id, currency, now, canon, promise_status)
+    cands = _candidates(db, actor, scope, branch_id, currency, now, canon, promise_status, activity)
     promise_view: dict[int, dict] | None = None  # None: the page enrichment (T-016) looks the promises up itself
     if promise_status == "none":
         promise_view = {}  # no current promise by definition: nothing to look up, ``current_promise`` is null
     elif promise_status is not None:  # exact projection of the surviving rows; reused below for ``current_promise``
         cands, promise_view = promises.filter_candidates(db, actor.tenant_id, cands, promise_status, now)
-    views = ledger.views_many(db, [c.id for c in cands])  # only the loans that passed the promise filter
+    views = ledger.views_many(db, [c.id for c in cands])  # only the loans that passed the activity / promise filters
     rows: list[dict] = []
     for c in cands:
         bd = ledger.business_date_in(c.tz, now)  # THIS loan's frozen timezone
@@ -310,7 +329,10 @@ def overdue_loans(
         promise_view = promises.current_mini_views(
             db, actor.tenant_id, {i: ledger.business_date_in(tz_by_loan[i], now) for i in page_ids}
         )
-    activity_view = activities.latest_by_loan(db, actor.tenant_id, page_ids)
+    if activity == "no_activity":
+        activity_view = {}  # the membership proved there is none: null, never a second lookup that could contradict it
+    else:
+        activity_view = activities.latest_by_loan(db, actor.tenant_id, page_ids)
     items = [
         {
             **r,
