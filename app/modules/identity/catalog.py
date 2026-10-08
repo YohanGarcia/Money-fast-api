@@ -121,6 +121,12 @@ CATALOG: tuple[PermissionDef, ...] = (
         "Aceptar o rechazar rendiciones de efectivo de campo en la propia jornada de caja",
         True,
     ),
+    PermissionDef(
+        "cash.field_custody.refund",
+        "tenant",
+        "Devolver al cliente el efectivo de un pago de campo revertido (custodio o jornada propia)",
+        True,
+    ),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

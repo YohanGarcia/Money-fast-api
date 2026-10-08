@@ -105,6 +105,7 @@ from app.modules.loans.models import (  # noqa: F401
 
 from app.modules.field_custody.models import (  # noqa: F401
     CreditFieldCustodyReceipt,
+    CreditFieldRefund,
     CreditFieldRendition,
     CreditFieldRenditionItem,
 )

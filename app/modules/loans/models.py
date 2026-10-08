@@ -530,6 +530,18 @@ class CreditPaymentReversal(Base):
         UniqueConstraint(
             "tenant_id", "id", "payment_id", "loan_id", name="uq_credit_payment_reversals_tenant_id_payment"
         ),
+        # T-020: target of the field refund FK (a refund repeats the reversal's payment, amount, origin, currency, branch)
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "payment_id",
+            "loan_id",
+            "amount",
+            "origin",
+            "currency_code",
+            "reversal_branch_id",
+            name="uq_credit_payment_reversals_refund_target",
+        ),
         Index("ix_credit_payment_reversals_loan", "loan_id"),
     )
 

@@ -60,3 +60,50 @@ class OutstandingFieldCustody(AppError):
     default_message = (
         "El usuario tiene efectivo de campo en custodia o una rendicion declarada: resuelvelo antes de desactivarlo."
     )
+
+
+# --- T-020 field refund ---
+class ReversalNotFound(AppError):
+    status_code, code = 404, "reversal_not_found"
+    default_message = "Reversion no encontrada."
+
+
+class FieldRefundNotApplicable(AppError):
+    status_code, code = 409, "field_refund_not_applicable"
+    default_message = (
+        "La reversion de un pago de ventanilla ya devolvio el efectivo de la caja: no hay reembolso de campo."
+    )
+
+
+class PreCustodyNotRefundable(AppError):
+    status_code, code = 409, "pre_custody_not_refundable"
+    default_message = (
+        "El pago de campo es anterior a la custodia (T-019): no se sabe donde esta el efectivo; no se reembolsa."
+    )
+
+
+class AlreadyRefunded(AppError):
+    status_code, code = 409, "already_refunded"
+    default_message = "Esta reversion ya tiene su reembolso fisico."
+
+
+class ReceiptInDeclaredRendition(AppError):
+    status_code, code = 409, "receipt_in_declared_rendition"
+    default_message = "El pago esta en una rendicion declarada: cancelala o rechazala antes de reembolsar."
+
+
+class RefundSessionRequired(AppError):
+    status_code, code = 422, "refund_session_required"
+    default_message = "El efectivo ya esta en la caja: indica cash_session_id (tu jornada abierta actual)."
+
+
+class RefundSessionNotApplicable(AppError):
+    status_code, code = 422, "refund_session_not_applicable"
+    default_message = (
+        "El efectivo sigue con el cobrador: el reembolso directo no usa jornada de caja (no envies cash_session_id)."
+    )
+
+
+class ReceiptRefunded(AppError):
+    status_code, code = 409, "receipt_refunded"
+    default_message = "Uno o mas pagos ya fueron reembolsados por su cobrador: salieron de la custodia y no se rinden."

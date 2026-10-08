@@ -551,8 +551,10 @@ def test_no_legacy_dual_write_no_direct_session_write_no_new_sort_or_side_effect
     pkg = ROOT / "app/modules/field_custody"
     src = "\n".join(p.read_text(encoding="utf-8") for p in pkg.glob("*.py"))
     for banned in ("CashAllocation", "CashDelivery", "cash_service", "app.models.payment", "app.models.loan ", "session.balance",
-                   "CreditPaymentApplication", "CreditPaymentReversal", "CreditLoanObligation", "record_cash", "outbox", "accounting"):
+                   "CreditPaymentApplication", "CreditLoanObligation", "record_cash", "outbox", "accounting"):
         assert banned not in src, banned
+    # T-020 READS the reversal a refund is linked to; custody never creates or changes one
+    assert "CreditPaymentReversal(" not in src and "update(CreditPaymentReversal" not in src
     assert "deposit_field_rendition(" in src and "UPDATE cash_sessions" not in src
     assert custody_service.cash_port.FIELD_RENDITION_KIND == KIND
     legacy = (ROOT / "app/services/cash_service.py").read_text(encoding="utf-8")
@@ -564,7 +566,7 @@ def test_no_legacy_dual_write_no_direct_session_write_no_new_sort_or_side_effect
 def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scratch_db):
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0018" in _alembic(scratch_db, "heads").stdout
+    assert "0019" in _alembic(scratch_db, "heads").stdout  # T-020 added 0019 on top of 0018
     assert _alembic(scratch_db, "downgrade", "0017").returncode == 0  # empty: clean
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     from sqlalchemy import create_engine
@@ -580,10 +582,11 @@ def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
     assert out.returncode != 0 and "Cannot downgrade 0018" in out.stderr
     eng = create_engine(scratch_db)
     with eng.connect() as c:  # nothing dropped, nothing erased
-        assert c.execute(text("SELECT count(*) FROM permissions WHERE code LIKE 'cash.field_custody.%'")).scalar() == 3
+        assert c.execute(text("SELECT count(*) FROM permissions WHERE code IN ('cash.field_custody.read', "
+                              "'cash.field_custody.render', 'cash.field_custody.accept')")).scalar() == 3
         assert c.execute(text("SELECT count(*) FROM credit_field_renditions")).scalar() == 1
-        assert c.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_credit_field%'")).scalar() == 8
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0018"
+        assert c.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_credit_field%' AND tgname NOT LIKE 'trg_credit_field_refunds%'")).scalar() == 8
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0019"  # the refused chain rolls back
     eng.dispose()
 
 

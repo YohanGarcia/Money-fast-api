@@ -260,6 +260,110 @@ class CreditFieldRenditionItem(Base):
     released: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+REFUND_SOURCES = ("collector", "branch_cash")
+REFUND_MOVEMENT_KIND = "credit_field_refund"
+
+
+class CreditFieldRefund(Base):
+    """T-020: the PHYSICAL return to the customer of a reversed FIELD payment (1:1 with its reversal, full amount).
+    ``collector``: the custodian hands the cash back directly (no Cash movement); it is the receipt's terminal exit from
+    collector custody, exclusive with an accepted rendition. ``branch_cash``: the cash was already accepted into a session;
+    ONE negative Cash movement ``credit_field_refund`` leaves the refunding cashier's current session. Append-only; the
+    payment, reversal, receipt, rendition and items are never touched."""
+
+    __tablename__ = "credit_field_refunds"
+    __table_args__ = (
+        CheckConstraint(f"currency_code = '{CUSTODY_CURRENCY}'", name="currency_dop"),
+        CheckConstraint(CENT_EXACT.format(c="amount"), name="amount_cent_exact"),
+        CheckConstraint("origin = 'field'", name="origin_field"),  # with the composite FK: only a FIELD reversal
+        CheckConstraint("source_kind IN ('collector', 'branch_cash')", name="source_kind_valid"),
+        CheckConstraint(
+            "((source_kind = 'branch_cash') = (cash_session_id IS NOT NULL)) "
+            "AND ((source_kind = 'branch_cash') = (cash_movement_id IS NOT NULL))",
+            name="cash_matches_source",
+        ),
+        CheckConstraint("source_kind <> 'collector' OR refunded_by = custodian_user_id", name="collector_refunds_own"),
+        CheckConstraint("char_length(btrim(reason)) BETWEEN 3 AND 500", name="reason_length"),
+        # the exact reversal: same tenant, payment, loan, FULL amount, field origin, currency and branch
+        ForeignKeyConstraint(
+            [
+                "tenant_id",
+                "reversal_id",
+                "payment_id",
+                "loan_id",
+                "amount",
+                "origin",
+                "currency_code",
+                "receiving_branch_id",
+            ],
+            [
+                "credit_payment_reversals.tenant_id",
+                "credit_payment_reversals.id",
+                "credit_payment_reversals.payment_id",
+                "credit_payment_reversals.loan_id",
+                "credit_payment_reversals.amount",
+                "credit_payment_reversals.origin",
+                "credit_payment_reversals.currency_code",
+                "credit_payment_reversals.reversal_branch_id",
+            ],
+            name="fk_credit_field_refunds_reversal",
+        ),
+        # the exact custody receipt of that payment: same branch, custodian, currency and FULL amount
+        ForeignKeyConstraint(
+            [
+                "tenant_id",
+                "receipt_id",
+                "payment_id",
+                "receiving_branch_id",
+                "custodian_user_id",
+                "currency_code",
+                "amount",
+            ],
+            [
+                "credit_field_custody_receipts.tenant_id",
+                "credit_field_custody_receipts.id",
+                "credit_field_custody_receipts.payment_id",
+                "credit_field_custody_receipts.receiving_branch_id",
+                "credit_field_custody_receipts.custodian_user_id",
+                "credit_field_custody_receipts.currency_code",
+                "credit_field_custody_receipts.amount",
+            ],
+            name="fk_credit_field_refunds_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "refunded_by"], ["users.company_id", "users.id"], name="fk_credit_field_refunds_actor"
+        ),
+        UniqueConstraint("reversal_id", name="uq_credit_field_refunds_reversal"),
+        UniqueConstraint("payment_id", name="uq_credit_field_refunds_payment"),
+        UniqueConstraint("receipt_id", name="uq_credit_field_refunds_receipt"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_credit_field_refunds_tenant_key"),
+        UniqueConstraint("tenant_id", "refund_number", name="uq_credit_field_refunds_tenant_number"),
+        UniqueConstraint("cash_movement_id", name="uq_credit_field_refunds_cash_movement"),
+        Index("ix_credit_field_refunds_branch", "tenant_id", "receiving_branch_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("companies.id"))
+    refund_number: Mapped[str] = mapped_column(String(20))  # RFD-000001: technical reference, NOT a fiscal document
+    payment_id: Mapped[int] = mapped_column(Integer)
+    reversal_id: Mapped[int] = mapped_column(Integer)
+    receipt_id: Mapped[int] = mapped_column(Integer)
+    loan_id: Mapped[int] = mapped_column(Integer)
+    receiving_branch_id: Mapped[int] = mapped_column(Integer)
+    origin: Mapped[str] = mapped_column(String(10), default="field")
+    currency_code: Mapped[str] = mapped_column(String(3))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    source_kind: Mapped[str] = mapped_column(String(12))
+    custodian_user_id: Mapped[int] = mapped_column(Integer)
+    refunded_by: Mapped[int] = mapped_column(Integer)
+    cash_session_id: Mapped[int | None] = mapped_column(ForeignKey("cash_sessions.id"), nullable=True)
+    cash_movement_id: Mapped[int | None] = mapped_column(ForeignKey("cash_movements.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(String(500))
+    refunded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
+
+
 # =============================== database guards ===============================
 RECEIPT_INSERT_FN = """
 CREATE OR REPLACE FUNCTION credit_field_custody_receipts_insert_check() RETURNS trigger AS $$
@@ -329,6 +433,9 @@ BEGIN
   IF (SELECT state FROM credit_field_renditions WHERE id = NEW.rendition_id) IS DISTINCT FROM 'declared' THEN
     RAISE EXCEPTION 'items can only be added to a declared field rendition';
   END IF;
+  IF EXISTS (SELECT 1 FROM credit_field_refunds WHERE receipt_id = NEW.receipt_id AND source_kind = 'collector') THEN
+    RAISE EXCEPTION 'receipt % was refunded by its collector: it left custody and can never be rendered', NEW.receipt_id;
+  END IF;
   RETURN NEW;
 END $$ LANGUAGE plpgsql
 """
@@ -382,6 +489,46 @@ BEGIN
   RETURN NULL;
 END $$ LANGUAGE plpgsql
 """
+REFUND_INSERT_FN = """
+CREATE OR REPLACE FUNCTION credit_field_refunds_insert_check() RETURNS trigger AS $$
+DECLARE v_state text;
+BEGIN
+  SELECT f.state INTO v_state FROM credit_field_rendition_items i JOIN credit_field_renditions f ON f.id = i.rendition_id
+   WHERE i.receipt_id = NEW.receipt_id AND NOT i.released;
+  IF v_state = 'declared' THEN
+    RAISE EXCEPTION 'receipt % is in a declared rendition: cancel or reject it before refunding', NEW.receipt_id;
+  END IF;
+  IF NEW.source_kind = 'collector' AND v_state IS NOT NULL THEN
+    RAISE EXCEPTION 'receipt % already left collector custody through an accepted rendition', NEW.receipt_id;
+  END IF;
+  IF NEW.source_kind = 'branch_cash' AND v_state IS DISTINCT FROM 'accepted' THEN
+    RAISE EXCEPTION 'a branch cash refund needs the receipt accepted into branch cash (receipt %)', NEW.receipt_id;
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql
+"""
+REFUND_GUARD_FN = """
+CREATE OR REPLACE FUNCTION credit_field_refunds_guard() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'field refund % is immutable history: it cannot be %', OLD.id, lower(TG_OP);
+END $$ LANGUAGE plpgsql
+"""
+# Checked at COMMIT (deferred): a branch cash refund is backed by exactly its negative movement (no reverses_id: one
+# accepted rendition movement may aggregate many payments, each refunded independently).
+REFUND_CASH_FN = """
+CREATE OR REPLACE FUNCTION credit_field_refund_cash_check() RETURNS trigger AS $$
+DECLARE m RECORD;
+BEGIN
+  IF NEW.source_kind = 'branch_cash' THEN
+    SELECT kind, amount, session_id INTO m FROM cash_movements WHERE id = NEW.cash_movement_id;
+    IF m.kind IS DISTINCT FROM 'credit_field_refund' OR m.amount IS DISTINCT FROM -NEW.amount
+       OR m.session_id IS DISTINCT FROM NEW.cash_session_id THEN
+      RAISE EXCEPTION 'branch cash field refund % is not backed by its cash movement', NEW.id;
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql
+"""
 TRIGGERS = (
     "CREATE TRIGGER trg_credit_field_custody_receipts_insert_check BEFORE INSERT ON credit_field_custody_receipts "
     "FOR EACH ROW EXECUTE FUNCTION credit_field_custody_receipts_insert_check()",
@@ -400,6 +547,15 @@ TRIGGERS = (
     "CREATE CONSTRAINT TRIGGER trg_credit_field_rendition_items_consistency AFTER INSERT OR UPDATE ON credit_field_rendition_items "
     "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION credit_field_rendition_consistency_check()",
 )
+REFUND_TRIGGERS = (
+    "CREATE TRIGGER trg_credit_field_refunds_insert_check BEFORE INSERT ON credit_field_refunds "
+    "FOR EACH ROW EXECUTE FUNCTION credit_field_refunds_insert_check()",
+    "CREATE TRIGGER trg_credit_field_refunds_guard BEFORE UPDATE OR DELETE ON credit_field_refunds "
+    "FOR EACH ROW EXECUTE FUNCTION credit_field_refunds_guard()",
+    "CREATE CONSTRAINT TRIGGER trg_credit_field_refunds_cash AFTER INSERT ON credit_field_refunds "
+    "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION credit_field_refund_cash_check()",
+)
+REFUND_FUNCTIONS = (REFUND_INSERT_FN, REFUND_GUARD_FN, REFUND_CASH_FN)
 FUNCTIONS = (
     RECEIPT_INSERT_FN,
     RECEIPT_GUARD_FN,
@@ -410,12 +566,17 @@ FUNCTIONS = (
     RENDITION_CONSISTENCY_FN,
 )
 # each trigger goes with its own table
-for _name in ("credit_field_custody_receipts", "credit_field_renditions", "credit_field_rendition_items"):
-    # CREATE OR REPLACE: whichever of the three tables is created first brings the functions its triggers need
-    for _fn in FUNCTIONS:
+for _name in (
+    "credit_field_custody_receipts",
+    "credit_field_renditions",
+    "credit_field_rendition_items",
+    "credit_field_refunds",
+):
+    # CREATE OR REPLACE: whichever table is created first brings the functions its triggers need
+    for _fn in FUNCTIONS + REFUND_FUNCTIONS:
         event.listen(
             Base.metadata.tables[_name], "after_create", DDL(_fn.replace("%", "%%")).execute_if(dialect="postgresql")
         )
-for _sql in TRIGGERS:
+for _sql in TRIGGERS + REFUND_TRIGGERS:
     _table = _sql.split(" ON ")[1].split(" ")[0]
     event.listen(Base.metadata.tables[_table], "after_create", DDL(_sql).execute_if(dialect="postgresql"))

@@ -64,7 +64,8 @@ money back. Neither ever changes custody.
 
 Before rendition the debt is restored and the cash stays with the custodian (receipt outstanding, still renderable). While
 declared, the rendition stays valid. After acceptance, the cash stays in the session: no withdrawal, no release, no refund.
-A field reversal never calls the Cash port. Customer refund/disposition is out of scope (T-020 candidate). The T-009 note
+A field reversal never calls the Cash port. The physical return to the customer is the separate T-020 refund command
+(`docs/T-020-FIELD-CASH-REFUND.md`); a rejected rendition means all counted cash was handed back to the custodian. The T-009 note
 "custody = field payments net of reversals" is superseded; the T-009 runtime is unchanged.
 
 ## Idempotency and concurrency

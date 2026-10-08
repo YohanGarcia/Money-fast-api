@@ -207,6 +207,39 @@ def deposit_field_rendition(
     )
 
 
+FIELD_REFUND_KIND = "credit_field_refund"  # T-020; outside the legacy reversible kinds
+
+
+def withdraw_field_refund(
+    db: Session,
+    *,
+    tenant_id: int,
+    branch_id: int,
+    session_id: int,
+    amount: Decimal,
+    currency: str,
+    cashier_user_id: int,
+    reference: str,
+    notes: str,
+) -> CashWithdrawal:
+    """Cash OUT of a field refund from branch cash (T-020): the refunding cashier's explicit, open, OWN current session of
+    the receiving branch's box; fixed kind; never ``reverses_id`` (one accepted rendition deposit may cover many payments,
+    each refunded on its own). Locks box then session; needs enough balance. Never commits."""
+    return withdraw(
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        session_id=session_id,
+        amount=amount,
+        currency=currency,
+        actor_user_id=cashier_user_id,
+        kind=FIELD_REFUND_KIND,
+        reference=reference,
+        notes=notes,
+        require_cashier_id=cashier_user_id,
+    )
+
+
 def deposit(
     db: Session,
     *,

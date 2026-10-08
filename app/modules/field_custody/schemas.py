@@ -48,3 +48,19 @@ class CancelIn(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     idempotency_key: str = Field(min_length=12, max_length=120)
+
+
+class RefundIn(BaseModel):
+    """T-020: no amount, source, custodian, payment, branch or currency: all are derived from the reversal and custody."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    idempotency_key: str = Field(min_length=12, max_length=120)
+    reason: str = Field(min_length=3, max_length=500)
+    cash_session_id: int | None = Field(default=None, gt=0)  # required iff the cash is in branch cash
+
+    @model_validator(mode="after")
+    def _reason_not_blank(self):
+        if len(self.reason.strip()) < 3:
+            raise ValueError("El motivo debe tener al menos 3 caracteres.")
+        return self

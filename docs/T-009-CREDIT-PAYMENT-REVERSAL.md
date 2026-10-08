@@ -56,7 +56,7 @@ session** (a field reversal stops before Cash; every future debt-changing packag
   session. ~~Future custody/rendition calculations must use field payments net of reversals.~~ This note is
   **superseded by T-019**: a debt reversal is not a physical refund, so it NEVER changes field custody. The receipt stays
   outstanding with its custodian (or, once rendered, the cash stays in the session); returning money to the customer is a
-  separate future package. The T-009 runtime is unchanged.
+  separate command since T-020 (`POST /api/v2/payment-reversals/{id}/field-refund`). The T-009 runtime is unchanged.
 
 ## Cash session rules (D1, D2)
 

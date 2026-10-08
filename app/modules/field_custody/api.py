@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_session
 from app.modules.field_custody import service
-from app.modules.field_custody.schemas import AcceptIn, CancelIn, DeclareIn, RejectIn
+from app.modules.field_custody.schemas import AcceptIn, CancelIn, DeclareIn, RefundIn, RejectIn
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
 
@@ -84,3 +84,23 @@ def custody_summary(receiving_branch_id: int = Query(gt=0), actor: Principal = A
 @router.get("/payments/{payment_id}/field-custody")
 def payment_custody(payment_id: int, actor: Principal = Actor, db: Session = Db):
     return service.payment_custody(db, actor, payment_id)
+
+
+# --- T-020 field refund ---
+@router.post("/payment-reversals/{reversal_id}/field-refund")
+def field_refund(reversal_id: int, body: RefundIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    return service.refund(db, actor, reversal_id, body, client_ip(request))
+
+
+@router.get("/cash/field-refunds")
+def list_field_refunds(
+    status: Literal["pending", "refunded"] = "pending",
+    receiving_branch_id: int | None = Query(default=None, gt=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=200),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    return service.list_refunds(
+        db, actor, status=status, receiving_branch_id=receiving_branch_id, limit=limit, cursor=cursor
+    )
