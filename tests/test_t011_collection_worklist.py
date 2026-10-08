@@ -274,10 +274,13 @@ def test_the_effective_due_date_counts_never_the_contractual_one(client, tenant_
         "delinquency_start_basis": "effective_due_date",
         "accrual_basis": "contractual_dates",
     }
+    # Fixed disbursement day (the schedule starts at the disbursement date): the first contractual due date is
+    # 2026-11-07, a Saturday, so it must move. With the real clock it could land on Sunday and not move at all.
+    clock(monkeypatch, local(date(2026, 10, 7)))
     w = world10(client, adm, tenant_a, raw=rules(calendar=cal), code="PRD-CAL-WL")
     first = schedule(client, adm, w.loan["id"])[0]
     contractual, effective = date.fromisoformat(first["contractual_date"]), date.fromisoformat(first["due_date"])
-    assert effective > contractual
+    assert contractual.weekday() != 6 and effective > contractual  # Monday=0 .. Sunday=6
     clock(monkeypatch, local(effective))  # the effective date itself: not overdue (although past the contractual one)
     assert wl(client, adm)["items"] == []
     clock(monkeypatch, local(effective + timedelta(days=1)))
