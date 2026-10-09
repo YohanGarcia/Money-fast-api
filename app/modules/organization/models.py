@@ -30,6 +30,9 @@ def _now() -> datetime:
 
 ORG_STATUSES = ("active", "inactive")
 CASH_POINT_STATUSES = ("active", "inactive", "suspended")
+# T-021: manual = created by the tenant; legacy_box = the base cash point of a cash box (one per box, created with it);
+# legacy_session_split = created by migration 0020 for a concurrent legacy session (D8), born suspended (D12)
+CASH_POINT_ORIGINS = ("manual", "legacy_box", "legacy_session_split")
 
 
 def in_list(column: str, values: tuple[str, ...]) -> str:
@@ -76,11 +79,14 @@ class CashPoint(Base):
     __table_args__ = (
         CheckConstraint(in_list("status", CASH_POINT_STATUSES), name="status_valid"),
         CheckConstraint("(status = 'suspended') = (suspended_at IS NOT NULL)", name="suspension_consistent"),
+        CheckConstraint(in_list("origin", CASH_POINT_ORIGINS), name="origin_valid"),
+        CheckConstraint("(origin = 'legacy_box') = (box_id IS NOT NULL)", name="box_link_consistent"),
         ForeignKeyConstraint(
             ["tenant_id", "branch_id"], ["branches.company_id", "branches.id"], name="fk_cash_points_tenant_branch"
         ),
         UniqueConstraint("tenant_id", "code", name="uq_cash_points_tenant_code"),
         UniqueConstraint("tenant_id", "id", name="uq_cash_points_tenant_id"),
+        UniqueConstraint("box_id", name="uq_cash_points_box_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -93,6 +99,8 @@ class CashPoint(Base):
     suspension_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    origin: Mapped[str] = mapped_column(String(30), default="manual")
+    box_id: Mapped[int | None] = mapped_column(ForeignKey("cash_boxes.id"), nullable=True)
 
 
 class CashPointCurrency(Base):

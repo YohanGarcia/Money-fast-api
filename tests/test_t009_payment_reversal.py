@@ -8,7 +8,7 @@ Full reversal only. No partial reversal, adjustment, void, delinquency, payoff, 
 import itertools
 import re
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -28,6 +28,7 @@ from app.modules.loans import service as loan_service
 from app.schemas.cash import CashCommand
 from app.services import cash_service
 from tests import pg_env  # noqa: F401  (must precede app imports)
+from tests.cash_fixtures import close_session_now, open_v2_session
 from tests.test_t001_foundation import _alembic, scratch_db  # noqa: F401
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the earlier suites)
     V2,
@@ -73,27 +74,30 @@ def clock(monkeypatch, *, days=0):
 
 
 def own(session_id, user_id):
-    """The cash session belongs to this user (the reversal takes the cash out of the executing cashier's drawer)."""
+    """An open session of this user (the reversal takes the cash out of the executing cashier's drawer).
+
+    T-021: the owner of a session is immutable (DB), so when ``session_id`` belongs to someone else the user gets their
+    own open session (same balance, a free cash point of the same box). Returns the session id to use."""
     with SessionLocal() as db:
-        db.execute(text("UPDATE cash_sessions SET cashier_id = :u WHERE id = :s"), {"u": user_id, "s": session_id})
+        s = db.get(CashSession, session_id)
+        if s.cashier_id == user_id:
+            return session_id
+        new = open_v2_session(db, box_id=s.box_id, cashier_id=user_id, balance=s.balance)
         db.commit()
+        return new.id
 
 
 def add_session(box_id, cashier_id, balance="1000.00", state="open", opened_by=None):
+    """An open v2 session (own cash point when the box's is busy); ``closed`` = opened and closed the T-021 way."""
     with SessionLocal() as db:
-        s = CashSession(
-            box_id=box_id,
-            business_date=date.today(),
-            state=state,
-            opening_expected=Decimal(balance),
-            opening_counted=Decimal(balance),
-            balance=Decimal(balance),
-            opened_by=opened_by or cashier_id,
-            cashier_id=cashier_id,
-        )
-        db.add(s)
+        s = open_v2_session(db, box_id=box_id, cashier_id=cashier_id, balance=balance, opened_by=opened_by)
         db.commit()
-        return s.id
+        sid = s.id
+    if state == "closed":
+        close_session_now(sid)
+    else:
+        assert state == "open", state
+    return sid
 
 
 def user_id(email):
@@ -380,11 +384,7 @@ def test_the_external_reference_stays_occupied_after_a_reversal(client, tenant_a
 def test_the_current_open_session_is_used_and_the_closed_original_is_never_reopened(client, tenant_a, monkeypatch):
     adm, w, rows = case(client, tenant_a, monkeypatch)
     out = pay(client, adm, w, rows[0]["total_due"])
-    with SessionLocal() as db:  # the day ended: the original session is closed
-        db.execute(
-            text("UPDATE cash_sessions SET state = 'closed', closed_at = now() WHERE id = :i"), {"i": w.cash.session_id}
-        )
-        db.commit()
+    close_session_now(w.cash.session_id)  # the day ended: the original session is closed (count + handover)
     s2 = add_session(w.cash.box_id, tenant_a["admin_id"], balance="5000.00")
     with SessionLocal() as db:
         closed_before = tuple(
@@ -421,16 +421,15 @@ def test_counter_reversal_session_validation_leaves_no_trace(client, sink, tenan
     assert teller2
     other = add_session(w.cash.box_id, user_id("teller2@x.com"), balance="900.00", opened_by=tenant_a["admin_id"])
     unowned = add_session(w.cash.box_id, tenant_a["admin_id"], balance="900.00")
-    with SessionLocal() as db:
+    with SessionLocal() as db, pytest.raises(DBAPIError):  # T-021: an ownerless session cannot exist (DB)
         db.execute(text("UPDATE cash_sessions SET cashier_id = NULL WHERE id = :i"), {"i": unowned})
         db.commit()
-    closed = add_session(w.cash.box_id, tenant_a["admin_id"], balance="900.00", state="closing_review")
+    closed = add_session(w.cash.box_id, tenant_a["admin_id"], balance="900.00", state="closed")
     poor = add_session(w.cash.box_id, tenant_a["admin_id"], balance="1.00")
     before = rstate()
     cases = [
         (cash_b2.session_id, 409, "cash_unavailable"),  # another branch's session
         (other, 403, "cash_session_not_owned"),
-        (unowned, 403, "cash_session_not_owned"),
         (closed, 409, "cash_unavailable"),
         (poor, 409, "insufficient_cash"),
         (999999, 409, "cash_unavailable"),
@@ -467,13 +466,12 @@ def test_reversal_needs_its_own_permission_scoped_to_the_receiving_branch(client
     b2 = mk_branch(client, adm, "B2")
     cash_b2 = cash_for(tenant_a, b2["id"], balance="1000.00")
     out = pay(client, adm, w, rows[0]["total_due"], branch=b2["id"], session=cash_b2.session_id)
-    before = rstate()
     creator = user_hdr(client, sink, adm, tenant_a, "cr@x.com", ["payments.create", "payments.read", "loans.disburse"])
-    own(cash_b2.session_id, user_id("cr@x.com"))  # ownership must NOT be what blocks them: only the permission may
-    assert post_rev(client, creator, out["id"], w, branch=b2["id"], session=cash_b2.session_id).status_code == 403
+    s_cr = own(
+        cash_b2.session_id, user_id("cr@x.com")
+    )  # ownership must NOT be what blocks them: only the permission may
     reader = user_hdr(client, sink, adm, tenant_a, "rd@x.com", ["payments.read"])
-    own(cash_b2.session_id, user_id("rd@x.com"))
-    assert post_rev(client, reader, out["id"], w, branch=b2["id"], session=cash_b2.session_id).status_code == 403
+    s_rd = own(cash_b2.session_id, user_id("rd@x.com"))
     at_b1 = user_hdr(
         client,
         sink,
@@ -484,8 +482,11 @@ def test_reversal_needs_its_own_permission_scoped_to_the_receiving_branch(client
         scope="branch",
         branch_id=w.b["id"],
     )
-    own(cash_b2.session_id, user_id("b1@x.com"))
-    assert post_rev(client, at_b1, out["id"], w, branch=b2["id"], session=cash_b2.session_id).status_code == 403
+    s_b1 = own(cash_b2.session_id, user_id("b1@x.com"))  # T-021: each actor's own session exists before the snapshot
+    before = rstate()
+    assert post_rev(client, creator, out["id"], w, branch=b2["id"], session=s_cr).status_code == 403
+    assert post_rev(client, reader, out["id"], w, branch=b2["id"], session=s_rd).status_code == 403
+    assert post_rev(client, at_b1, out["id"], w, branch=b2["id"], session=s_b1).status_code == 403
     assert client.post(f"{PAYMENTS}/{out['id']}/reversals", json=rbody(w)).status_code == 401
     assert {k: v for k, v in rstate().items() if k != "security_events"} == {
         k: v for k, v in before.items() if k != "security_events"
@@ -500,8 +501,8 @@ def test_reversal_needs_its_own_permission_scoped_to_the_receiving_branch(client
         scope="branch",
         branch_id=b2["id"],
     )
-    own(cash_b2.session_id, user_id("b2@x.com"))
-    r = rev(client, at_b2, out["id"], w, branch=b2["id"], session=cash_b2.session_id)
+    s_b2 = own(cash_b2.session_id, user_id("b2@x.com"))
+    r = rev(client, at_b2, out["id"], w, branch=b2["id"], session=s_b2)
     assert r["reversed_by"] == user_id("b2@x.com")
     assert client.get(f"{PAYMENTS}/{out['id']}/reversal", headers=at_b2).status_code == 200  # payments.read
     nope = user_hdr(client, sink, adm, tenant_a, "n@x.com", ["users.read"])

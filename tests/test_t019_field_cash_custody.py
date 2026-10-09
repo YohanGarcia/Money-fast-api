@@ -29,6 +29,7 @@ from app.modules.field_custody import service as custody_service
 from app.modules.loans import payments as pay_service
 from app.schemas.cash import CashCommand
 from app.services import cash_service
+from tests.cash_fixtures import session_with_state
 from tests import pg_env  # noqa: F401  (must precede app imports)
 from tests.test_t001_foundation import _alembic, scratch_db  # noqa: F401
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the earlier suites)
@@ -66,20 +67,9 @@ def key(prefix="fc"):
 
 # ================================ helpers ============================================================
 def cashier_session(tenant, box_id, cashier_id, state="open", balance="0.00"):
-    with SessionLocal() as db:
-        s = CashSession(
-            box_id=box_id,
-            business_date=date.today(),
-            state=state,
-            opening_expected=Decimal(balance),
-            opening_counted=Decimal(balance),
-            balance=Decimal(balance),
-            opened_by=tenant["admin_id"],
-            cashier_id=cashier_id,
-        )
-        db.add(s)
-        db.commit()
-        return s.id
+    """The cashier's own v2 session (T-021: own cash point when the box's is busy; ``closed`` = opened and closed)."""
+    return session_with_state(tenant, box_id, cashier_id, state=state, balance=balance if state == "open" else "0.00",
+                              opened_by=tenant["admin_id"])
 
 
 def world(client, sink, tenant, monkeypatch, tag="a"):
@@ -412,6 +402,7 @@ def test_the_database_enforces_every_custody_invariant(client, sink, tenant_a, t
         mid = db.execute(text("INSERT INTO cash_movements (box_id, session_id, kind, amount, actor_id, notes, reference, created_at) "
                               "VALUES (:bx, :s, 'credit_field_rendition', 19.00, :a, 'x', 'x', now()) RETURNING id"),
                          {"bx": x.w.cash.box_id, "s": x.sess, "a": x.cas}).scalar()
+        db.execute(text("UPDATE cash_sessions SET balance = balance + 19.00 WHERE id = :s"), {"s": x.sess})  # T-021: balance = movements
         db.commit()
     accept_sql = ("UPDATE credit_field_renditions SET state = 'accepted', decided_by = :c, decided_at = now(), counted_amount = :n, "
                   "cash_session_id = :s, cash_movement_id = :m, decision_idempotency_key = 'k-123456789012', decision_request_digest = 'd' WHERE id = :r")
@@ -566,7 +557,7 @@ def test_no_legacy_dual_write_no_direct_session_write_no_new_sort_or_side_effect
 def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scratch_db):
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0019" in _alembic(scratch_db, "heads").stdout  # T-020 added 0019 on top of 0018
+    assert "0020" in _alembic(scratch_db, "heads").stdout  # T-020 / T-021 added 0019 / 0020 on top of 0018
     assert _alembic(scratch_db, "downgrade", "0017").returncode == 0  # empty: clean
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     from sqlalchemy import create_engine
@@ -586,7 +577,7 @@ def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
                               "'cash.field_custody.render', 'cash.field_custody.accept')")).scalar() == 3
         assert c.execute(text("SELECT count(*) FROM credit_field_renditions")).scalar() == 1
         assert c.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_credit_field%' AND tgname NOT LIKE 'trg_credit_field_refunds%'")).scalar() == 8
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0019"  # the refused chain rolls back
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0020"  # the refused chain rolls back (head)
     eng.dispose()
 
 

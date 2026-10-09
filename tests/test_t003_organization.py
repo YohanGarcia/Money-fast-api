@@ -311,29 +311,22 @@ def test_c04_pending_difference_never_suspends_a_cash_point(client, tenant_a):
     adm = admin_headers(client, tenant_a)
     b = mk_branch(client, adm, "B1")
     cp = mk_cp(client, adm, b["id"], "C1")
-    # a legacy cash session waiting for a closing-difference review must not touch the cash point
+    # a cash session closed with a difference pending review (T-021 record) must not touch the cash point
     with SessionLocal() as db:
         from decimal import Decimal
 
-        from app.models.cash import CashBox, CashSession
+        from app.models.cash import CashBox, CashSessionDifference
+        from tests.cash_fixtures import close_with_handover, open_v2_session, receiver_user
 
         box = CashBox(company_id=tenant_a["tenant_id"], branch_id=b["id"], initial_balance=Decimal("0"))
         db.add(box)
         db.flush()
-        db.add(
-            CashSession(
-                box_id=box.id,
-                business_date=now_utc().date(),
-                state="closing_review",
-                opening_expected=Decimal("100"),
-                opening_counted=Decimal("100"),
-                balance=Decimal("100"),
-                counted=Decimal("90"),
-                difference=Decimal("-10"),
-                opened_by=tenant_a["admin_id"],
-            )
+        s = open_v2_session(
+            db, box_id=box.id, cashier_id=tenant_a["admin_id"], balance="100.00", cash_point_id=cp["id"]
         )
+        close_with_handover(db, s, receiver_user(db, tenant_a["tenant_id"]), counted="90.00", note="Faltan 10")
         db.commit()
+        assert db.query(CashSessionDifference).filter_by(session_id=s.id).one().status == "pending_review"
     with SessionLocal() as db:
         assert db.get(CashPoint, cp["id"]).status == "active"
         assert service.ensure_cash_point_usable(db, tenant_a["tenant_id"], cp["id"]).status == "active"

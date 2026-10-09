@@ -41,8 +41,11 @@ def commit(db, fn):
         db.info.pop('cash_notifications', None)
         db.rollback();raise
 
+PRIVATE_COLUMNS=('proof','payload','open_idempotency_key','open_request_digest','close_idempotency_key','close_request_digest',
+                 'accept_idempotency_key','accept_request_digest')
+
 def public(row):
-    data={c.name:getattr(row,c.name) for c in row.__table__.columns if c.name not in ('proof','payload')}
+    data={c.name:getattr(row,c.name) for c in row.__table__.columns if c.name not in PRIVATE_COLUMNS}
     if hasattr(row,'proof'): data['has_proof']=bool(row.proof)
     return jsonable_encoder(data)
 
@@ -119,7 +122,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
-        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','opening_review','closing_review','closing_transfer_pending')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
+        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','closing')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
           expected_opening='0.00',
@@ -135,7 +138,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_rows=[]
         consolidated=svc.ZERO
         for candidate in boxes:
-            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','opening_review','closing_review','closing_transfer_pending']))).all()),svc.ZERO)
+            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','closing']))).all()),svc.ZERO)
             consolidated += amount
             branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount)})
         data['cash_boxes']=branch_rows

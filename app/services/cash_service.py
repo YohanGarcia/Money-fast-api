@@ -17,6 +17,9 @@ from app.models.loan import Loan
 from app.models.payment import Payment
 from app.models.company import Company
 from app.services import capital_service
+from app.modules.cash import sessions as cash_core
+from app.modules.cash.errors import DifferenceReviewNotAvailable, OnBehalfOpeningForbidden
+from app.modules.identity.authorization import build_principal
 
 ZERO = Decimal('0.00')
 TZ = ZoneInfo('America/Santo_Domingo')
@@ -59,7 +62,7 @@ def check_version(row, version):
 def active_session(db, box, required=True, cashier_id=None):
     statement = select(CashSession).where(
         CashSession.box_id==box.id,
-        CashSession.state.in_(['opening_review','open','closing_review','closing_transfer_pending']),
+        CashSession.state.in_(['open','closing']),  # T-021 lifecycle: open -> closing -> closed
     )
     if cashier_id is not None:
         statement = statement.where(CashSession.cashier_id == cashier_id)
@@ -128,65 +131,17 @@ def add_movement(db,box,session,user,kind,amount,notes,**kw):
     return row
 
 
-def _same_company_branch(db, user, candidate, branch_id):
-    if not candidate or candidate.company_id != user.company_id or not candidate.is_active:
-        return False
-    return candidate.role == 'admin' or candidate.branch_id == branch_id
-
-
-def _custody_transfer(db, *, box, session, kind, from_user_id, to_user_id, amount, notes=''):
-    row = CashCustodyTransfer(
-        company_id=box.company_id,
-        box_id=box.id,
-        session_id=session.id,
-        kind=kind,
-        from_user_id=from_user_id,
-        to_user_id=to_user_id,
-        amount=amount,
-        state='pending',
-        notes=notes or '',
-    )
-    db.add(row)
-    db.flush()
-    return row
-
-
 def _require_acceptance(p):
     if not p.acceptance_id or p.acceptance_method != 'authenticated_confirmation':
         fail('La entrega requiere una aceptación autenticada e identificable.')
 
 
-def _record_capital_handover(db, user, transfer, session, *, direction, amount, notes):
-    """Record one physical custody leg and its single capital ledger entry."""
-    if transfer.cash_movement_id or transfer.capital_movement_id:
-        fail('La transferencia física ya fue registrada.', 409)
-    if amount == ZERO:
-        return None, None
-    movement_amount = amount if direction == 'to_cash' else -amount
-    movement = CashMovement(
-        box_id=transfer.box_id,
-        session_id=session.id,
-        kind='opening_fund' if direction == 'to_cash' else 'capital_transfer',
-        amount=movement_amount,
-        actor_id=user.id,
-        notes=notes or ('Entrega de fondo desde capital' if direction == 'to_cash' else 'Entrega total de cierre a capital'),
-        reference=f'CUST-{transfer.id}',
-        custody_transfer_id=transfer.id,
-    )
-    db.add(movement)
-    db.flush()
-    capital_row = capital_service.record(
-        db,
-        transfer.company_id,
-        user.id,
-        direction,
-        amount,
-        notes or '',
-        cash_movement_id=movement.id,
-    )
-    transfer.cash_movement_id = movement.id
-    transfer.capital_movement_id = capital_row.id
-    return movement, capital_row
+def _legacy_result(out, **extra):
+    """T-021 session answer in the legacy command shape (plus the full session and the action that completes it)."""
+    handover = out.get('handover') or {}
+    return dict(session_id=out['id'], state=out['state'], cash_point_id=out['cash_point_id'],
+                transfer_id=handover.get('id'), difference=out.get('difference'),
+                next_action=out.get('next_action'), session=out, **extra)
 
 def branch_for_customer(db, c):
     if c.cash_branch_id: return c.cash_branch_id
@@ -262,8 +217,10 @@ def setup(db,user,payload):
     if db.scalar(select(CashBox).where(CashBox.branch_id==b.id)): fail('Esta caja ya está configurada.',409)
     row=CashBox(company_id=user.company_id,branch_id=b.id,initial_balance=payload.initial_balance)
     db.add(row); db.flush()
-    audit(db,row,user,'configured',initial_balance=payload.initial_balance,notes=payload.notes)
-    return dict(box_id=row.id)
+    # T-021: the database creates the box's base CashPoint with it (no box ever lacks its operational position)
+    cash_point_id=cash_core.base_cash_point_id(db,row.id)
+    audit(db,row,user,'configured',initial_balance=payload.initial_balance,notes=payload.notes,cash_point_id=cash_point_id)
+    return dict(box_id=row.id,cash_point_id=cash_point_id)
 
 def activate(db,user):
     require_role(user,'admin')
@@ -282,25 +239,26 @@ def command(db,user,p):
     old,digest=replay(db,user,p.idempotency_key,p.model_dump(mode='json'))
     if old: return old
     action=p.action
+    if action=='resolve':
+        # T-021 (DR-007): the difference is a separate record; a closed session is never reopened nor adjusted here.
+        raise DifferenceReviewNotAvailable()
     if action=='declare': require_role(user,'collector')
-    elif action in ('resolve','reverse','confirm_surplus','reject_surplus','confirm_transfer','reject_transfer'): require_role(user,'admin')
+    elif action in ('reverse','confirm_surplus','reject_surplus','confirm_transfer','reject_transfer'): require_role(user,'admin')
     elif action == 'confirm_closing_transfer': require_role(user,'admin','manager','cashier')
     else: require_role(user,'cashier')
+    # T-021: open / close / confirm_closing_transfer ALSO need the explicit permissions (no role grants them implicitly)
     result={}
+    actor=build_principal(db,user,0) if action in ('open','close','confirm_closing_transfer') else None
     if action=='open':
-        cashier = user
-        if user.role == 'admin' and p.target_id:
-            candidate = db.get(User, p.target_id)
-            if candidate and candidate.role == 'cashier':
-                cashier = candidate
-        if not _same_company_branch(db, user, cashier, box.branch_id):
-            fail('El cajero receptor no pertenece a la sucursal.', 403)
-        if active_session(db,box,False,cashier_id=cashier.id):
-            fail('Este cajero ya tiene una jornada abierta o pendiente de resolver.',409)
-        row=CashSession(box_id=box.id,business_date=today(),opening_expected=p.amount,opening_counted=p.amount,balance=p.amount,opened_by=user.id,cashier_id=cashier.id,state='open',opened_at=now(),notes=p.notes)
-        db.add(row);db.flush()
-        audit(db,box,user,'physical_opening_declared',session_id=row.id,cashier_id=cashier.id,amount=p.amount,notes=p.notes)
-        result={'session_id':row.id,'state':row.state,'opening_mode':'physical_declared'}
+        if p.target_id and p.target_id!=user.id: raise OnBehalfOpeningForbidden()
+        cash_point_id=p.cash_point_id or cash_core.base_cash_point_id(db,box.id)
+        point=cash_core._cash_point(db,user.company_id,cash_point_id) if cash_point_id else None
+        if point is None or point.branch_id!=box.branch_id: fail('Selecciona una caja de esta sucursal.',404)
+        if p.amount>0 and not p.capital:
+            fail('La apertura con efectivo debe indicar su origen: fondo desde capital (capital=true). No se admite efectivo sin origen.')
+        out=cash_core.open_session(db,actor,cash_point_id=point.id,source='capital' if p.amount>0 else 'zero',amount=p.amount,
+            denominations=p.denominations,observation_note=p.notes,idempotency_key=p.idempotency_key)
+        result=_legacy_result(out,opening_mode=out['opening_source'])
 
     elif action=='declare':
         reserved=db.scalar(select(func.coalesce(func.sum(CashDelivery.declared),0)).where(CashDelivery.box_id==box.id,CashDelivery.collector_id==user.id,CashDelivery.state=='pending'))
@@ -368,6 +326,8 @@ def command(db,user,p):
         if not p.kind or p.amount<=0 or not p.notes.strip(): fail('Indica tipo, importe positivo y concepto.')
         if p.kind=='bank_deposit' and not p.reference.strip(): fail('Indica la referencia del depósito.')
         if p.capital and p.kind not in ('contribution','withdrawal'): fail('El movimiento con capital debe ser aporte (desde capital) o retiro (hacia capital).')
+        # T-021 (D3): cash never enters without a traced origin; an untracked contribution is not accepted.
+        if p.kind=='contribution' and not p.capital: fail('Un aporte a caja debe venir de capital (capital=true): no se admite efectivo sin origen.')
         # capital -> caja needs enough reserve; checked before the cash entry so both stay consistent.
         if p.capital and p.kind=='contribution' and p.amount>capital_service.balance(db,box.company_id): fail('El capital disponible no alcanza para este aporte a caja.',409)
         amount=p.amount if p.kind=='contribution' else -p.amount
@@ -376,71 +336,20 @@ def command(db,user,p):
             capital_service.record(db,box.company_id,user.id,'to_cash' if p.kind=='contribution' else 'from_cash',p.amount,p.notes,cash_movement_id=row.id)
         result={'movement_id':row.id}
     elif action=='close':
-        session=operational_session(db,box,user,p.session_id);check_version(session,p.version)
+        session=operational_session(db,box,user,p.session_id)
+        if p.version is None or p.version!=session.version: fail('Los datos cambiaron. Actualiza antes de guardar.',409)
         if db.scalar(select(CashDelivery.id).where(CashDelivery.box_id==box.id,CashDelivery.state=='surplus_review')):
             fail('El administrador debe resolver los sobrantes reportados antes del cuadre.',409)
-        if not p.denominations or any(k not in DENOMINATIONS or isinstance(v,bool) or v<0 or v>1_000_000 for k,v in p.denominations.items()): fail('Conteo por denominaciones inválido.')
-        counted=sum((Decimal(k)*v for k,v in p.denominations.items()),ZERO)
-        if counted>Decimal('9999999999.99'): fail('Conteo fuera de rango.')
-        difference=counted-session.balance
-        if difference and not p.notes.strip(): fail('Indica el motivo del faltante o sobrante.')
-        movements=db.scalars(select(CashMovement).where(CashMovement.session_id==session.id,CashMovement.kind.not_in(('opening_adjustment','opening_fund','capital_transfer')))).all()
-        session.snapshot=dict(opening=str(session.opening_counted),incoming=str(sum((m.amount for m in movements if m.amount>0),ZERO)),outgoing=str(-sum((m.amount for m in movements if m.amount<0),ZERO)),expected=str(session.balance),collector_pending=str(pending(db,box)),movement_ids=[m.id for m in movements])
-        session.counted=counted;session.difference=difference;session.denominations=p.denominations;session.notes=p.notes;session.closed_by=user.id;session.closed_at=now()
-        if difference:
-            session.state='closing_review'
-            result={'session_id':session.id,'state':session.state,'difference':str(difference)}
-        else:
-            receiver = db.get(User,p.receiver_id) if p.receiver_id else (user if user.role=='admin' else None)
-            if not receiver or receiver.role not in ('admin','manager') or not _same_company_branch(db,user,receiver,box.branch_id):
-                fail('Identifica al encargado que recibirá físicamente el efectivo de cierre.',403)
-            if receiver.id == session.cashier_id and user.role != 'admin': fail('La entrega de cierre requiere un responsable distinto.',403)
-            transfer=_custody_transfer(db,box=box,session=session,kind='closing_capital',from_user_id=session.cashier_id or session.opened_by,to_user_id=receiver.id,amount=counted,notes=p.notes)
-            session.state='closing_transfer_pending'
-            result={'session_id':session.id,'transfer_id':transfer.id,'state':session.state,'difference':str(difference)}
-    elif action=='resolve':
-        row=db.get(CashSession,p.target_id)
-        if not row or row.box_id!=box.id: fail('Jornada no encontrada.',404)
-        check_version(row,p.version)
-        if row.state not in ('opening_review','closing_review'): fail('La jornada no requiere resolución.',409)
-        if not p.notes.strip() or not p.resolution: fail('Indica resolución y motivo.')
-        opening=row.state=='opening_review'
-        if p.resolution=='return':
-            if opening:
-                # Return to the expected float; physical correction is confirmed by the admin.
-                fail('Para corregir la apertura indica el conteo corregido y aprueba la resolución.')
-            row.state='open';row.closed_at=None;row.closed_by=None
-        else:
-            difference=(row.opening_counted-row.opening_expected) if opening else row.difference
-            if opening:
-                row.opening_counted=p.amount;row.balance=p.amount;difference=p.amount-row.opening_expected
-                row.state='open'
-            else:
-                receiver = db.get(User,p.receiver_id) if p.receiver_id else user
-                if not receiver or receiver.role not in ('admin','manager') or not _same_company_branch(db,user,receiver,box.branch_id):
-                    fail('Identifica al encargado que recibirá físicamente el efectivo de cierre.',403)
-                transfer=_custody_transfer(db,box=box,session=row,kind='closing_capital',from_user_id=row.cashier_id or row.opened_by,to_user_id=receiver.id,amount=row.counted or ZERO,notes=p.notes)
-                row.state='closing_transfer_pending'
-                result['transfer_id']=transfer.id
-            # Adjustment is recorded, never applied twice to expected / counted totals.
-            if difference:
-                db.add(CashMovement(box_id=box.id,session_id=row.id,actor_id=user.id,kind='opening_adjustment' if opening else 'closing_adjustment',amount=difference,notes=p.notes))
-        row.resolved_by=user.id
-        result.update({'session_id':row.id,'state':row.state})
+        out=cash_core.close_session(db,actor,session.id,denominations=p.denominations,observation_note=p.notes,
+            receiver_user_id=p.receiver_id,idempotency_key=p.idempotency_key,snapshot_extra=dict(collector_pending=str(pending(db,box))))
+        result=_legacy_result(out)
     elif action=='confirm_closing_transfer':
         transfer=db.get(CashCustodyTransfer,p.target_id)
         if not transfer or transfer.box_id!=box.id or transfer.kind!='closing_capital': fail('Transferencia física de cierre no encontrada.',404)
-        if transfer.state!='pending': fail('La transferencia física ya fue procesada.',409)
-        session=db.get(CashSession,transfer.session_id)
-        if not session or session.state!='closing_transfer_pending': fail('La jornada no está pendiente de transferencia.',409)
-        if user.id != transfer.to_user_id and user.role != 'admin': fail('Solo el responsable receptor puede confirmar la entrega.',403)
-        check_version(session,p.version)
-        check_version(transfer, p.transfer_version if p.transfer_version is not None else transfer.version)
+        if p.transfer_version is not None and p.transfer_version!=transfer.version: fail('Los datos cambiaron. Actualiza antes de guardar.',409)
         _require_acceptance(p)
-        _record_capital_handover(db,user,transfer,session,direction='from_cash',amount=transfer.amount,notes=p.notes)
-        session.balance=ZERO;session.state='closed';session.closed_at=now();session.closed_by=user.id
-        transfer.state='confirmed';transfer.acceptance_id=p.acceptance_id;transfer.acceptance_method=p.acceptance_method;transfer.accepted_by=user.id;transfer.accepted_at=now();transfer.notes=p.notes or transfer.notes
-        result={'session_id':session.id,'transfer_id':transfer.id,'state':session.state,'amount':str(transfer.amount)}
+        out=cash_core.accept_handover(db,actor,transfer.id,idempotency_key=p.idempotency_key,acceptance_id=p.acceptance_id,notes=p.notes)
+        result=_legacy_result(out,amount=out['handover']['amount'])
     elif action=='reverse':
         original=db.get(CashMovement,p.target_id)
         if not original or original.box_id!=box.id: fail('Movimiento no encontrado.',404)

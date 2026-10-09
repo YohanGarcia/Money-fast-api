@@ -1,4 +1,8 @@
-"""Acceptance tests for independent custody and mandatory capital transfer."""
+"""Acceptance tests for independent custody and mandatory capital transfer.
+
+T-021: one active session per CashPoint (a second cashier works on a second CashPoint of the branch), openings come from
+capital (counted by denomination), closes hand the counted cash to capital through an accepted handover, differences
+are records (never a resolve/return/adjustment), and the cash permissions are explicit."""
 
 import base64
 import unittest
@@ -11,6 +15,11 @@ from app.core.database import SessionLocal
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.models.capital import CapitalMovement
 from app.models.customer import Customer
+from app.modules.organization.models import CashPoint
+from tests.cash_fixtures import denominations_for, grant_cash_permissions
+
+CASHIER_PERMS = ['cash.sessions.open', 'cash.sessions.close', 'cash.sessions.read']
+RECEIVER_PERMS = ['cash.handovers.accept', 'cash.sessions.read']
 
 
 class CashRefactorTests(unittest.TestCase):
@@ -49,6 +58,15 @@ class CashRefactorTests(unittest.TestCase):
         self.req('/cash/setup', dict(branch_id=self.branch, initial_balance='0', notes='Configuración histórica'), code=200)
         self.req('/cash/activate', {}, code=200)
         self.req('/capital/movements', dict(kind='injection', amount='5000', notes='Fondo de prueba'), code=200)
+        company_id = self.users['cashier']['company_id']
+        for name, perms in (('cashier', CASHIER_PERMS), ('cashier2', CASHIER_PERMS), ('manager', RECEIVER_PERMS)):
+            grant_cash_permissions(company_id, self.users[name]['id'], perms, self.branch)
+        with SessionLocal() as db:  # D1: a second cashier needs a second cash position of the branch
+            cp2 = CashPoint(tenant_id=company_id, branch_id=self.branch, code='QA-CAJA-2', name='Caja 2', status='active',
+                            origin='manual')
+            db.add(cp2)
+            db.commit()
+            self.cash_points = {'cashier': None, 'cashier2': cp2.id}
 
     def req(self, path, body=None, headers=None, code=200, method=None):
         response = self.client.request(method or ('POST' if body is not None else 'GET'), '/api/v1' + path, json=body, headers=headers or self.admin)
@@ -66,7 +84,10 @@ class CashRefactorTests(unittest.TestCase):
         return self.req('/cash/commands', dict(action=action, branch_id=self.branch, idempotency_key=str(uuid.uuid4()), **fields), headers, code)
 
     def open_for(self, cashier='cashier', amount='1000'):
-        result = self.cmd('open', headers=self.roles[cashier], amount=amount, notes='Fondo recibido físicamente')
+        funded = Decimal(amount) > 0
+        result = self.cmd('open', headers=self.roles[cashier], amount=amount, capital=funded,
+                          denominations=denominations_for(amount) if funded else {},
+                          cash_point_id=self.cash_points[cashier], notes='Fondo recibido físicamente')
         with SessionLocal() as db:
             result['version'] = db.get(CashSession, result['session_id']).version
         return result
@@ -83,19 +104,19 @@ class CashRefactorTests(unittest.TestCase):
         path = f'/reports/finance?start={today()}&end={today()}'
         report = self.req(path)
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('5000.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('3600.00'))  # T-021: the fund left capital
         self.assertEqual(Decimal(report['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('6400.00'))
+        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('5000.00'))  # no capital inflation
 
         current = self.workspace(self.roles['cashier'])['session']
         pending = self.cmd('close', headers=self.roles['cashier'],
                            version=current['version'],
                            target_id=self.users['manager']['id'],
                            denominations={'500': 1, '200': 1, '100': 1})
-        self.assertEqual(pending['state'], 'closing_transfer_pending')
+        self.assertEqual(pending['state'], 'closing')
         before_confirmation = self.req(path)
         self.assertEqual(Decimal(before_confirmation['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('5000.00'))
+        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('3600.00'))
 
         with SessionLocal() as db:
             version = db.get(CashSession, first['session_id']).version
@@ -106,9 +127,9 @@ class CashRefactorTests(unittest.TestCase):
                  acceptance_method='authenticated_confirmation')
         after = self.req(path)
         self.assertEqual(Decimal(after['efectivo_caja']), Decimal('600.00'))
-        self.assertEqual(Decimal(after['reserva_capital']), Decimal('5800.00'))
+        self.assertEqual(Decimal(after['reserva_capital']), Decimal('4400.00'))
         self.assertEqual(Decimal(after['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('6400.00'))
+        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('5000.00'))
 
     def test_finance_report_uses_physical_count_for_unresolved_shortfall(self):
         """A disputed closing difference must not be silently shown as actual cash."""
@@ -119,10 +140,10 @@ class CashRefactorTests(unittest.TestCase):
                            version=2, target_id=self.users['manager']['id'],
                            denominations={'500': 1, '200': 1},
                            notes='Awaiting shortfall resolution')
-        self.assertEqual(pending['state'], 'closing_review')
+        self.assertEqual(pending['state'], 'closing')  # the counted cash awaits its handover; the difference is a record
         report = self.req(f'/reports/finance?start={today()}&end={today()}')
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('700.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('5000.00'))
+        self.assertEqual(Decimal(report['reserva_capital']), Decimal('4100.00'))
 
     def test_composed_transfer_is_pending_and_preserves_exact_amount(self):
         """A bank transfer with explicit split components does not credit the loan early."""
@@ -155,10 +176,10 @@ class CashRefactorTests(unittest.TestCase):
         """Admin movements must never silently target the newest cashier."""
         first = self.open_for('cashier', '800')
         second = self.open_for('cashier2', '600')
-        # Both newly opened sessions are at version 2, so optimistic version
-        # validation alone cannot distinguish them.
+        # T-021: a capital opening leaves the session at version 2 (the fund movement); a stale version is refused
+        # and nothing moves; the explicit session with its current version is the only accepted target.
         self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
-                 version=2, code=409)
+                 version=first['version'] - 1, code=409)
         self.cmd('movement', headers=self.roles['cashier'], kind='expense', amount='100', notes='QA expense',
                  version=first['version'], session_id=first['session_id'])
         with SessionLocal() as db:
@@ -200,45 +221,50 @@ class CashRefactorTests(unittest.TestCase):
             self.assertEqual(db.get(CashSession, first['session_id']).balance, Decimal('800.00'))
             self.assertEqual(db.get(CashSession, second['session_id']).balance, Decimal('600.00'))
 
-    def test_resolving_shortfall_uses_explicit_physical_receiver(self):
+    def test_shortfall_hands_over_the_counted_cash_to_the_explicit_receiver(self):
         opened = self.open_for('cashier', '900')
         session_id = opened['session_id']
         pending = self.cmd('close', headers=self.roles['cashier'],
                            target_id=self.users['manager']['id'], version=2,
                            denominations={'500': 1, '200': 1},
                            notes='Shortfall under review')
-        self.assertEqual(pending['state'], 'closing_review')
+        self.assertEqual(pending['state'], 'closing')
         with SessionLocal() as db:
             version = db.get(CashSession, session_id).version
-        resolved = self.cmd('resolve', target_id=session_id, version=version,
-                            resolution='approve', receiver_id=self.users['manager']['id'],
-                            notes='Authorized shortfall')
-        self.assertEqual(resolved['state'], 'closing_transfer_pending')
+        refused = self.cmd('resolve', target_id=session_id, version=version, resolution='approve',
+                           receiver_id=self.users['manager']['id'], notes='Authorized shortfall', code=409)
+        self.assertEqual(refused['error']['code'], 'difference_review_not_available')
         with SessionLocal() as db:
             transfer = db.query(CashCustodyTransfer).filter(
                 CashCustodyTransfer.session_id == session_id,
                 CashCustodyTransfer.kind == 'closing_capital',
             ).one()
             self.assertEqual(transfer.to_user_id, self.users['manager']['id'])
-            self.assertEqual(transfer.amount, Decimal('700.00'))
+            self.assertEqual(transfer.amount, Decimal('700.00'))  # the physical count, never the expected amount
 
-    def test_physical_opening_is_independent_from_capital(self):
+    def test_opening_cash_has_a_traced_capital_origin(self):
         before_capital = Decimal(self.req('/capital')['balance'])
+        anonymous = self.cmd('open', headers=self.roles['cashier'], amount='700', denominations={'500': 1, '200': 1},
+                             notes='Efectivo sin origen', code=422)  # D3: no anonymous opening cash
+        self.assertIn('capital', anonymous['detail'])
         result = self.open_for(amount='700')
         self.assertEqual(result['state'], 'open')
-        self.assertEqual(result['opening_mode'], 'physical_declared')
-        self.assertNotIn('transfer_id', result)
+        self.assertEqual(result['opening_mode'], 'capital')
+        self.assertIsNone(result['transfer_id'])
         with SessionLocal() as db:
             session = db.get(CashSession, result['session_id'])
             self.assertEqual(session.opening_counted, Decimal('700.00'))
             self.assertEqual(session.balance, Decimal('700.00'))
-            self.assertIsNone(db.query(CashCustodyTransfer).filter(CashCustodyTransfer.session_id == session.id).first())
-            self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').count(), 0)
-        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital)
+            fund = db.query(CashMovement).filter(CashMovement.session_id == session.id).one()
+            self.assertEqual((fund.kind, fund.amount), ('opening_capital_fund', Decimal('700.00')))
+            capital = db.query(CapitalMovement).filter(CapitalMovement.kind == 'to_cash').one()
+            self.assertEqual((capital.amount, capital.cash_movement_id), (Decimal('700.00'), fund.id))
+        self.assertEqual(Decimal(self.req('/capital')['balance']), before_capital - Decimal('700.00'))
 
     def test_admin_is_supervisor_not_cashier_operator(self):
         denied = self.cmd('open', amount='1000', notes='Admin should not own a drawer', code=403)
         self.assertEqual(denied['detail'], 'No tienes permiso para esta operación de caja.')
+        self.req('/capital/movements', dict(kind='injection', amount='146000', notes='Fondo de prueba'), code=200)
         first = self.open_for('cashier', '51000')
         second = self.open_for('cashier2', '100000')
         workspace = self.workspace(self.admin)
@@ -270,7 +296,7 @@ class CashRefactorTests(unittest.TestCase):
             denominations={'1000': 1},
             notes='Cuadre exacto por administrador',
         )
-        self.assertEqual(pending['state'], 'closing_transfer_pending')
+        self.assertEqual(pending['state'], 'closing')
         with SessionLocal() as db:
             transfer = db.query(CashCustodyTransfer).filter(
                 CashCustodyTransfer.session_id == session_id,
@@ -283,7 +309,7 @@ class CashRefactorTests(unittest.TestCase):
         self.open_for('cashier', '1000')
         session = self.workspace()['session']
         pending = self.cmd('close', headers=self.roles['cashier'], target_id=self.users['manager']['id'], version=session['version'], denominations={'1000': 1}, notes='Conteo exacto')
-        self.assertEqual(pending['state'], 'closing_transfer_pending')
+        self.assertEqual(pending['state'], 'closing')
         pending_session = self.workspace()['session']
         with SessionLocal() as db:
             self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'from_cash').count(), 0)
@@ -292,7 +318,7 @@ class CashRefactorTests(unittest.TestCase):
         with SessionLocal() as db:
             capital = db.query(CapitalMovement).filter(CapitalMovement.kind == 'from_cash').one()
             self.assertEqual(capital.amount, Decimal('1000.00'))
-            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind == 'capital_transfer').count(), 1)
+            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind == 'closing_capital_transfer').count(), 1)
             transfer = db.query(CashCustodyTransfer).filter(CashCustodyTransfer.kind == 'closing_capital').one()
             self.assertEqual(transfer.state, 'confirmed')
             self.assertEqual(transfer.accepted_by, self.users['manager']['id'])
@@ -308,7 +334,7 @@ class CashRefactorTests(unittest.TestCase):
         with SessionLocal() as db:
             session_row = db.get(CashSession, pending['session_id'])
             transfer = db.get(CashCustodyTransfer, pending['transfer_id'])
-            self.assertEqual(session_row.state, 'closing_transfer_pending')
+            self.assertEqual(session_row.state, 'closing')
             self.assertEqual(transfer.state, 'pending')
-            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind == 'capital_transfer').count(), 0)
+            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind == 'closing_capital_transfer').count(), 0)
             self.assertEqual(db.query(CapitalMovement).filter(CapitalMovement.kind == 'from_cash').count(), 0)

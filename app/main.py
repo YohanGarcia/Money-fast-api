@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.context.middleware import RequestContextMiddleware
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.modules.cash.api import router as cash_router
 from app.modules.credit.api import router as credit_router
 from app.modules.customers.api import router as customers_router
 from app.modules.field_custody.api import router as field_custody_router
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
     application.include_router(origination_limit_router)
     application.include_router(loans_router)
     application.include_router(field_custody_router)
+    application.include_router(cash_router)
 
     @application.get("/")
     def root() -> dict[str, str]:

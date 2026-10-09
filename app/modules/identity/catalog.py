@@ -127,6 +127,20 @@ CATALOG: tuple[PermissionDef, ...] = (
         "Devolver al cliente el efectivo de un pago de campo revertido (custodio o jornada propia)",
         True,
     ),
+    PermissionDef("cash.sessions.read", "tenant", "Consultar jornadas de caja (T-021)"),
+    PermissionDef(
+        "cash.sessions.open", "tenant", "Abrir la propia jornada en una caja (cero o fondo desde capital)", True
+    ),
+    PermissionDef(
+        "cash.sessions.close", "tenant", "Cerrar la propia jornada con conteo fisico por denominaciones", True
+    ),
+    PermissionDef(
+        "cash.handovers.accept",
+        "tenant",
+        "Recibir y confirmar la entrega de cierre de efectivo a capital (nunca la propia)",
+        True,
+    ),
+    PermissionDef("cash.differences.read", "tenant", "Consultar diferencias de caja registradas en apertura o cierre"),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

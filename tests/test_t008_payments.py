@@ -25,6 +25,7 @@ from app.modules.loans import service as loan_service
 from app.schemas.cash import CashCommand
 from app.services import cash_service
 from tests import pg_env  # noqa: F401  (must precede app imports)
+from tests.cash_fixtures import close_session_now
 from tests.test_t001_foundation import _alembic, scratch_db  # noqa: F401
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the earlier suites)
     V2,
@@ -529,8 +530,9 @@ def test_cash_validation_session_branch_closed_session_currency_and_inactive_bra
                 reference="x",
                 notes="x",
             )
-        db.execute(text("UPDATE cash_sessions SET state = 'closing_review' WHERE id = :i"), {"i": w.cash.session_id})
-        db.commit()
+    assert money_state() == before  # nothing so far moved money
+    close_session_now(w.cash.session_id)  # T-021: a real close (count, handover to capital, acceptance)
+    before = money_state()  # the close's own handover movement is not something a refused payment changes
     assert (
         client.post(f"{LOANS}/{w.loan['id']}/payments", headers=adm, json=pbody(w, "5.00")).status_code == 409
     )  # closed session

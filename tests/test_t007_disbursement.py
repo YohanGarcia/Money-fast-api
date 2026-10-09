@@ -20,6 +20,7 @@ from app.modules.cash import port as cash_port
 from app.modules.identity.models import SecurityEvent
 from app.modules.loans import service as loan_service
 from tests import pg_env  # noqa: F401  (must precede app imports)
+from tests.cash_fixtures import open_v2_session, session_with_state
 from tests.test_t001_foundation import _alembic, scratch_db  # noqa: F401
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the earlier suites)
     V2,
@@ -65,23 +66,16 @@ TZ = "America/Santo_Domingo"
 
 # ================================ helpers ============================================================
 def cash_for(tenant, branch_id, balance="1000000.00", state="open", enable=True):
-    """Legacy cash runtime fixture: CashConfig + the branch's CashBox + one custody session."""
+    """Cash runtime fixture: CashConfig + the branch's CashBox (its base CashPoint comes with it) + one OPEN custody
+    session owned by the tenant admin, funded from capital (T-021 v2 contract: no anonymous opening cash)."""
+    assert state == "open", "T-021: a session is born open; close it through tests.cash_fixtures"
     with SessionLocal() as db:
         if enable and db.get(CashConfig, tenant["tenant_id"]) is None:
             db.add(CashConfig(company_id=tenant["tenant_id"], activated_by=tenant["admin_id"]))
         box = CashBox(company_id=tenant["tenant_id"], branch_id=branch_id, initial_balance=Decimal(0))
         db.add(box)
         db.flush()
-        session = CashSession(
-            box_id=box.id,
-            business_date=today(),
-            state=state,
-            opening_expected=Decimal(balance),
-            opening_counted=Decimal(balance),
-            balance=Decimal(balance),
-            opened_by=tenant["admin_id"],
-        )
-        db.add(session)
+        session = open_v2_session(db, box_id=box.id, cashier_id=tenant["admin_id"], balance=balance)
         db.commit()
         return SimpleNamespace(box_id=box.id, session_id=session.id, branch_id=branch_id)
 
@@ -145,6 +139,10 @@ def state_counts():
     )
     with SessionLocal() as db:
         counts = {t: db.execute(text(f"SELECT count(*) FROM {t}")).scalar() for t in tables}
+        # T-021: a session's capital opening fund (fixture) is not a Credit movement
+        counts["cash_movements"] -= db.execute(
+            text("SELECT count(*) FROM cash_movements WHERE kind = 'opening_capital_fund'")
+        ).scalar()
         counts["loan_seq"] = db.execute(
             text("SELECT coalesce(max(last_value), 0) FROM tenant_sequences WHERE name = 'credit_loan'")
         ).scalar()
@@ -184,7 +182,11 @@ def test_d01_d02_disbursement_uses_the_formalized_approved_amount_and_activates_
     # the money really left the custody session, once, through a typed cash movement
     assert session_balance(w.cash.session_id) == Decimal("993000.00")
     with SessionLocal() as db:
-        mv = db.execute(text("SELECT id, kind, amount, reference, session_id FROM cash_movements")).one()
+        mv = db.execute(
+            text(
+                "SELECT id, kind, amount, reference, session_id FROM cash_movements WHERE kind <> 'opening_capital_fund'"
+            )
+        ).one()  # T-021: the fixture fund is not a credit movement
     assert (mv.kind, mv.amount, mv.reference, mv.session_id) == (
         MOVEMENT_KIND,
         Decimal("-7000.00"),
@@ -284,13 +286,11 @@ def test_funding_source_validation(client, tenant_a):
         == 422
     )
     assert core(state_counts()) == core(before)
-    with SessionLocal() as db:  # a closed custody session cannot be used
-        db.execute(text("UPDATE cash_sessions SET state = 'closing_review' WHERE id = :i"), {"i": w.cash.session_id})
-        db.execute(text("UPDATE cash_sessions SET balance = 100000 WHERE id = :i"), {"i": w.cash.session_id})
-        db.commit()
-    assert client.post(f"{F}/{w.f['id']}/disburse", headers=adm, json=body(w)).status_code == 409
+    # a closed custody session cannot be used (T-021: closed is terminal, so it is a separate closed session)
+    closed = session_with_state(tenant_a, w.cash.box_id, tenant_a["admin_id"], state="closed")
+    r1 = client.post(f"{F}/{w.f['id']}/disburse", headers=adm, json=body(w, session=closed))
+    assert r1.status_code == 409 and r1.json()["error"]["code"] == "cash_unavailable"
     with SessionLocal() as db:  # cash not enabled for the tenant at all
-        db.execute(text("UPDATE cash_sessions SET state = 'open' WHERE id = :i"), {"i": w.cash.session_id})
         db.execute(text("DELETE FROM cash_configs"))
         db.commit()
     r2 = client.post(f"{F}/{w.f['id']}/disburse", headers=adm, json=body(w))
@@ -403,7 +403,7 @@ def test_only_a_ready_formalized_contract_can_be_disbursed(client, tenant_a):
         db.commit()
     r = client.post(f"{F}/{w.f['id']}/disburse", headers=adm, json=body(w))
     assert r.status_code == 409 and r.json()["error"]["code"] == "formalization_not_ready"
-    assert count("credit_loans") == 0 and count("cash_movements") == 0
+    assert count("credit_loans") == 0 and count("cash_movements", "kind <> 'opening_capital_fund'") == 0
     # an approved-but-not-formalized application has no contract to disburse at all
     d = review(client, adm, w)
     approve(client, adm, d, amount="5000")

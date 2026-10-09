@@ -350,6 +350,7 @@ def test_the_database_enforces_every_refund_invariant(client, sink, tenant_a, te
         mid = db.execute(text("INSERT INTO cash_movements (box_id, session_id, kind, amount, actor_id, notes, reference, created_at) "
                               "VALUES (:bx, :s, 'credit_field_refund', -15.00, :a, 'x', 'x', now()) RETURNING id"),
                          {"bx": x.w.cash.box_id, "s": x.rsess, "a": x.rcas}).scalar()
+        db.execute(text("UPDATE cash_sessions SET balance = balance - 15.00 WHERE id = :s"), {"s": x.rsess})  # T-021: balance = movements
         db.commit()
     refused(ins, **(b2 | {"s": "branch_cash", "by": x.rcas, "cs": x.rsess, "cm": mid}))  # branch source before acceptance
     refused(ins, **(b2 | {"s": "branch_cash", "by": x.rcas}))  # branch source without session / movement
@@ -365,6 +366,7 @@ def test_the_database_enforces_every_refund_invariant(client, sink, tenant_a, te
             m2 = db.execute(text("INSERT INTO cash_movements (box_id, session_id, kind, amount, actor_id, notes, reference, created_at) "
                                  "VALUES (:bx, :s, :k, :am, :a, 'x', 'x', now()) RETURNING id"),
                             {"bx": x.w.cash.box_id, "s": sess, "k": kind, "am": amount, "a": x.rcas}).scalar()
+            db.execute(text("UPDATE cash_sessions SET balance = balance + :am WHERE id = :s"), {"s": sess, "am": amount})  # T-021
             db.commit()
         refused(ins, **(b3 | {"s": "branch_cash", "by": x.rcas, "cs": x.rsess, "cm": m2}))  # movement kind / amount / session / sign
 
@@ -439,7 +441,7 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0019" in _alembic(scratch_db, "heads").stdout
+    assert "0020" in _alembic(scratch_db, "heads").stdout
     assert _alembic(scratch_db, "downgrade", "0018").returncode == 0
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     eng = create_engine(scratch_db)
@@ -456,5 +458,5 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
     with eng.connect() as c:
         assert c.execute(text("SELECT count(*) FROM credit_field_refunds")).scalar() == 1
         assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'cash.field_custody.refund'")).scalar() == 1
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0019"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0020"
     eng.dispose()

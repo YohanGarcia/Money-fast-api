@@ -61,14 +61,13 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
         current_sessions = db.scalars(
             select(CashSession).join(CashBox).where(
                 CashBox.company_id == company_id,
-                CashSession.state.in_(("open", "closing_review", "closing_transfer_pending")),
+                CashSession.state.in_(("open", "closing")),  # T-021: closing = counted cash awaiting its handover
             )
         ).all()
         efectivo = sum(
             (
                 session.counted
-                if session.state in ("closing_review", "closing_transfer_pending")
-                and session.counted is not None
+                if session.state == "closing" and session.counted is not None
                 else session.balance
                 for session in current_sessions
             ),

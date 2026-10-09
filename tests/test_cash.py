@@ -12,6 +12,9 @@ from app.core.database import SessionLocal
 from app.models.payment import Payment
 from app.models.cash import CashCustodyTransfer, CashMovement, CashSession
 from app.services.cash_service import today
+from tests.cash_fixtures import denominations_for, grant_cash_permissions
+
+CASHIER_PERMS = ['cash.sessions.open', 'cash.sessions.close', 'cash.sessions.read']
 
 class CashTests(unittest.TestCase):
     setUpClass = classmethod(legacy.MoneyFastApiTests.setUpClass.__func__)
@@ -41,6 +44,8 @@ class CashTests(unittest.TestCase):
             self.users[role]=u
             self.roles[role]=self.auth_headers(self.login(role+'@example.com','workerpass123')['access_token'])
         self.admin_id=next(u['id'] for u in self.req('/users') if u['role']=='admin')  # ordering by name is collation-dependent on PostgreSQL
+        # T-021: cash permissions are explicit (never implied by the legacy role); the owner holds them via the system role
+        grant_cash_permissions(self.users['cashier']['company_id'],self.users['cashier']['id'],CASHIER_PERMS,self.branch)
         self.customer=self.create_customer(self.admin,collector_id=self.users['collector']['id'])
         self.loan=self.create_loan(self.admin,self.customer['id'])
         for bid in (self.branch,self.other): self.req('/cash/setup',dict(branch_id=bid,initial_balance='1000',notes='Prueba inicial'))
@@ -69,9 +74,11 @@ class CashTests(unittest.TestCase):
 
     def open(self,amount='1000'):
         self._finish_pending_close()
-        if Decimal(amount)>0:
+        funded=Decimal(amount)>0
+        if funded:
             self.req('/capital/movements',dict(kind='injection',amount=amount,notes='Fondo de prueba'),code=200)
-        return self.cmd('open',headers=self.roles['cashier'],amount=amount,notes='Conteo inicial')
+        # T-021 (D3/D4): the opening cash comes from capital and is counted by denomination
+        return self.cmd('open',headers=self.roles['cashier'],amount=amount,capital=funded,denominations=denominations_for(amount) if funded else {},notes='Conteo inicial')
     def delivery(self,amount='1000'):
         return self.cmd('declare',headers=self.roles['collector'],amount=amount)['delivery_id']
     def receive(self,did,amount='600'):
@@ -116,19 +123,25 @@ class CashTests(unittest.TestCase):
         self.cmd('movement',kind='expense',amount='100',notes='Gasto',version=v,code=409)
         self.assertEqual(Decimal(self.workspace()['session']['balance']),1600)
 
-    def test_closing_difference_review_and_immutable_snapshot(self):
+    def test_closing_difference_is_recorded_never_reopened_and_never_blocks_the_next_opening(self):
+        # T-021 / DR-007: the difference is a separate record; no resolve, no return-to-open, no adjustment movement
         self.open();w=self.workspace()
-        self.cmd('close',version=w['session']['version'],denominations={'500':1},notes='Faltante contado')
-        w=self.workspace();s=w['session'];saved=s['snapshot']
-        self.cmd('movement',kind='contribution',amount='100',notes='Aporte',version=s['version'],code=409)
-        self.cmd('resolve',headers=self.roles['cashier'],target_id=s['id'],version=s['version'],resolution='approve',notes='No autorizado',code=403)
-        self.cmd('resolve',target_id=s['id'],version=s['version'],resolution='return',notes='Recontar')
-        s=self.workspace()['session']
-        self.cmd('close',version=s['version'],denominations={'500':1},notes='Faltante verificado')
-        s=self.workspace()['session']
-        self.cmd('resolve',target_id=s['id'],version=s['version'],resolution='approve',notes='Ajuste aprobado')
+        self.cmd('close',version=w['session']['version'],denominations={'500':1},code=422)  # observation required
+        closed=self.cmd('close',version=w['session']['version'],denominations={'500':1},notes='Faltante contado')
+        self.assertEqual(closed['state'],'closing');self.assertEqual(Decimal(closed['difference']),-500)
+        self.assertEqual(closed['next_action']['action'],'accept_closing_handover')
+        s=self.workspace()['session'];saved=s['snapshot']
+        self.cmd('movement',kind='expense',amount='100',notes='Gasto',version=s['version'],code=409)
+        for headers in (self.roles['cashier'],self.admin):
+            r=self.cmd('resolve',headers=headers,target_id=s['id'],version=s['version'],resolution='return',notes='Recontar',code=409)
+            self.assertEqual(r['error']['code'],'difference_review_not_available')
+        self._finish_pending_close()
+        with SessionLocal() as db:
+            row=db.get(CashSession,s['id']);self.assertEqual(row.state,'closed')
+            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind=='closing_adjustment').count(),0)
+            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind=='closing_capital_transfer').one().amount,Decimal('-500.00'))
         self.assertEqual(self.workspace()['sessions'][0]['snapshot'],saved)
-        self.open('500');self.assertEqual(Decimal(self.workspace()['session']['balance']),500)
+        self.open('500');self.assertEqual(Decimal(self.workspace()['session']['balance']),500)  # the pending difference does not block
 
     def test_opening_is_independent_and_totals_remain_consistent(self):
         self.open('900');s=self.workspace()['session'];self.assertEqual(s['state'],'open');self.assertEqual(Decimal(s['opening_expected']),Decimal('900'))
@@ -165,9 +178,10 @@ class CashTests(unittest.TestCase):
         self.assertEqual(Decimal(self.workspace(self.roles['collector'])['pending']),1000)
 
     def test_simultaneous_open_and_identical_payment(self):
+        self.req('/capital/movements',dict(kind='injection',amount='1000',notes='Fondo de prueba'),code=200)
         def opening(_):
-            return self.client.post('/api/v1/cash/commands',json=dict(action='open',branch_id=self.branch,amount='1000',idempotency_key=str(uuid.uuid4())),headers=self.roles['cashier']).status_code
-        with ThreadPoolExecutor(2) as pool: self.assertEqual(sorted(pool.map(opening,range(2))),[200,409])
+            return self.client.post('/api/v1/cash/commands',json=dict(action='open',branch_id=self.branch,amount='1000',capital=True,denominations={'1000':1},idempotency_key=str(uuid.uuid4())),headers=self.roles['cashier']).status_code
+        with ThreadPoolExecutor(2) as pool: self.assertEqual(sorted(pool.map(opening,range(2))),[200,409])  # one session per cash point
         payload=dict(loan_id=self.loan['id'],payment_type='custom',amount='1000',method='cash',origin='field',branch_id=self.branch,idempotency_key=str(uuid.uuid4()))
         def pay(_):return self.client.post('/api/v1/payments',json=payload,headers=self.roles['collector'])
         with ThreadPoolExecutor(2) as pool: responses=list(pool.map(pay,range(2)))
@@ -244,12 +258,11 @@ class CashTests(unittest.TestCase):
 
     def test_midnight_and_inclusive_local_range(self):
         from datetime import UTC,datetime,time
-        from app.models.cash import CashSession
-        self.open()
-        with SessionLocal() as db:
-            s=db.get(CashSession,self.workspace()['session']['id'])
-            # UTC 03:59 is the preceding local calendar day in Santo Domingo.
-            s.opened_at=datetime.combine(today(),time(3,59),UTC);s.business_date=today()-timedelta(days=1);db.commit()
+        from unittest.mock import patch
+        # UTC 03:59 is the preceding local calendar day in Santo Domingo (T-021: the opening is immutable, so the clock
+        # is set when the session opens instead of rewriting it afterwards)
+        with patch('app.modules.cash.sessions.now_utc',return_value=datetime.combine(today(),time(3,59),UTC)):
+            self.open()
         s=self.workspace()['session'];self.cmd('close',version=s['version'],denominations={'1000':1})
         report=self.req(f'/cash/report?branch_id={self.branch}&start={today()}&end={today()}&kind=sessions')
         self.assertEqual(len(report['rows']),1)
@@ -315,5 +328,29 @@ class CashTests(unittest.TestCase):
         self.delivery('400')
         self.cmd('receive_collector',target_id=self.users['collector']['id'],version=self.workspace()['session']['version'],amount='400',code=409)
         self.assertEqual(Decimal(self.workspace()['pending']),400)
+
+    def test_t021_legacy_bridge_open_close_confirm_and_resolve(self):
+        third=self.req('/branches',dict(name='Sur',address='Calle Sur 1',manager_name='Gerente QA',notary_name='Notario QA',phone='8095555555'),code=201)['id']
+        setup=self.req('/cash/setup',dict(branch_id=third,initial_balance='0',notes='Caja nueva'))
+        self.assertIsNotNone(setup['cash_point_id'])  # a new box always gets its operational CashPoint
+        self.cmd('open',headers=self.roles['cashier'],target_id=self.users['manager']['id'],code=403)  # never on behalf of someone
+        self.req('/capital/movements',dict(kind='injection',amount='300',notes='Fondo'),code=200)
+        opened=self.cmd('open',headers=self.roles['cashier'],amount='300',capital=True,denominations={'200':1,'100':1})
+        self.assertEqual((opened['state'],opened['opening_mode']),('open','capital'))
+        w=self.workspace();s=w['session']
+        self.assertNotIn('open_idempotency_key',s);self.assertNotIn('open_request_digest',s)
+        self.cmd('movement',kind='contribution',amount='10',notes='Aporte sin origen',version=s['version'],code=422)  # D3
+        self.cmd('close',version=s['version']-1,denominations={'200':1,'100':1},code=409)  # stale version: nothing closes
+        closed=self.cmd('close',version=s['version'],denominations={'200':1,'100':1})
+        self.assertEqual(closed['state'],'closing');self.assertEqual(closed['next_action']['legacy_command'],'confirm_closing_transfer')
+        body=dict(action='confirm_closing_transfer',branch_id=self.branch,target_id=closed['transfer_id'],acceptance_id='bridge-'+uuid.uuid4().hex,
+                  acceptance_method='authenticated_confirmation',idempotency_key=str(uuid.uuid4()))
+        first=self.req('/cash/commands',body,self.admin)
+        self.assertEqual(first['state'],'closed')
+        self.assertEqual(self.req('/cash/commands',body,self.admin),first)  # replay: same answer, nothing moves twice
+        with SessionLocal() as db:
+            self.assertEqual(db.query(CashMovement).filter(CashMovement.kind=='closing_capital_transfer').count(),1)
+        r=self.cmd('resolve',target_id=s['id'],resolution='approve',notes='x',code=409)
+        self.assertEqual(r['error']['code'],'difference_review_not_available')
 
 if __name__=='__main__':unittest.main()
