@@ -20,6 +20,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
+from app.core.errors import IdempotencyConflict
 from app.models.cash import CashSession
 from app.modules.cash import difference_ddl
 from app.modules.cash import differences as diffs
@@ -638,6 +639,120 @@ def test_concurrent_resolutions_leave_one_resolution_one_event(client, sink, ten
 
 
 # ================================ database backstops ======================================================
+def test_cross_branch_requests_racing_for_one_tenant_key_end_as_idempotency_conflict(
+    client, sink, tenant_a, monkeypatch
+):
+    """The key is tenant-global but each branch has its own box lock: the loser must be a 409, never a database error."""
+    x1, x2 = rworld(client, sink, tenant_a, "a"), rworld(client, sink, tenant_a, "b")
+    assert x1.b != x2.b and x1.box != x2.box
+    _s1, d1 = shortage(client, x1)
+    _s2, d2 = shortage(client, x2)
+    before = money_state()
+    shared = key("t22")
+    real_replay, local, barrier = diffs._replay, threading.local(), threading.Barrier(2)
+
+    def synced_replay(*a, **kw):
+        found = real_replay(*a, **kw)
+        local.calls = getattr(local, "calls", 0) + 1
+        if local.calls == 2 and found is None:  # both passed the post-lock check: now both INSERT the same key
+            barrier.wait(30)
+        return found
+
+    monkeypatch.setattr(diffs, "_replay", synced_replay)
+    out: list = []
+
+    def attempt(resolver, difference_id):
+        with SessionLocal() as db:
+            actor = build_principal(db, db.get(UserAccount, resolver), 0)
+            try:
+                r = diffs.resolve_difference(
+                    db,
+                    actor,
+                    difference_id,
+                    idempotency_key=shared,
+                    resolution_type="accepted_loss",
+                    reason=REASON,
+                    reference=REF,
+                )
+                db.commit()
+                out.append((difference_id, "ok", r["replayed"]))
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                out.append((difference_id, type(exc).__name__, getattr(exc, "status_code", None)))
+
+    threads = [
+        threading.Thread(target=attempt, args=(x1.res, d1["id"])),
+        threading.Thread(target=attempt, args=(x2.res, d2["id"])),
+    ]
+    [t.start() for t in threads]
+    [t.join(90) for t in threads]
+    monkeypatch.setattr(diffs, "_replay", real_replay)
+    assert len(out) == 2
+    (winner,) = [o for o in out if o[1] == "ok"]
+    (loser,) = [o for o in out if o[1] != "ok"]
+    assert winner[2] is False and loser[1] == "IdempotencyConflict" and loser[2] == 409
+    assert len(resolutions("idempotency_key = :k", k=shared)) == 1 and len(resolutions()) == 1
+    assert [r.difference_id for r in resolutions()] == [winner[0]]
+    assert len(events(EVENT)) == 1
+    with SessionLocal() as db:
+        rows = db.execute(
+            text("SELECT id, status FROM cash_session_differences WHERE id IN (:a, :b)"), {"a": d1["id"], "b": d2["id"]}
+        ).all()
+    status = dict(rows)
+    assert status[winner[0]] == "resolved" and status[loser[0]] == "pending_review"
+    assert money_state() == before  # no CashMovement, no CapitalMovement, no session rewrite
+
+
+def test_only_the_idempotency_key_collision_is_classified_other_integrity_errors_propagate(
+    client, sink, tenant_a, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from sqlalchemy.exc import IntegrityError
+
+    x = rworld(client, sink, tenant_a)
+    _s, d = shortage(client, x)
+    _s2, d2 = shortage(client, x)
+    taken = key("t22")
+    resolve(client, x.res_h, d2["id"], "accepted_loss", reference=REF, k=taken)  # the winning row for ``taken``
+
+    def failing_flush(constraint):
+        real = Session.flush
+
+        def flush(self, *a, **kw):
+            if any(type(o).__name__ == "CashDifferenceResolution" for o in self.new):
+                raise IntegrityError("INSERT", {}, SimpleNamespace(diag=SimpleNamespace(constraint_name=constraint)))
+            return real(self, *a, **kw)
+
+        return flush
+
+    def attempt(constraint, k, expected):
+        with monkeypatch.context() as m, SessionLocal() as db:
+            m.setattr(Session, "flush", failing_flush(constraint))
+            real, calls = diffs._replay, []
+
+            def blind_until_the_insert(*a, **kw):  # the winner is not yet visible before and after the locks
+                calls.append(1)
+                return None if len(calls) <= 2 else real(*a, **kw)
+
+            m.setattr(diffs, "_replay", blind_until_the_insert)
+            actor = build_principal(db, db.get(UserAccount, x.res), 0)
+            with pytest.raises(expected):
+                diffs.resolve_difference(
+                    db, actor, d["id"], idempotency_key=k, resolution_type="accepted_loss", reason=REASON, reference=REF
+                )
+            db.rollback()
+
+    # only the KEY collision is classified (against the winning row); any other constraint keeps its own behaviour
+    attempt("uq_cash_difference_resolutions_key", taken, IdempotencyConflict)
+    for other in ("uq_cash_difference_resolutions_difference", "uq_cash_difference_resolutions_posting_session", None):
+        attempt(other, taken, IntegrityError)
+    # the key named but no winning row to classify against: never swallowed, never turned into a success
+    attempt("uq_cash_difference_resolutions_key", key("t22"), IntegrityError)
+    assert len(resolutions()) == 1 and len(events(EVENT)) == 1  # only d2's
+    assert detail(client, x.res_h, d["id"])["difference"]["status"] == "pending_review"
+
+
 def test_database_enforces_resolution_shape_phase_sign_and_disposition(client, sink, tenant_a):
     x = rworld(client, sink, tenant_a)
     s = open_(

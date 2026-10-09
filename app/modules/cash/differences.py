@@ -12,11 +12,15 @@
 * A resolution moves NO cash and NO capital (capital already holds the counted cash of the T-021 handover) and rewrites
   no session, count or movement. Any accounting posting is T-022B's own truth, keyed by ``resolution_id``.
 
-Lock order: cash box (legacy container) -> difference. The session is only read: ``closed`` is terminal. Functions here
+Lock order: cash box (legacy container) -> difference. The session is only read: ``closed`` is terminal. The idempotency
+key is tenant-global, so two requests on different differences (different box locks) can race for it: the loser's INSERT
+collides on ``uq_cash_difference_resolutions_key`` inside a savepoint and is classified by ``_replay`` (replay or
+``IdempotencyConflict``), never a raw database error. Functions here
 never commit: the HTTP layer commits the unit of work.
 """
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.errors import IdempotencyConflict
@@ -51,6 +55,7 @@ RESOLVE = "cash.differences.resolve"
 MIN_REASON = 10
 MIN_REFERENCE = 3
 EVENT_RESOLVED = "cash.difference.resolved"
+KEY_CONSTRAINT = "uq_cash_difference_resolutions_key"  # (tenant_id, idempotency_key): the tenant-global key anchor
 
 
 # --- rules ----------------------------------------------------------------------------------------------
@@ -221,8 +226,18 @@ def resolve_difference(
         idempotency_key=idempotency_key,
         request_digest=digest,
     )
-    db.add(resolution)
-    db.flush()
+    try:
+        with db.begin_nested():  # savepoint: only the resolution INSERT is undone if the key collides
+            db.add(resolution)
+            db.flush()
+    except IntegrityError as exc:
+        # The key is tenant-global, so a request on ANOTHER difference (another box lock) may have committed it first.
+        if getattr(getattr(exc.orig, "diag", None), "constraint_name", None) != KEY_CONSTRAINT:
+            raise  # one resolution per difference, posting uniqueness, FKs, triggers: not an idempotency matter
+        replay = _replay(db, tenant_id, actor, idempotency_key, digest, difference_id)
+        if replay is None:
+            raise
+        return replay
     d.status = "resolved"
     db.flush()
     _audit(
