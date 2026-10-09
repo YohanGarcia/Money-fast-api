@@ -10,7 +10,7 @@ from sqlalchemy import (DDL, CheckConstraint, Date, DateTime, ForeignKey, Foreig
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
-from app.modules.cash import ddl
+from app.modules.cash import ddl, difference_ddl
 
 SESSION_STATES = ('open', 'closing', 'closed')
 ACTIVE_SESSION_STATES = ('open', 'closing')
@@ -20,6 +20,12 @@ HANDOVER_PROVENANCES = ('legacy', 'migration', 'v2')
 DIFFERENCE_STATUSES = ('pending_review', 'under_review', 'resolved', 'dismissed')
 DIFFERENCE_PHASES = ('opening', 'closing')
 DIFFERENCE_PROVENANCES = ('legacy_migration', 'v2')
+# T-022A: the only resolutions; ``accounting_disposition`` is fixed at insert by the type and never changes (T-022B owns
+# any posting truth in its own tables, keyed by resolution_id)
+RESOLUTION_TYPES = ('no_further_action', 'accepted_loss', 'accepted_surplus')
+ACCOUNTING_DISPOSITIONS = ('none', 'posting_required')
+DISPOSITION_BY_TYPE = {'no_further_action': 'none', 'accepted_loss': 'posting_required',
+                       'accepted_surplus': 'posting_required'}
 
 
 def _in(column, values):
@@ -208,7 +214,8 @@ class CashMovement(Base):
 class CashSessionDifference(Base):
     """A physical difference observed at opening or close (DR-007): a record, never a balancing movement.
 
-    T-021 only creates it (``pending_review``) and never changes it; review and resolution belong to a later package."""
+    T-021 creates it (``pending_review``). Since T-022A its original columns stay immutable and ``status`` may only move
+    ``pending_review -> resolved``, together with its ``CashDifferenceResolution`` (``difference_ddl``)."""
     __tablename__ = 'cash_session_differences'
     __table_args__ = (
         CheckConstraint(_in('phase', DIFFERENCE_PHASES), name='phase_valid'),
@@ -221,6 +228,7 @@ class CashSessionDifference(Base):
         ForeignKeyConstraint(['tenant_id', 'cash_point_id'], ['cash_points.tenant_id', 'cash_points.id'],
                              name='fk_cash_session_differences_tenant_cash_point'),
         UniqueConstraint('session_id', 'phase', name='uq_cash_session_differences_session_phase'),
+        UniqueConstraint('id', 'phase', name='uq_cash_session_differences_id_phase'),
         Index('ix_cash_session_differences_review', 'tenant_id', 'status', 'id'),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -238,6 +246,44 @@ class CashSessionDifference(Base):
     detected_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class CashDifferenceResolution(Base):
+    """T-022A: the immutable review decision of a closed session's difference (INSERT only, never UPDATE/DELETE/TRUNCATE).
+
+    ``resolved`` means "review decision complete", not "accounting posted": a resolution moves no cash and no capital.
+    ``accounting_disposition`` is fixed by the type (``posting_required`` for accepted_loss/accepted_surplus, only for a
+    closing difference) and never changes; any future posting lives in T-022B tables referencing ``resolution_id``."""
+    __tablename__ = 'cash_difference_resolutions'
+    __table_args__ = (
+        CheckConstraint(_in('resolution_type', RESOLUTION_TYPES), name='type_valid'),
+        CheckConstraint(_in('accounting_disposition', ACCOUNTING_DISPOSITIONS), name='disposition_valid'),
+        CheckConstraint("(resolution_type = 'no_further_action') = (accounting_disposition = 'none')",
+                        name='disposition_matches_type'),
+        CheckConstraint("phase = 'closing' OR resolution_type = 'no_further_action'", name='opening_no_further_action_only'),
+        CheckConstraint("length(btrim(reason)) >= 10", name='reason_required'),
+        CheckConstraint("resolution_type = 'no_further_action' OR length(btrim(coalesce(reference, ''))) >= 3",
+                        name='reference_required'),
+        ForeignKeyConstraint(['difference_id', 'phase'], ['cash_session_differences.id', 'cash_session_differences.phase'],
+                             name='fk_cash_difference_resolutions_difference_phase'),
+        UniqueConstraint('difference_id', name='uq_cash_difference_resolutions_difference'),
+        Index('uq_cash_difference_resolutions_key', 'tenant_id', 'idempotency_key', unique=True),
+        Index('uq_cash_difference_resolutions_posting_session', 'session_id', unique=True,
+              postgresql_where=text("accounting_disposition = 'posting_required'")),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey('companies.id'))
+    difference_id: Mapped[int] = mapped_column(Integer)
+    session_id: Mapped[int] = mapped_column(ForeignKey('cash_sessions.id'), index=True)
+    phase: Mapped[str] = mapped_column(String(10))
+    resolution_type: Mapped[str] = mapped_column(String(30))
+    accounting_disposition: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(Text)
+    reference: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    resolved_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_digest: Mapped[str] = mapped_column(String(80))
 
 class CashTransfer(Base):
     __tablename__ = 'cash_transfers'
@@ -286,3 +332,15 @@ for _table in sorted(ddl.TRIGGER_TABLES):
 for _sql in ddl.TRIGGERS:
     event.listen(Base.metadata.tables[_sql.split(' ON ')[1].split(' ')[0]], 'after_create',
                  DDL(_sql).execute_if(dialect='postgresql'))
+
+# T-022A backstops (app.modules.cash.difference_ddl): installed after the T-021 ones, replacing the blanket guard of the
+# differences table by a DELETE-only guard + the status-only update check.
+for _table in (difference_ddl.DIFFERENCE_TABLE, difference_ddl.RESOLUTION_TABLE):
+    for _fn in difference_ddl.FUNCTIONS:
+        event.listen(Base.metadata.tables[_table], 'after_create', DDL(_fn.replace('%', '%%')).execute_if(dialect='postgresql'))
+event.listen(Base.metadata.tables[difference_ddl.DIFFERENCE_TABLE], 'after_create',
+             DDL(f"DROP TRIGGER IF EXISTS {difference_ddl.DIFFERENCE_GUARD} ON {difference_ddl.DIFFERENCE_TABLE}")
+             .execute_if(dialect='postgresql'))
+for _sql in difference_ddl.TRIGGERS:
+    _target = difference_ddl.RESOLUTION_TABLE if difference_ddl.RESOLUTION_TABLE in _sql else difference_ddl.DIFFERENCE_TABLE
+    event.listen(Base.metadata.tables[_target], 'after_create', DDL(_sql).execute_if(dialect='postgresql'))

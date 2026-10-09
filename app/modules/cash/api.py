@@ -6,8 +6,9 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.db import get_session
+from app.modules.cash import differences
 from app.modules.cash import sessions as service
-from app.modules.cash.schemas import AcceptHandoverIn, CloseIn, OpenIn
+from app.modules.cash.schemas import AcceptHandoverIn, CloseIn, OpenIn, ResolveDifferenceIn
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
 
@@ -87,9 +88,43 @@ def list_handovers(
 def list_differences(
     status: Literal["pending_review", "under_review", "resolved", "dismissed"] = "pending_review",
     branch_id: int | None = Query(default=None, gt=0),
+    phase: Literal["opening", "closing"] | None = None,
+    provenance: Literal["legacy_migration", "v2"] | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     before_id: int | None = Query(default=None, gt=0),
     actor: Principal = Actor,
     db: Session = Db,
 ):
-    return service.list_differences(db, actor, status=status, branch_id=branch_id, limit=limit, before_id=before_id)
+    return service.list_differences(
+        db,
+        actor,
+        status=status,
+        branch_id=branch_id,
+        limit=limit,
+        before_id=before_id,
+        phase=phase,
+        provenance=provenance,
+    )
+
+
+@router.get("/differences/{difference_id}")
+def get_difference(difference_id: int, actor: Principal = Actor, db: Session = Db):
+    return differences.get_difference(db, actor, difference_id)
+
+
+@router.post("/differences/{difference_id}/resolve")
+def resolve_difference(
+    difference_id: int, body: ResolveDifferenceIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    out = differences.resolve_difference(
+        db,
+        actor,
+        difference_id,
+        idempotency_key=body.idempotency_key,
+        resolution_type=body.resolution_type,
+        reason=body.reason,
+        reference=body.reference,
+        client_ip=client_ip(request),
+    )
+    db.commit()
+    return out

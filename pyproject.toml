@@ -63,6 +63,7 @@ include = [
   "tests/test_t011_collection_worklist.py",
   "tests/test_t012_collection_assignment.py",
   "tests/test_t021_cashpoint_session_lifecycle.py",
+  "tests/test_t022a_cash_difference_resolution.py",
 ]
 
 [tool.ruff.lint]
@@ -81,8 +82,10 @@ extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_
 "app/modules/field_custody/*.py" = ["E501"]  # long inline SQL (guard and consistency trigger functions)
 "app/modules/cash/port.py" = ["E501"]  # long BLOCKED_BY_EVIDENCE message
 "app/modules/cash/ddl.py" = ["E501"]  # long inline SQL (T-021 lifecycle and consistency trigger functions)
+"app/modules/cash/difference_ddl.py" = ["E501"]  # long inline SQL (T-022A resolution guard and consistency functions)
 "app/modules/cash/errors.py" = ["E501"]  # long user-facing messages
 "tests/test_t021_cashpoint_session_lifecycle.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t022a_cash_difference_resolution.py" = ["E501", "E731", "F811"]  # inline SQL, small lambdas, fixture re-use via import
 "tests/test_t007_disbursement.py" = ["E501", "E731"]  # inline SQL literals
 "tests/test_t008_payments.py" = ["E501", "E731"]  # inline SQL literals
 "tests/test_t009_payment_reversal.py" = ["E501", "E731"]  # inline SQL literals

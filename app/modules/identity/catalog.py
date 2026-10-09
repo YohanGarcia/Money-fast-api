@@ -141,6 +141,12 @@ CATALOG: tuple[PermissionDef, ...] = (
         True,
     ),
     PermissionDef("cash.differences.read", "tenant", "Consultar diferencias de caja registradas en apertura o cierre"),
+    PermissionDef(
+        "cash.differences.resolve",
+        "tenant",
+        "Resolver diferencias de caja de jornadas cerradas (nunca quien abrio, opero, cerro o detecto)",
+        True,
+    ),
     PermissionDef("platform.users.read", "platform", "Consultar usuarios de plataforma"),
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )

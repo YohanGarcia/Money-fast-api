@@ -1,4 +1,4 @@
-from app.models.cash import CashConfig, CashBox, CashSession, CashCustodyTransfer, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest, CashSessionDifference
+from app.models.cash import CashConfig, CashBox, CashSession, CashCustodyTransfer, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest, CashSessionDifference, CashDifferenceResolution
 from app.models.app_setting import AppSetting
 from app.models.bank_account import BankAccount
 from app.models.capital import CapitalMovement

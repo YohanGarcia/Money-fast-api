@@ -32,3 +32,14 @@ class AcceptHandoverIn(BaseModel):
 
     idempotency_key: str = Field(min_length=12, max_length=120)
     notes: str | None = Field(default=None, max_length=2000)
+
+
+class ResolveDifferenceIn(BaseModel):
+    """T-022A. ``reason`` and ``reference`` are validated by the service so their errors carry stable codes."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    idempotency_key: str = Field(min_length=12, max_length=120)
+    resolution_type: Literal["no_further_action", "accepted_loss", "accepted_surplus"]
+    reason: str = Field(default="", max_length=2000)
+    reference: str | None = Field(default=None, max_length=160)

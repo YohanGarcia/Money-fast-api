@@ -98,3 +98,41 @@ class DifferenceReviewNotAvailable(AppError):
     default_message = (
         "La revision de diferencias pertenece a un paquete posterior: una jornada cerrada no se reabre ni se ajusta."
     )
+
+
+class DifferenceNotFound(AppError):
+    status_code, code = 404, "cash_difference_not_found"
+    default_message = "Diferencia de caja no encontrada."
+
+
+class DifferenceNotPending(AppError):
+    status_code, code = 409, "difference_not_pending"
+    default_message = "La diferencia ya fue resuelta."
+
+
+class SessionNotClosed(AppError):
+    status_code, code = 409, "session_not_closed"
+    default_message = "La jornada aun no esta cerrada: sus diferencias se resuelven despues del cierre definitivo."
+
+
+class MakerCannotResolve(AppError):
+    status_code, code = 403, "maker_checker_violation"
+    default_message = "Quien abrio, opero, cerro o detecto la diferencia de la jornada no puede resolverla: la revision es independiente."
+
+
+class ResolutionNotApplicable(AppError):
+    status_code, code = 422, "resolution_type_not_applicable"
+    default_message = (
+        "Ese tipo de resolucion no aplica: la perdida solo resuelve un faltante y el sobrante un sobrante, ambos de "
+        "cierre; una diferencia de apertura solo se resuelve sin accion adicional."
+    )
+
+
+class ResolutionReasonRequired(AppError):
+    status_code, code = 422, "resolution_reason_required"
+    default_message = "Indica el motivo de la resolucion (al menos 10 caracteres)."
+
+
+class ResolutionReferenceRequired(AppError):
+    status_code, code = 422, "resolution_reference_required"
+    default_message = "Indica la referencia que respalda la decision (acta, informe o documento)."

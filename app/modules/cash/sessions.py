@@ -20,7 +20,7 @@ import hashlib
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.errors import IdempotencyConflict
@@ -30,6 +30,7 @@ from app.models.cash import (
     CashBox,
     CashConfig,
     CashCustodyTransfer,
+    CashDifferenceResolution,
     CashMovement,
     CashSession,
     CashSessionDifference,
@@ -57,6 +58,7 @@ from app.modules.cash.errors import (
 from app.modules.credit.rules import canonical_json
 from app.modules.identity.audit import record_event
 from app.modules.identity.authorization import Principal, build_principal, require
+from app.modules.identity.catalog import CATALOG_CODES
 from app.modules.identity.errors import PermissionDenied, TenantMismatch
 from app.modules.identity.models import UserAccount
 from app.modules.organization.models import CashPoint
@@ -203,6 +205,22 @@ def difference_out(d: CashSessionDifference) -> dict:
         "observation_note": d.observation_note,
         "detected_by": d.detected_by,
         "detected_at": d.detected_at,
+    }
+
+
+def resolution_out(r: CashDifferenceResolution) -> dict:
+    """The immutable decision. No idempotency key or digest."""
+    return {
+        "id": r.id,
+        "difference_id": r.difference_id,
+        "session_id": r.session_id,
+        "phase": r.phase,
+        "resolution_type": r.resolution_type,
+        "accounting_disposition": r.accounting_disposition,
+        "reason": r.reason,
+        "reference": r.reference,
+        "resolved_by": r.resolved_by,
+        "resolved_at": r.resolved_at,
     }
 
 
@@ -713,25 +731,36 @@ def current_session(db: Session, actor: Principal, cash_point_id: int) -> dict |
     return session_out(db, s)
 
 
-def _branch_ids(db: Session, actor: Principal, permission: str, branch_id: int | None) -> list[int] | None:
-    """None = every branch (tenant scope); otherwise the branches the actor may see for ``permission``."""
-    if branch_id is not None:
-        if not actor.allows(permission, tenant_id=actor.tenant_id, branch_id=branch_id):
-            raise PermissionDenied()
-        return [branch_id]
-    if actor.holds_at_tenant_scope(permission):
-        return None
-    ids = sorted({g.branch_id for g in actor.grants if g.permission == permission and g.scope_kind == "branch"})
-    if not ids:
+def _visible(actor: Principal, permission: str, branch_id: int | None) -> tuple[list[int] | None, list[int]]:
+    """(branches, cash_points) the actor may see for ``permission``; branches None = every branch (tenant scope).
+
+    T-022A: a cash_point-scoped grant counts too (it used to be ignored, so a CashPoint-scoped reviewer saw nothing)."""
+    if branch_id is not None and actor.allows(permission, tenant_id=actor.tenant_id, branch_id=branch_id):
+        return [branch_id], []
+    if branch_id is None and actor.holds_at_tenant_scope(permission):
+        return None, []
+    grants = [g for g in actor.grants if g.permission == permission and permission in CATALOG_CODES]
+    branches = sorted({g.branch_id for g in grants if g.scope_kind == "branch"})
+    points = sorted({g.cash_point_id for g in grants if g.scope_kind == "cash_point"})
+    if not points and (branch_id is not None or not branches):
         raise PermissionDenied()
-    return ids
+    return ([] if branch_id is not None else branches), points
+
+
+def _scoped(stmt, branches: list[int] | None, points: list[int], branch_id: int | None):
+    """Restrict a CashPoint-joined query to what ``_visible`` allowed (and to ``branch_id`` when asked)."""
+    if branches is not None:
+        stmt = stmt.where(or_(CashPoint.branch_id.in_(branches), CashPoint.id.in_(points)))
+    if branch_id is not None:
+        stmt = stmt.where(CashPoint.branch_id == branch_id)
+    return stmt
 
 
 def list_handovers(
     db: Session, actor: Principal, *, state: str, branch_id: int | None, limit: int, before_id: int | None
 ) -> dict:
     tenant_id = _gate(actor)
-    branches = _branch_ids(db, actor, ACCEPT, branch_id)
+    branches, points = _visible(actor, ACCEPT, branch_id)
     stmt = (
         select(CashCustodyTransfer)
         .join(CashSession, CashSession.id == CashCustodyTransfer.session_id)
@@ -744,8 +773,7 @@ def list_handovers(
         .order_by(CashCustodyTransfer.id.desc())
         .limit(limit)
     )
-    if branches is not None:
-        stmt = stmt.where(CashPoint.branch_id.in_(branches))
+    stmt = _scoped(stmt, branches, points, branch_id)
     if before_id is not None:
         stmt = stmt.where(CashCustodyTransfer.id < before_id)
     items = [handover_out(h) for h in db.scalars(stmt).all()]
@@ -753,10 +781,18 @@ def list_handovers(
 
 
 def list_differences(
-    db: Session, actor: Principal, *, status: str, branch_id: int | None, limit: int, before_id: int | None
+    db: Session,
+    actor: Principal,
+    *,
+    status: str,
+    branch_id: int | None,
+    limit: int,
+    before_id: int | None,
+    phase: str | None = None,
+    provenance: str | None = None,
 ) -> dict:
     tenant_id = _gate(actor)
-    branches = _branch_ids(db, actor, DIFF_READ, branch_id)
+    branches, points = _visible(actor, DIFF_READ, branch_id)
     stmt = (
         select(CashSessionDifference)
         .join(CashPoint, CashPoint.id == CashSessionDifference.cash_point_id)
@@ -764,11 +800,24 @@ def list_differences(
         .order_by(CashSessionDifference.id.desc())
         .limit(limit)
     )
-    if branches is not None:
-        stmt = stmt.where(CashPoint.branch_id.in_(branches))
+    stmt = _scoped(stmt, branches, points, branch_id)
+    if phase is not None:
+        stmt = stmt.where(CashSessionDifference.phase == phase)
+    if provenance is not None:
+        stmt = stmt.where(CashSessionDifference.provenance == provenance)
     if before_id is not None:
         stmt = stmt.where(CashSessionDifference.id < before_id)
-    items = [difference_out(d) for d in db.scalars(stmt).all()]
+    rows = db.scalars(stmt).all()
+    resolutions = {
+        r.difference_id: r
+        for r in db.scalars(
+            select(CashDifferenceResolution).where(CashDifferenceResolution.difference_id.in_([d.id for d in rows]))
+        )
+    }
+    items = [
+        {**difference_out(d), "resolution": resolution_out(resolutions[d.id]) if d.id in resolutions else None}
+        for d in rows
+    ]
     return {"items": items, "next_before_id": items[-1]["id"] if len(items) == limit else None}
 
 
