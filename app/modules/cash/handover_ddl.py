@@ -293,6 +293,9 @@ BEGIN
      OR NEW.decline_reason IS DISTINCT FROM OLD.decline_reason) THEN
     RAISE EXCEPTION 'session handover % decline is recorded: it is immutable', OLD.id;
   END IF;
+  IF OLD.declined_at IS NULL AND NEW.declined_at IS NOT NULL AND (OLD.state <> 'pending' OR NEW.state <> 'pending') THEN
+    RAISE EXCEPTION 'session handover % decline is recorded only while pending', OLD.id;
+  END IF;
   IF OLD.accept_idempotency_key IS NOT NULL AND (NEW.accept_idempotency_key IS DISTINCT FROM OLD.accept_idempotency_key
      OR NEW.accept_request_digest IS DISTINCT FROM OLD.accept_request_digest) THEN
     RAISE EXCEPTION 'session handover % acceptance key is recorded: it is immutable', OLD.id;

@@ -506,6 +506,65 @@ def test_decline_is_an_immutable_annotation_and_a_declined_row_can_never_be_acce
     assert "reason" not in ev.details and "decline_reason" not in ev.details  # ids and structured facts only
 
 
+def test_a_redirect_can_never_create_decline_history(client, sink, tenant_a):
+    """The decline is its own command: it is recorded only on a row that stays pending (review finding)."""
+    x = hworld(client, sink, tenant_a)
+    sid, h1, _ = declared(client, x)
+
+    def cancel_with_decline(hid, new_to):
+        # ONE complete transaction: the redirect command AND a decline that was never made, a valid replacement
+        # and the forward pointer. Only the sequencing guard may refuse it (every other constraint is satisfied).
+        ins, params = insert_handover(x, sid, to_user_id=new_to)
+        return [
+            (
+                "UPDATE cash_session_handovers SET state = 'cancelled', redirect_idempotency_key = :rk, "
+                "redirect_request_digest = 'sha256:x', redirected_by = :sup, redirected_at = now(), "
+                "redirect_reason = 'Reasignacion hacia otro destino', decline_idempotency_key = :dk, "
+                "decline_request_digest = 'sha256:y', declined_by = to_user_id, declined_at = now(), "
+                "decline_reason = 'Rechazo fabricado durante la redireccion' WHERE id = :h",
+                {"rk": key("t23r"), "dk": key("t23d"), "sup": x.sup, "h": hid},
+            ),
+            (ins, params),
+            (
+                "UPDATE cash_session_handovers SET redirected_to_session_handover_id = "
+                "(SELECT max(id) FROM cash_session_handovers WHERE source_session_id = :s) WHERE id = :h",
+                {"s": sid, "h": hid},
+            ),
+        ]
+
+    with pytest.raises(DBAPIError, match="decline is recorded only while pending"):
+        tx(*cancel_with_decline(h1, x.alt))
+    row = handover_row(h1)
+    assert (row["state"], row["declined_at"], row["redirected_at"]) == ("pending", None, None)
+    assert count("cash_session_handovers", f"source_session_id = {sid}") == 1
+
+    # redirect BEFORE a decline stays legal, and the cancelled row can never be annotated with a decline afterwards
+    out = dredirect(client, x.cas_h, h1, "next_session", x.alt).json()
+    h2 = out["replacement"]["handover"]["id"]
+    assert handover_row(h1)["state"] == "cancelled" and handover_row(h1)["declined_at"] is None
+    with pytest.raises(DBAPIError, match="decline is recorded only while pending"):
+        tx(
+            (
+                "UPDATE cash_session_handovers SET decline_idempotency_key = :dk, decline_request_digest = 'sha256:y', "
+                "declined_by = to_user_id, declined_at = now(), decline_reason = 'Rechazo fabricado a posteriori' "
+                "WHERE id = :h",
+                {"dk": key("t23d"), "h": h1},
+            )
+        )
+    assert handover_row(h1)["declined_at"] is None
+
+    # a genuine decline (pending, still pending) and then a redirect: legal, the decline fields stay identical
+    ddecline(client, x.alt_h, h2)
+    before = dict(handover_row(h2))
+    out = dredirect(client, x.sup_h, h2, "next_session", x.nxt).json()
+    h3 = out["replacement"]["handover"]["id"]
+    after = handover_row(h2)
+    assert after["state"] == "cancelled" and h3 != h2
+    for column in ("declined_by", "declined_at", "decline_reason", "decline_idempotency_key", "decline_request_digest"):
+        assert after[column] == before[column] and before[column] is not None
+    assert handover_row(h3)["declined_at"] is None
+
+
 # ================================ 4. redirect =============================================================
 def test_redirect_authority_chain_and_forward_pointers(client, sink, tenant_a):
     x = hworld(client, sink, tenant_a)
