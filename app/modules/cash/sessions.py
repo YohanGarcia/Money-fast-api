@@ -14,6 +14,12 @@
 
 Lock order: cash box (legacy container) -> cash point (open/close) -> session -> handover. The Credit Cash port keeps
 box -> session. Functions here never commit: the HTTP layer (or the legacy command) commits the unit of work.
+
+Idempotency (T-021H): the open / close / accept keys are TENANT-global but the locks are per branch. Each command
+(1) replays before the locks, (2) replays AGAIN right after them, before any state check, so an identical concurrent
+retry gets the original answer instead of busy / not-open / not-pending, and (3) claims its key inside a savepoint as
+its first write, so a collision with another branch's key is classified (only by the named unique index) as
+``IdempotencyConflict`` while the outer transaction and everything else stay intact.
 """
 
 import hashlib
@@ -21,6 +27,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.errors import IdempotencyConflict
@@ -70,6 +77,10 @@ ACCEPT, DIFF_READ = "cash.handovers.accept", "cash.differences.read"
 CENT = Decimal("0.01")
 MAX_AMOUNT = Decimal("9999999999.99")
 OPENING_FUND_KIND = "opening_capital_fund"
+# T-021H: the tenant-global idempotency anchors (their PostgreSQL names are the only collisions that are classified)
+OPEN_KEY_CONSTRAINT = "uq_cash_sessions_open_key"
+CLOSE_KEY_CONSTRAINT = "uq_cash_sessions_close_key"
+ACCEPT_KEY_CONSTRAINT = "uq_cash_custody_transfers_accept_key"
 CLOSING_TRANSFER_KIND = "closing_capital_transfer"
 
 
@@ -306,6 +317,57 @@ def _note(raw: str | None) -> str:
     return (raw or "").strip()
 
 
+def _violates(exc: IntegrityError, constraint: str) -> bool:
+    """True only when PostgreSQL names ``constraint`` (a unique index name) as the one violated."""
+    return getattr(getattr(exc.orig, "diag", None), "constraint_name", None) == constraint
+
+
+def _open_replay(db: Session, tenant_id: int, actor: Principal, idempotency_key: str, digest: str) -> dict | None:
+    """The answer to a repeated open (same key, digest and owner); a different request under the key conflicts."""
+    prior = db.scalar(
+        select(CashSession).where(
+            CashSession.tenant_id == tenant_id, CashSession.open_idempotency_key == idempotency_key
+        )
+    )
+    if prior is None:
+        return None
+    if prior.open_request_digest == digest and prior.cashier_id == actor.user_id:
+        return session_out(db, prior, replayed=True)
+    raise IdempotencyConflict()
+
+
+def _close_replay(db: Session, tenant_id: int, s: CashSession, idempotency_key: str, digest: str) -> dict | None:
+    """The answer to a repeated close of THIS session; the key on any other session conflicts."""
+    if s.close_idempotency_key == idempotency_key:
+        if s.close_request_digest == digest:
+            return session_out(db, s, replayed=True)
+        raise IdempotencyConflict()
+    if db.scalar(
+        select(CashSession.id).where(
+            CashSession.tenant_id == tenant_id, CashSession.close_idempotency_key == idempotency_key
+        )
+    ):
+        raise IdempotencyConflict()
+    return None
+
+
+def _accept_replay(
+    db: Session, tenant_id: int, actor: Principal, h: CashCustodyTransfer, idempotency_key: str, digest: str
+) -> dict | None:
+    """The answer to a repeated acceptance of THIS handover by the same actor; the key elsewhere conflicts."""
+    if h.accept_idempotency_key == idempotency_key:
+        if h.accept_request_digest == digest and h.accepted_by == actor.user_id:
+            return session_out(db, _session(db, tenant_id, h.session_id), replayed=True)
+        raise IdempotencyConflict()
+    if db.scalar(
+        select(CashCustodyTransfer.id).where(
+            CashCustodyTransfer.company_id == tenant_id, CashCustodyTransfer.accept_idempotency_key == idempotency_key
+        )
+    ):
+        raise IdempotencyConflict()
+    return None
+
+
 # --- open ------------------------------------------------------------------------------------------------
 def open_session(
     db: Session,
@@ -334,15 +396,9 @@ def open_session(
             "observation_note": note,
         }
     )
-    prior = db.scalar(
-        select(CashSession).where(
-            CashSession.tenant_id == tenant_id, CashSession.open_idempotency_key == idempotency_key
-        )
-    )
-    if prior is not None:
-        if prior.open_request_digest == digest and prior.cashier_id == actor.user_id:
-            return session_out(db, prior, replayed=True)
-        raise IdempotencyConflict()
+    replay = _open_replay(db, tenant_id, actor, idempotency_key, digest)
+    if replay is not None:
+        return replay
     cp = _cash_point(db, tenant_id, cash_point_id)
     require(actor, OPEN, **_scope(cp))
     if source == "zero":
@@ -360,6 +416,9 @@ def open_session(
     # locks: box -> cash point (the active-slot check serialises here; the partial UNIQUE index is the backstop)
     box = _box(db, tenant_id, cp.branch_id)
     cp = _cash_point(db, tenant_id, cash_point_id, lock=True)
+    replay = _open_replay(db, tenant_id, actor, idempotency_key, digest)  # an identical request committed meanwhile
+    if replay is not None:
+        return replay
     if cp.status != "active":
         raise CashPointNotActive()  # D6: suspended (or inactive) blocks a NEW session only
     ensure_cash_point_usable(db, tenant_id, cp.id, "DOP")  # T-003 gate: tenant and branch active, currency admitted
@@ -391,8 +450,17 @@ def open_session(
         open_idempotency_key=idempotency_key,
         open_request_digest=digest,
     )
-    db.add(s)
-    db.flush()
+    try:
+        with db.begin_nested():  # savepoint: only the session INSERT is undone if the tenant-global key collides
+            db.add(s)
+            db.flush()
+    except IntegrityError as exc:
+        if not _violates(exc, OPEN_KEY_CONSTRAINT):
+            raise  # any other integrity failure keeps its own behaviour
+        replay = _open_replay(db, tenant_id, actor, idempotency_key, digest)  # the winner: another branch or request
+        if replay is None:
+            raise
+        return replay
     if source == "capital":
         movement = CashMovement(
             box_id=box.id,
@@ -506,16 +574,9 @@ def close_session(
         }
     )
     s = _session(db, tenant_id, session_id)
-    if s.close_idempotency_key == idempotency_key:
-        if s.close_request_digest == digest:
-            return session_out(db, s, replayed=True)
-        raise IdempotencyConflict()
-    if db.scalar(
-        select(CashSession.id).where(
-            CashSession.tenant_id == tenant_id, CashSession.close_idempotency_key == idempotency_key
-        )
-    ):
-        raise IdempotencyConflict()
+    replay = _close_replay(db, tenant_id, s, idempotency_key, digest)
+    if replay is not None:
+        return replay
     cp = _cash_point(db, tenant_id, s.cash_point_id)
     require(actor, CLOSE, **_scope(cp))
     if s.cashier_id != actor.user_id:
@@ -524,6 +585,9 @@ def close_session(
     _box(db, tenant_id, cp.branch_id)
     cp = _cash_point(db, tenant_id, s.cash_point_id, lock=True)
     s = _session(db, tenant_id, session_id, lock=True)
+    replay = _close_replay(db, tenant_id, s, idempotency_key, digest)  # an identical request closed it meanwhile
+    if replay is not None:
+        return replay
     if s.state != "open":
         raise SessionNotOpen()
     expected = Decimal(s.balance)
@@ -535,17 +599,27 @@ def close_session(
             raise ReceiverRequired()
         _valid_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
     at = now_utc()
-    s.counted, s.closing_expected, s.difference = counted, expected, difference
-    s.denominations = counted_map
-    s.close_contract = "v2"
-    s.closed_by, s.closed_at = actor.user_id, at
-    s.close_idempotency_key, s.close_request_digest = idempotency_key, digest
-    s.snapshot = _close_snapshot(db, s, expected, counted, difference) | (snapshot_extra or {})
-    if note:
-        s.notes = note
-    s.state = "closing" if counted > 0 else "closed"
-    s.version += 1
-    db.flush()
+    snapshot = _close_snapshot(db, s, expected, counted, difference) | (snapshot_extra or {})  # reads only
+    try:
+        with db.begin_nested():  # savepoint: only this UPDATE (which claims the tenant-global key) is undone
+            s.counted, s.closing_expected, s.difference = counted, expected, difference
+            s.denominations = counted_map
+            s.close_contract = "v2"
+            s.closed_by, s.closed_at = actor.user_id, at
+            s.close_idempotency_key, s.close_request_digest = idempotency_key, digest
+            s.snapshot = snapshot
+            if note:
+                s.notes = note
+            s.state = "closing" if counted > 0 else "closed"
+            s.version += 1
+            db.flush()
+    except IntegrityError as exc:
+        if not _violates(exc, CLOSE_KEY_CONSTRAINT):
+            raise
+        replay = _close_replay(db, tenant_id, s, idempotency_key, digest)  # the session is restored: open, no key
+        if replay is None:
+            raise
+        return replay
     if difference != 0:
         _record_difference(
             db, s, phase="closing", expected=expected, counted=counted, note=note, actor_id=actor.user_id, at=at
@@ -619,16 +693,9 @@ def accept_handover(
     )
     if h is None:
         raise HandoverNotFound()
-    if h.accept_idempotency_key == idempotency_key:
-        if h.accept_request_digest == digest and h.accepted_by == actor.user_id:
-            return session_out(db, _session(db, tenant_id, h.session_id), replayed=True)
-        raise IdempotencyConflict()
-    if db.scalar(
-        select(CashCustodyTransfer.id).where(
-            CashCustodyTransfer.company_id == tenant_id, CashCustodyTransfer.accept_idempotency_key == idempotency_key
-        )
-    ):
-        raise IdempotencyConflict()
+    replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)
+    if replay is not None:
+        return replay
     s = _session(db, tenant_id, h.session_id)
     cp = _cash_point(db, tenant_id, s.cash_point_id)
     require(actor, ACCEPT, **_scope(cp))
@@ -641,6 +708,9 @@ def accept_handover(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)  # an identical request won meanwhile
+    if replay is not None:
+        return replay
     if h.state != "pending" or s.state != "closing":
         raise HandoverNotPending()
     if actor.user_id == h.from_user_id:
@@ -648,6 +718,20 @@ def accept_handover(
     if h.provenance == "v2" and actor.user_id != h.to_user_id:
         raise NotNamedReceiver()
     at = now_utc()
+    # The key is claimed FIRST, alone in a savepoint, before any movement / capital row / balance / state change: a
+    # collision with another branch's key can then only ever undo this one UPDATE, so no economic row has to escape a
+    # rollback. A later failure aborts the whole request transaction (services never commit).
+    try:
+        with db.begin_nested():
+            h.accept_idempotency_key, h.accept_request_digest = idempotency_key, digest
+            db.flush()
+    except IntegrityError as exc:
+        if not _violates(exc, ACCEPT_KEY_CONSTRAINT):
+            raise
+        replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)
+        if replay is None:
+            raise
+        return replay
     if h.amount > 0:
         movement = CashMovement(
             box_id=s.box_id,
@@ -676,7 +760,6 @@ def accept_handover(
     h.accepted_by, h.accepted_at = actor.user_id, at
     h.acceptance_id = acceptance_id or f"T021-{tenant_id}-{idempotency_key}"[:80]
     h.acceptance_method = "authenticated_confirmation"
-    h.accept_idempotency_key, h.accept_request_digest = idempotency_key, digest
     if notes:
         h.notes = notes
     h.version += 1
