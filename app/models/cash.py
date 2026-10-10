@@ -10,11 +10,11 @@ from sqlalchemy import (DDL, CheckConstraint, Date, DateTime, ForeignKey, Foreig
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
-from app.modules.cash import ddl, difference_ddl
+from app.modules.cash import ddl, difference_ddl, handover_ddl
 
 SESSION_STATES = ('open', 'closing', 'closed')
 ACTIVE_SESSION_STATES = ('open', 'closing')
-OPENING_SOURCES = ('legacy', 'zero', 'capital')
+OPENING_SOURCES = ('legacy', 'zero', 'capital', 'handover')
 CONTRACTS = ('legacy', 'v2')
 HANDOVER_PROVENANCES = ('legacy', 'migration', 'v2')
 DIFFERENCE_STATUSES = ('pending_review', 'under_review', 'resolved', 'dismissed')
@@ -26,6 +26,9 @@ RESOLUTION_TYPES = ('no_further_action', 'accepted_loss', 'accepted_surplus')
 ACCOUNTING_DISPOSITIONS = ('none', 'posting_required')
 DISPOSITION_BY_TYPE = {'no_further_action': 'none', 'accepted_loss': 'posting_required',
                        'accepted_surplus': 'posting_required'}
+# T-023A: direct same-CashPoint session handovers (their own table; ``cash_custody_transfers`` stays capital-only)
+SESSION_HANDOVER_STATES = ('pending', 'confirmed', 'cancelled')
+HANDOVER_MOVEMENT_KINDS = ('session_handover_out', 'opening_handover_fund')
 
 
 def _in(column, values):
@@ -62,8 +65,14 @@ class CashSession(Base):
         CheckConstraint("close_contract IS DISTINCT FROM 'v2' OR (counted >= 0 AND closing_expected IS NOT NULL "
                         "AND difference = counted - closing_expected)", name='v2_close_difference'),
         CheckConstraint("state = 'open' OR close_contract IS NOT NULL", name='closed_has_contract'),
+        # T-023A: a ``handover`` opening is born only from its confirmed direct handover and carries no open key of its own
+        CheckConstraint("(opening_source = 'handover') = (opening_handover_id IS NOT NULL)", name='handover_opening_consistent'),
+        CheckConstraint("opening_source <> 'handover' OR (open_idempotency_key IS NULL AND open_request_digest IS NULL)",
+                        name='handover_opening_unkeyed'),
         ForeignKeyConstraint(['tenant_id', 'cash_point_id'], ['cash_points.tenant_id', 'cash_points.id'],
                              name='fk_cash_sessions_tenant_cash_point'),
+        Index('uq_cash_sessions_opening_handover', 'opening_handover_id', unique=True,
+              postgresql_where=text('opening_handover_id IS NOT NULL')),
         Index('uq_cash_sessions_active_cash_point', 'cash_point_id', unique=True,
               postgresql_where=text("state IN ('open', 'closing')")),
         Index('uq_cash_sessions_open_key', 'tenant_id', 'open_idempotency_key', unique=True,
@@ -83,6 +92,9 @@ class CashSession(Base):
     opening_denominations: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     closing_expected: Mapped[Decimal | None] = mapped_column(Numeric(12,2), nullable=True)
     balance_base: Mapped[Decimal] = mapped_column(Numeric(12,2), default=Decimal('0'))
+    # T-023A: the confirmed direct handover this session was opened from (unique, immutable); NULL for zero/capital/legacy
+    opening_handover_id: Mapped[int | None] = mapped_column(
+        ForeignKey('cash_session_handovers.id', name='fk_cash_sessions_opening_handover_id', use_alter=True), nullable=True)
     open_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     open_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     close_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -190,6 +202,17 @@ class CashMovement(Base):
               postgresql_where=text("kind = 'opening_capital_fund'")),
         Index('uq_cash_movements_closing_transfer', 'session_id', unique=True,
               postgresql_where=text("kind = 'closing_capital_transfer'")),
+        # T-023A: a confirmed direct handover has exactly one source movement and one receiving movement
+        CheckConstraint("(kind IN ('session_handover_out', 'opening_handover_fund')) = (session_handover_id IS NOT NULL)",
+                        name='handover_link_consistent'),
+        CheckConstraint("kind <> 'session_handover_out' OR amount < 0", name='handover_out_negative'),
+        CheckConstraint("kind <> 'opening_handover_fund' OR amount > 0", name='handover_fund_positive'),
+        Index('uq_cash_movements_handover_out', 'session_handover_id', unique=True,
+              postgresql_where=text("kind = 'session_handover_out'")),
+        Index('uq_cash_movements_handover_fund', 'session_handover_id', unique=True,
+              postgresql_where=text("kind = 'opening_handover_fund'")),
+        Index('ix_cash_movements_session_handover', 'session_handover_id',
+              postgresql_where=text('session_handover_id IS NOT NULL')),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     box_id: Mapped[int] = mapped_column(ForeignKey('cash_boxes.id'), index=True)
@@ -206,6 +229,9 @@ class CashMovement(Base):
     delivery_id: Mapped[int | None] = mapped_column(ForeignKey('cash_deliveries.id'))
     custody_transfer_id: Mapped[int | None] = mapped_column(ForeignKey('cash_custody_transfers.id', name='fk_cash_movements_custody_transfer_id'), nullable=True)
     reverses_id: Mapped[int | None] = mapped_column(ForeignKey('cash_movements.id'), unique=True)
+    # T-023A: the direct session handover a ``session_handover_out`` / ``opening_handover_fund`` movement belongs to
+    session_handover_id: Mapped[int | None] = mapped_column(
+        ForeignKey('cash_session_handovers.id', name='fk_cash_movements_session_handover_id'), nullable=True)
     notes: Mapped[str] = mapped_column(Text)
     reference: Mapped[str] = mapped_column(String(160), default='')
     proof: Mapped[dict | None] = mapped_column(JSON)
@@ -285,6 +311,93 @@ class CashDifferenceResolution(Base):
     idempotency_key: Mapped[str] = mapped_column(String(120))
     request_digest: Mapped[str] = mapped_column(String(80))
 
+
+class CashSessionHandover(Base):
+    """T-023A: a DIRECT handover of a closing session's counted cash to a named next cashier of the SAME CashPoint.
+
+    ``pending -> confirmed`` (terminal) | ``pending -> cancelled`` (only by a redirect, which also fills ONE immutable forward
+    pointer: to a later direct row or to a new T-021 capital custody row). Decline is an immutable annotation on a
+    ``pending`` row (never a fourth state); a declined row can never be confirmed. Confirming it opens the receiving session
+    (``cash_sessions.opening_handover_id``) in the same transaction; the receiver's fresh count is that session's
+    ``opening_denominations`` (single source of truth). Every command owns its idempotency key + digest."""
+    __tablename__ = 'cash_session_handovers'
+    __table_args__ = (
+        CheckConstraint(_in('state', SESSION_HANDOVER_STATES), name='state_valid'),
+        CheckConstraint("currency_code = 'DOP'", name='currency_dop'),
+        CheckConstraint('amount > 0', name='amount_positive'),
+        CheckConstraint('to_user_id <> from_user_id', name='receiver_not_maker'),
+        CheckConstraint('(accept_idempotency_key IS NULL) = (accept_request_digest IS NULL)', name='accept_claim_complete'),
+        CheckConstraint('(accepted_by IS NULL) = (accepted_at IS NULL)', name='accept_actor_complete'),
+        CheckConstraint("(state = 'confirmed') = (accepted_by IS NOT NULL)", name='confirmed_iff_accepted'),
+        CheckConstraint("state <> 'confirmed' OR accept_idempotency_key IS NOT NULL", name='confirmed_has_key'),
+        CheckConstraint('accepted_by IS NULL OR accepted_by = to_user_id', name='accepted_by_receiver'),
+        CheckConstraint('declined_at IS NULL OR accept_idempotency_key IS NULL', name='declined_never_claimed'),
+        CheckConstraint("state <> 'confirmed' OR declined_at IS NULL", name='declined_never_confirmed'),
+        CheckConstraint('(declined_at IS NULL) = (declined_by IS NULL) AND (declined_at IS NULL) = '
+                        '(decline_idempotency_key IS NULL) AND (declined_at IS NULL) = (decline_request_digest IS NULL) '
+                        'AND (declined_at IS NULL) = (decline_reason IS NULL)', name='decline_complete'),
+        CheckConstraint('declined_by IS NULL OR declined_by = to_user_id', name='declined_by_receiver'),
+        CheckConstraint('decline_reason IS NULL OR length(btrim(decline_reason)) >= 10', name='decline_reason_required'),
+        CheckConstraint('(redirected_at IS NULL) = (redirected_by IS NULL) AND (redirected_at IS NULL) = '
+                        '(redirect_idempotency_key IS NULL) AND (redirected_at IS NULL) = (redirect_request_digest IS NULL) '
+                        'AND (redirected_at IS NULL) = (redirect_reason IS NULL)', name='redirect_complete'),
+        CheckConstraint("(state = 'cancelled') = (redirected_at IS NOT NULL)", name='cancelled_iff_redirected'),
+        CheckConstraint('redirect_reason IS NULL OR length(btrim(redirect_reason)) >= 10', name='redirect_reason_required'),
+        CheckConstraint('redirected_to_session_handover_id IS NULL OR redirected_to_capital_handover_id IS NULL',
+                        name='one_forward_pointer'),
+        CheckConstraint("(redirected_to_session_handover_id IS NULL AND redirected_to_capital_handover_id IS NULL) "
+                        "OR state = 'cancelled'", name='pointer_only_when_cancelled'),
+        ForeignKeyConstraint(['tenant_id', 'cash_point_id'], ['cash_points.tenant_id', 'cash_points.id'],
+                             name='fk_cash_session_handovers_tenant_cash_point'),
+        Index('uq_cash_session_handovers_live', 'source_session_id', unique=True,
+              postgresql_where=text("state <> 'cancelled'")),
+        Index('ix_cash_session_handovers_source_session', 'source_session_id'),
+        Index('ix_cash_session_handovers_receiver', 'to_user_id', 'state'),
+        Index('ix_cash_session_handovers_tenant', 'tenant_id', 'id'),
+        Index('uq_cash_session_handovers_accept_key', 'tenant_id', 'accept_idempotency_key', unique=True,
+              postgresql_where=text('accept_idempotency_key IS NOT NULL')),
+        Index('uq_cash_session_handovers_decline_key', 'tenant_id', 'decline_idempotency_key', unique=True,
+              postgresql_where=text('decline_idempotency_key IS NOT NULL')),
+        Index('uq_cash_session_handovers_redirect_key', 'tenant_id', 'redirect_idempotency_key', unique=True,
+              postgresql_where=text('redirect_idempotency_key IS NOT NULL')),
+        Index('uq_cash_session_handovers_redirect_next', 'redirected_to_session_handover_id', unique=True,
+              postgresql_where=text('redirected_to_session_handover_id IS NOT NULL')),
+        Index('uq_cash_session_handovers_redirect_capital', 'redirected_to_capital_handover_id', unique=True,
+              postgresql_where=text('redirected_to_capital_handover_id IS NOT NULL')),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey('companies.id'))
+    box_id: Mapped[int] = mapped_column(ForeignKey('cash_boxes.id'))
+    cash_point_id: Mapped[int] = mapped_column(Integer)
+    source_session_id: Mapped[int] = mapped_column(ForeignKey('cash_sessions.id'))
+    from_user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    to_user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    currency_code: Mapped[str] = mapped_column(String(3), default='DOP')
+    state: Mapped[str] = mapped_column(String(20), default='pending')
+    accept_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    accept_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    accepted_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decline_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    decline_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    declined_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    declined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decline_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    redirect_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    redirect_request_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    redirected_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    redirected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    redirect_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    redirected_to_session_handover_id: Mapped[int | None] = mapped_column(
+        ForeignKey('cash_session_handovers.id', name='fk_cash_session_handovers_redirect_next'), nullable=True)
+    redirected_to_capital_handover_id: Mapped[int | None] = mapped_column(
+        ForeignKey('cash_custody_transfers.id', name='fk_cash_session_handovers_redirect_capital'), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    version: Mapped[int] = mapped_column(default=1)
+
+
 class CashTransfer(Base):
     __tablename__ = 'cash_transfers'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -344,3 +457,12 @@ event.listen(Base.metadata.tables[difference_ddl.DIFFERENCE_TABLE], 'after_creat
 for _sql in difference_ddl.TRIGGERS:
     _target = difference_ddl.RESOLUTION_TABLE if difference_ddl.RESOLUTION_TABLE in _sql else difference_ddl.DIFFERENCE_TABLE
     event.listen(Base.metadata.tables[_target], 'after_create', DDL(_sql).execute_if(dialect='postgresql'))
+
+# T-023A backstops (app.modules.cash.handover_ddl): the four 0020 functions it REPLACES are re-installed after every T-021
+# table's own copy (listeners run in registration order, so the newest definition always wins), then the new functions/triggers.
+for _table in sorted(ddl.TRIGGER_TABLES | {handover_ddl.HANDOVER_TABLE}):
+    for _fn in handover_ddl.FUNCTIONS:
+        event.listen(Base.metadata.tables[_table], 'after_create', DDL(_fn.replace('%', '%%')).execute_if(dialect='postgresql'))
+for _sql in handover_ddl.TRIGGERS:
+    event.listen(Base.metadata.tables[_sql.split(' ON ')[1].split(' ')[0]], 'after_create',
+                 DDL(_sql).execute_if(dialect='postgresql'))

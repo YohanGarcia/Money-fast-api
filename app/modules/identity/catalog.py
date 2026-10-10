@@ -140,6 +140,18 @@ CATALOG: tuple[PermissionDef, ...] = (
         "Recibir y confirmar la entrega de cierre de efectivo a capital (nunca la propia)",
         True,
     ),
+    PermissionDef(
+        "cash.handovers.receive",
+        "tenant",
+        "Recibir efectivo de cierre de otro cajero en la misma caja y abrir la propia jornada con el (nunca el propio)",
+        True,
+    ),
+    PermissionDef(
+        "cash.handovers.redirect",
+        "tenant",
+        "Reasignar una entrega directa de cierre a otro cajero de la misma caja o a capital (supervision)",
+        True,
+    ),
     PermissionDef("cash.differences.read", "tenant", "Consultar diferencias de caja registradas en apertura o cierre"),
     PermissionDef(
         "cash.differences.resolve",

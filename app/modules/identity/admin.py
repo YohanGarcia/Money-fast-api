@@ -152,6 +152,12 @@ def disable_user(db: Session, actor: Principal, user_id: int, client_ip: str | N
 
     if has_open_custody(db, actor.tenant_id, user.id):
         raise OutstandingFieldCustody()
+    # T-023A: an open / closing session or a pending handover to receive is a responsibility nobody inherits silently
+    from app.modules.cash.errors import UserHasCashResponsibility
+    from app.modules.cash.sessions import has_cash_responsibility
+
+    if has_cash_responsibility(db, actor.tenant_id, user.id):
+        raise UserHasCashResponsibility()
     now = now_utc()
     user.status = "disabled"
     user.disabled_at = now

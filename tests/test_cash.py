@@ -177,6 +177,13 @@ class CashTests(unittest.TestCase):
         self.req(f"/customers/{c['id']}",{**c,'assigned_collector_id':None},method='PUT')
         self.assertEqual(Decimal(self.workspace(self.roles['collector'])['pending']),1000)
 
+    def test_t023a_legacy_user_update_cannot_deactivate_a_user_who_owns_an_active_session(self):
+        self.open('1000');u=self.users['cashier']
+        body=dict(full_name=u['full_name'],email=u['email'],role='cashier',is_active=False,branch_id=self.branch)
+        r=self.client.request('PUT','/api/v1'+f"/users/{u['id']}",json=body,headers=self.admin)
+        self.assertEqual(r.status_code,409,r.text);self.assertIn('desactivarlo',r.text)  # the T-023A cash responsibility guard
+        self.req(f"/users/{u['id']}",{**body,'is_active':True},method='PUT')  # staying active is fine
+
     def test_simultaneous_open_and_identical_payment(self):
         self.req('/capital/movements',dict(kind='injection',amount='1000',notes='Fondo de prueba'),code=200)
         def opening(_):

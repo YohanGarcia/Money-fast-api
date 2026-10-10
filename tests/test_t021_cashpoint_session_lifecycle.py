@@ -1069,7 +1069,7 @@ def test_migration_0020_maps_legacy_history_without_rewriting_it_and_downgrades_
     ]  # D7 history intact
     refused_down = _alembic(scratch_db, "downgrade", "0019")
     assert refused_down.returncode != 0 and "closing handovers created or accepted under T-021" in refused_down.stderr
-    assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0021",)]
+    assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0022",)]
     eng.dispose()
 
 
@@ -1153,5 +1153,5 @@ def test_migration_0020_empty_upgrade_downgrade_reupgrade_and_v2_history_refuses
     out = _alembic(scratch_db, "downgrade", "0019")
     assert out.returncode != 0 and "v2 cash sessions exist" in out.stderr
     with eng.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0021"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0022"
     eng.dispose()

@@ -1055,6 +1055,9 @@ def test_migration_0021_upgrade_check_empty_downgrade_reupgrade_and_guard_parity
     up = _alembic(scratch_db, "upgrade", "head")
     assert up.returncode == 0, up.stderr[-800:]
     assert _alembic(scratch_db, "check").returncode == 0
+    assert (
+        _alembic(scratch_db, "downgrade", "0021").returncode == 0
+    )  # T-023A (0022) has its own suite: look at 0021 itself
     at_0021 = _snapshot(eng)
     assert at_0021["version"] == "0021" and at_0021["permission"] == 1
     assert {t[1] for t in at_0021["triggers"]} >= {
@@ -1072,6 +1075,7 @@ def test_migration_0021_upgrade_check_empty_downgrade_reupgrade_and_guard_parity
     assert restored == at_0020  # exact 0020 guard + structure, no 0021 object left (functions, constraints, indexes)
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
+    assert _alembic(scratch_db, "downgrade", "0021").returncode == 0
     assert _snapshot(eng) == at_0021
     eng.dispose()
 
@@ -1202,7 +1206,9 @@ def test_migration_0021_legacy_differences_resolve_only_after_the_session_closes
     assert (
         _snapshot(eng) == before and _rows(eng, "SELECT * FROM cash_difference_resolutions ORDER BY id") == res_before
     )
-    assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0021",)]
+    assert _rows(eng, "SELECT version_num FROM alembic_version") == [
+        ("0022",)
+    ]  # the refused chain rolls back whole: the head stays
     assert _alembic(scratch_db, "check").returncode == 0
     eng.dispose()
 
@@ -1230,7 +1236,9 @@ def test_migration_0021_downgrade_also_refuses_resolved_status_or_security_evide
     before = _snapshot(eng)
     out = _alembic(scratch_db, "downgrade", "0020")
     assert out.returncode != 0 and "cannot downgrade 0021: cash difference resolution history exists" in out.stderr
-    assert _snapshot(eng) == before and _rows(eng, "SELECT version_num FROM alembic_version") == [("0021",)]
+    assert _snapshot(eng) == before and _rows(eng, "SELECT version_num FROM alembic_version") == [
+        ("0022",)
+    ]  # the refused chain rolls back whole: the head stays
     eng.dispose()
 
 

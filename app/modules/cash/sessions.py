@@ -20,13 +20,17 @@ Idempotency (T-021H): the open / close / accept keys are TENANT-global but the l
 retry gets the original answer instead of busy / not-open / not-pending, and (3) claims its key inside a savepoint as
 its first write, so a collision with another branch's key is classified (only by the named unique index) as
 ``IdempotencyConflict`` while the outer transaction and everything else stay intact.
+
+Direct handover (T-023A): ``close`` with ``destination = next_session`` leaves the counted cash in ONE pending
+``cash_session_handovers`` row for a named cashier of the SAME CashPoint (``app.modules.cash.session_handovers`` owns
+accept / decline / redirect). The capital close keeps its historical digest byte for byte (no ``destination`` key).
 """
 
 import hashlib
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -41,6 +45,7 @@ from app.models.cash import (
     CashMovement,
     CashSession,
     CashSessionDifference,
+    CashSessionHandover,
 )
 from app.modules.cash.ddl import DENOMINATIONS
 from app.modules.cash.errors import (
@@ -53,9 +58,11 @@ from app.modules.cash.errors import (
     HandoverNotPending,
     InsufficientCapital,
     InvalidCount,
+    InvalidHandoverDestination,
     InvalidOpening,
     InvalidReceiver,
     MakerCannotAccept,
+    NextSessionRequiresCash,
     NotNamedReceiver,
     NotSessionOwner,
     ObservationRequired,
@@ -74,6 +81,7 @@ from app.services import capital_service
 
 READ, OPEN, CLOSE = "cash.sessions.read", "cash.sessions.open", "cash.sessions.close"
 ACCEPT, DIFF_READ = "cash.handovers.accept", "cash.differences.read"
+RECEIVE, REDIRECT = "cash.handovers.receive", "cash.handovers.redirect"  # T-023A (direct handover)
 CENT = Decimal("0.01")
 MAX_AMOUNT = Decimal("9999999999.99")
 OPENING_FUND_KIND = "opening_capital_fund"
@@ -82,6 +90,11 @@ OPEN_KEY_CONSTRAINT = "uq_cash_sessions_open_key"
 CLOSE_KEY_CONSTRAINT = "uq_cash_sessions_close_key"
 ACCEPT_KEY_CONSTRAINT = "uq_cash_custody_transfers_accept_key"
 CLOSING_TRANSFER_KIND = "closing_capital_transfer"
+# T-023A: opening cash of a handover-opened session, and the source's matching exit (exactly one of each per handover)
+OPENING_HANDOVER_FUND_KIND = "opening_handover_fund"
+HANDOVER_OUT_KIND = "session_handover_out"
+OPENING_KINDS = (OPENING_FUND_KIND, OPENING_HANDOVER_FUND_KIND)  # opening cash, never operating incoming cash
+DESTINATIONS = ("capital", "next_session")
 
 
 # --- helpers --------------------------------------------------------------------------------------------
@@ -184,6 +197,46 @@ def _handover(db: Session, session_id: int) -> CashCustodyTransfer | None:
     )
 
 
+def _lock_user_share(db: Session, user_id: int) -> None:
+    """T-019 pattern: the user row FOR SHARE, so ``disable_user`` (FOR UPDATE) serialises with whoever relies on it."""
+    db.execute(select(UserAccount.id).where(UserAccount.id == user_id).with_for_update(read=True))
+
+
+def _live_session_handover(db: Session, session_id: int) -> CashSessionHandover | None:
+    """The non-cancelled direct handover of a source session (at most one exists)."""
+    return db.scalar(
+        select(CashSessionHandover).where(
+            CashSessionHandover.source_session_id == session_id, CashSessionHandover.state != "cancelled"
+        )
+    )
+
+
+def session_handover_out(h: CashSessionHandover) -> dict:
+    """The direct handover as business history. No idempotency keys or digests."""
+    return {
+        "id": h.id,
+        "source_session_id": h.source_session_id,
+        "cash_point_id": h.cash_point_id,
+        "state": h.state,
+        "amount": _amt(h.amount),
+        "currency_code": h.currency_code,
+        "from_user_id": h.from_user_id,
+        "to_user_id": h.to_user_id,
+        "created_at": h.created_at,
+        "declined": h.declined_at is not None,
+        "declined_by": h.declined_by,
+        "declined_at": h.declined_at,
+        "decline_reason": h.decline_reason,
+        "accepted_by": h.accepted_by,
+        "accepted_at": h.accepted_at,
+        "redirected_by": h.redirected_by,
+        "redirected_at": h.redirected_at,
+        "redirect_reason": h.redirect_reason,
+        "redirected_to_session_handover_id": h.redirected_to_session_handover_id,
+        "redirected_to_capital_handover_id": h.redirected_to_capital_handover_id,
+    }
+
+
 def handover_out(h: CashCustodyTransfer) -> dict:
     return {
         "id": h.id,
@@ -241,6 +294,7 @@ def session_out(db: Session, s: CashSession, *, replayed: bool | None = None) ->
     differences = db.scalars(
         select(CashSessionDifference).where(CashSessionDifference.session_id == s.id).order_by(CashSessionDifference.id)
     ).all()
+    dh = None if s.state == "open" else _live_session_handover(db, s.id)  # only a closing / closed source can have one
     next_action = None
     if s.state == "closing" and h is not None and h.state == "pending":
         next_action = {
@@ -249,6 +303,14 @@ def session_out(db: Session, s: CashSession, *, replayed: bool | None = None) ->
             "receiver_user_id": h.to_user_id,
             "endpoint": f"/api/v2/cash/handovers/{h.id}/accept",
             "legacy_command": "confirm_closing_transfer",
+        }
+    elif s.state == "closing" and dh is not None and dh.state == "pending":
+        declined = dh.declined_at is not None
+        next_action = {
+            "action": "redirect_session_handover" if declined else "accept_session_handover",
+            "session_handover_id": dh.id,
+            "receiver_user_id": dh.to_user_id,
+            "endpoint": f"/api/v2/cash/session-handovers/{dh.id}/" + ("redirect" if declined else "accept"),
         }
     out = {
         "id": s.id,
@@ -266,6 +328,7 @@ def session_out(db: Session, s: CashSession, *, replayed: bool | None = None) ->
         "opening_expected": _amt(s.opening_expected),
         "opening_counted": _amt(s.opening_counted),
         "opening_denominations": s.opening_denominations,
+        "opening_handover_id": s.opening_handover_id,
         "balance": _amt(s.balance),
         "close_contract": s.close_contract,
         "closing_expected": _amt(s.closing_expected),
@@ -274,6 +337,7 @@ def session_out(db: Session, s: CashSession, *, replayed: bool | None = None) ->
         "closed_by": s.closed_by,
         "closed_at": s.closed_at,
         "handover": handover_out(h) if h is not None else None,
+        "session_handover": session_handover_out(dh) if dh is not None else None,
         "differences": [difference_out(d) for d in differences],
         "next_action": next_action,
     }
@@ -524,7 +588,7 @@ def _close_snapshot(db: Session, s: CashSession, expected: Decimal, counted: Dec
     rows = db.execute(
         select(CashMovement.id, CashMovement.kind, CashMovement.amount).where(CashMovement.session_id == s.id)
     ).all()
-    flows = [r for r in rows if r.kind != OPENING_FUND_KIND]
+    flows = [r for r in rows if r.kind not in OPENING_KINDS]
     incoming = sum((r.amount for r in flows if r.amount > 0), Decimal(0))
     outgoing = -sum((r.amount for r in flows if r.amount < 0), Decimal(0))
     return {
@@ -546,6 +610,16 @@ def _valid_receiver(db: Session, tenant_id: int, cp: CashPoint, receiver_user_id
         raise InvalidReceiver()
 
 
+def _valid_direct_receiver(db: Session, tenant_id: int, cp: CashPoint, receiver_user_id: int, maker_id: int) -> None:
+    """A named next cashier: an active user of the tenant, never the maker, who may receive AND open HERE."""
+    user = db.get(UserAccount, receiver_user_id)
+    if user is None or user.company_id != tenant_id or not user.is_active or user.id == maker_id:
+        raise InvalidReceiver()
+    principal = build_principal(db, user, 0)
+    if not (principal.allows(RECEIVE, **_scope(cp)) and principal.allows(OPEN, **_scope(cp))):
+        raise InvalidReceiver()
+
+
 def close_session(
     db: Session,
     actor: Principal,
@@ -557,22 +631,33 @@ def close_session(
     idempotency_key: str,
     client_ip: str | None = None,
     snapshot_extra: dict | None = None,
+    destination: str = "capital",
 ) -> dict:
-    """Operational close by the session owner. The difference (if any) is a record; it never blocks the next session."""
+    """Operational close by the session owner. The difference (if any) is a record; it never blocks the next session.
+
+    ``destination = capital`` (default) is the T-021 flow and its digest is the historical one; ``next_session``
+    leaves the counted cash in a pending DIRECT handover to a named cashier of the same CashPoint (the digest
+    adds ``destination``).
+    """
     tenant_id = _gate(actor)
     note = _note(observation_note)
     if not denominations:
         raise InvalidCount("El cierre exige el conteo fisico por denominaciones.")
     counted_map, counted = count_denominations(denominations)
-    digest = _digest(
-        {
-            "operation": "close_cash_session",
-            "session_id": session_id,
-            "denominations": counted_map,
-            "observation_note": note,
-            "receiver_user_id": receiver_user_id if counted > 0 else None,
-        }
-    )
+    if destination not in DESTINATIONS:
+        raise InvalidHandoverDestination()
+    if destination == "next_session" and counted <= 0:
+        raise NextSessionRequiresCash()
+    payload = {
+        "operation": "close_cash_session",
+        "session_id": session_id,
+        "denominations": counted_map,
+        "observation_note": note,
+        "receiver_user_id": receiver_user_id if counted > 0 else None,
+    }
+    if destination == "next_session":
+        payload["destination"] = "next_session"  # the capital / default digest stays byte-for-byte the historical one
+    digest = _digest(payload)
     s = _session(db, tenant_id, session_id)
     replay = _close_replay(db, tenant_id, s, idempotency_key, digest)
     if replay is not None:
@@ -581,7 +666,9 @@ def close_session(
     require(actor, CLOSE, **_scope(cp))
     if s.cashier_id != actor.user_id:
         raise NotSessionOwner()
-    # locks: box -> cash point -> session
+    # locks: receiver user (FOR SHARE) -> box -> cash point -> session
+    if counted > 0 and receiver_user_id is not None:
+        _lock_user_share(db, receiver_user_id)
     _box(db, tenant_id, cp.branch_id)
     cp = _cash_point(db, tenant_id, s.cash_point_id, lock=True)
     s = _session(db, tenant_id, session_id, lock=True)
@@ -597,7 +684,10 @@ def close_session(
     if counted > 0:
         if receiver_user_id is None:
             raise ReceiverRequired()
-        _valid_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
+        if destination == "next_session":
+            _valid_direct_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
+        else:
+            _valid_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
     at = now_utc()
     snapshot = _close_snapshot(db, s, expected, counted, difference) | (snapshot_extra or {})  # reads only
     try:
@@ -624,8 +714,22 @@ def close_session(
         _record_difference(
             db, s, phase="closing", expected=expected, counted=counted, note=note, actor_id=actor.user_id, at=at
         )
-    handover = None
-    if counted > 0:
+    handover = direct = None
+    if counted > 0 and destination == "next_session":
+        direct = CashSessionHandover(
+            tenant_id=tenant_id,
+            box_id=s.box_id,
+            cash_point_id=s.cash_point_id,
+            source_session_id=s.id,
+            from_user_id=s.cashier_id,
+            to_user_id=receiver_user_id,
+            amount=counted,
+            currency_code="DOP",
+            state="pending",
+        )
+        db.add(direct)
+        db.flush()
+    elif counted > 0:
         handover = CashCustodyTransfer(
             company_id=tenant_id,
             box_id=s.box_id,
@@ -654,7 +758,23 @@ def close_session(
         counted=_amt(counted),
         difference=_amt(difference),
         handover_id=handover.id if handover is not None else None,
+        **({"session_handover_id": direct.id} if direct is not None else {}),
     )
+    if direct is not None:
+        _audit(
+            db,
+            "cash.session_handover.declared",
+            actor,
+            client_ip,
+            direct.to_user_id,
+            session_handover_id=direct.id,
+            session_id=s.id,
+            cash_point_id=cp.id,
+            branch_id=cp.branch_id,
+            amount=_amt(direct.amount),
+            from_user_id=direct.from_user_id,
+            to_user_id=direct.to_user_id,
+        )
     if difference != 0:
         _audit(
             db,
@@ -907,3 +1027,27 @@ def list_differences(
 def base_cash_point_id(db: Session, box_id: int) -> int | None:
     """The CashPoint created with a cash box (the legacy command's default position)."""
     return db.scalar(select(CashPoint.id).where(CashPoint.box_id == box_id))
+
+
+# --- user lifecycle guard (T-023A, D20) ---------------------------------------------------------------------
+def has_cash_responsibility(db: Session, tenant_id: int, user_id: int) -> bool:
+    """The user owns an open / closing session, or is the named receiver of a pending capital handover, or of a pending,
+    NOT declined direct handover (a receiver who declined has discharged that responsibility). ONE query."""
+    owns_session = exists().where(
+        CashSession.tenant_id == tenant_id,
+        CashSession.cashier_id == user_id,
+        CashSession.state.in_(ACTIVE_SESSION_STATES),
+    )
+    capital_receiver = exists().where(
+        CashCustodyTransfer.company_id == tenant_id,
+        CashCustodyTransfer.to_user_id == user_id,
+        CashCustodyTransfer.kind == "closing_capital",
+        CashCustodyTransfer.state == "pending",
+    )
+    direct_receiver = exists().where(
+        CashSessionHandover.tenant_id == tenant_id,
+        CashSessionHandover.to_user_id == user_id,
+        CashSessionHandover.state == "pending",
+        CashSessionHandover.declined_at.is_(None),
+    )
+    return bool(db.scalar(select(or_(owns_session, capital_receiver, direct_receiver))))

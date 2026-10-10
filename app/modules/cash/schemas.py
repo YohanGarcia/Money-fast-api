@@ -25,6 +25,8 @@ class CloseIn(BaseModel):
     denominations: dict[str, StrictInt] = Field(min_length=1)  # the physical count is always required
     observation_note: str | None = Field(default=None, max_length=2000)  # required when counted != expected
     receiver_user_id: int | None = Field(default=None, gt=0)  # required when there is cash to hand over
+    # T-023A: ``capital`` (default, the T-021 flow) or ``next_session`` (a named cashier of the SAME CashPoint takes it)
+    destination: Literal["capital", "next_session"] = "capital"
 
 
 class AcceptHandoverIn(BaseModel):
@@ -43,3 +45,28 @@ class ResolveDifferenceIn(BaseModel):
     resolution_type: Literal["no_further_action", "accepted_loss", "accepted_surplus"]
     reason: str = Field(default="", max_length=2000)
     reference: str | None = Field(default=None, max_length=160)
+
+
+class AcceptSessionHandoverIn(BaseModel):
+    """T-023A. The receiver recounts the cash: a fresh, full denomination map whose total must equal the handover."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    idempotency_key: str = Field(min_length=12, max_length=120)
+    denominations: dict[str, StrictInt] = Field(min_length=1)
+
+
+class DeclineSessionHandoverIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    idempotency_key: str = Field(min_length=12, max_length=120)
+    reason: str = Field(default="", max_length=2000)
+
+
+class RedirectSessionHandoverIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    idempotency_key: str = Field(min_length=12, max_length=120)
+    destination: Literal["next_session", "capital"]
+    receiver_user_id: int = Field(gt=0)
+    reason: str = Field(default="", max_length=2000)

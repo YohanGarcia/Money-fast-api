@@ -6,9 +6,17 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.db import get_session
-from app.modules.cash import differences
+from app.modules.cash import differences, session_handovers
 from app.modules.cash import sessions as service
-from app.modules.cash.schemas import AcceptHandoverIn, CloseIn, OpenIn, ResolveDifferenceIn
+from app.modules.cash.schemas import (
+    AcceptHandoverIn,
+    AcceptSessionHandoverIn,
+    CloseIn,
+    DeclineSessionHandoverIn,
+    OpenIn,
+    RedirectSessionHandoverIn,
+    ResolveDifferenceIn,
+)
 from app.modules.identity.authorization import Principal
 from app.modules.identity.deps import client_ip, get_principal
 
@@ -46,6 +54,7 @@ def close_session(session_id: int, body: CloseIn, request: Request, actor: Princ
         receiver_user_id=body.receiver_user_id,
         idempotency_key=body.idempotency_key,
         client_ip=client_ip(request),
+        destination=body.destination,
     )
     db.commit()
     return out
@@ -82,6 +91,71 @@ def list_handovers(
     db: Session = Db,
 ):
     return service.list_handovers(db, actor, state=state, branch_id=branch_id, limit=limit, before_id=before_id)
+
+
+# --- T-023A: same-CashPoint direct session handovers (the /handovers routes above stay capital-only) ------------
+@router.get("/session-handovers")
+def list_session_handovers(
+    state: Literal["pending", "confirmed", "cancelled"] = "pending",
+    branch_id: int | None = Query(default=None, gt=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    before_id: int | None = Query(default=None, gt=0),
+    actor: Principal = Actor,
+    db: Session = Db,
+):
+    return session_handovers.list_session_handovers(
+        db, actor, state=state, branch_id=branch_id, limit=limit, before_id=before_id
+    )
+
+
+@router.get("/session-handovers/{handover_id}")
+def get_session_handover(handover_id: int, actor: Principal = Actor, db: Session = Db):
+    return session_handovers.get_session_handover(db, actor, handover_id)
+
+
+@router.post("/session-handovers/{handover_id}/accept")
+def accept_session_handover(
+    handover_id: int, body: AcceptSessionHandoverIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    out = session_handovers.accept_session_handover(
+        db,
+        actor,
+        handover_id,
+        idempotency_key=body.idempotency_key,
+        denominations=body.denominations,
+        client_ip=client_ip(request),
+    )
+    db.commit()
+    return out
+
+
+@router.post("/session-handovers/{handover_id}/decline")
+def decline_session_handover(
+    handover_id: int, body: DeclineSessionHandoverIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    out = session_handovers.decline_session_handover(
+        db, actor, handover_id, idempotency_key=body.idempotency_key, reason=body.reason, client_ip=client_ip(request)
+    )
+    db.commit()
+    return out
+
+
+@router.post("/session-handovers/{handover_id}/redirect")
+def redirect_session_handover(
+    handover_id: int, body: RedirectSessionHandoverIn, request: Request, actor: Principal = Actor, db: Session = Db
+):
+    out = session_handovers.redirect_session_handover(
+        db,
+        actor,
+        handover_id,
+        idempotency_key=body.idempotency_key,
+        destination=body.destination,
+        receiver_user_id=body.receiver_user_id,
+        reason=body.reason,
+        client_ip=client_ip(request),
+    )
+    db.commit()
+    return out
 
 
 @router.get("/differences")

@@ -278,6 +278,9 @@ def update_user(
             from app.modules.field_custody.errors import OutstandingFieldCustody
             from app.modules.field_custody.service import has_open_custody
             if has_open_custody(db, company_id, user.id): raise HTTPException(409, OutstandingFieldCustody.default_message)
+            from app.modules.cash.errors import UserHasCashResponsibility  # T-023A: same guard as v2 disable_user
+            from app.modules.cash.sessions import has_cash_responsibility
+            if has_cash_responsibility(db, company_id, user.id): raise HTTPException(409, UserHasCashResponsibility.default_message)
     user.full_name = payload.full_name.strip()
     user.email = payload.email.lower()
     previous_status = user.status

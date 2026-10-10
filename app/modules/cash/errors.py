@@ -136,3 +136,55 @@ class ResolutionReasonRequired(AppError):
 class ResolutionReferenceRequired(AppError):
     status_code, code = 422, "resolution_reference_required"
     default_message = "Indica la referencia que respalda la decision (acta, informe o documento)."
+
+
+# --- T-023A: same-CashPoint direct session handover ----------------------------------------------------------
+class SessionHandoverNotFound(AppError):
+    status_code, code = 404, "session_handover_not_found"
+    default_message = "Entrega directa entre jornadas no encontrada."
+
+
+class SessionHandoverNotPending(AppError):
+    status_code, code = 409, "session_handover_not_pending"
+    default_message = "La entrega directa ya no esta pendiente (fue confirmada o reasignada)."
+
+
+class HandoverDeclined(AppError):
+    status_code, code = 409, "handover_declined"
+    default_message = "El receptor rechazo esta entrega: ya no puede aceptarse; solo puede reasignarse."
+
+
+class ReceiverCountMismatch(AppError):
+    status_code, code = 422, "receiver_count_mismatch"
+    default_message = (
+        "El conteo del receptor no coincide con el efectivo entregado: la entrega no se acepta ni se abre jornada. "
+        "Cuenta de nuevo o rechaza la entrega."
+    )
+
+
+class NextSessionRequiresCash(AppError):
+    status_code, code = 422, "next_session_requires_cash"
+    default_message = "Una entrega a la siguiente jornada necesita efectivo contado: sin efectivo el cierre es directo."
+
+
+class InvalidHandoverDestination(AppError):
+    status_code, code = 422, "invalid_handover_destination"
+    default_message = "El destino del efectivo es capital o la siguiente jornada de la misma caja."
+
+
+class HandoverReasonRequired(AppError):
+    status_code, code = 422, "handover_reason_required"
+    default_message = "Indica el motivo (al menos 10 caracteres)."
+
+
+class RedirectNotAuthorized(AppError):
+    status_code, code = 403, "redirect_not_authorized"
+    default_message = "Solo quien entrega puede reasignar antes del rechazo; despues del rechazo solo supervision con permiso de reasignacion."
+
+
+class UserHasCashResponsibility(AppError):
+    status_code, code = 409, "user_has_cash_responsibility"
+    default_message = (
+        "El usuario tiene una jornada de caja abierta o en cierre, o una entrega pendiente por recibir: "
+        "resuelvela antes de desactivarlo."
+    )

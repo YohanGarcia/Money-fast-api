@@ -441,7 +441,7 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0021" in _alembic(scratch_db, "heads").stdout
+    assert "0022" in _alembic(scratch_db, "heads").stdout
     assert _alembic(scratch_db, "downgrade", "0018").returncode == 0
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     eng = create_engine(scratch_db)
@@ -458,5 +458,5 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
     with eng.connect() as c:
         assert c.execute(text("SELECT count(*) FROM credit_field_refunds")).scalar() == 1
         assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'cash.field_custody.refund'")).scalar() == 1
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0021"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0022"
     eng.dispose()
