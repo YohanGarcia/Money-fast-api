@@ -561,7 +561,9 @@ def test_z06_branch_and_resource_scope_foundation(client, sink, tenant_a, tenant
     )
     assert ok.status_code == 201
     me = client.get(f"{V2}/auth/me", headers=h(login(client, "branchy@example.com"))).json()
-    assert me["permissions"] == [{"permission": "users.read", "scope": "branch", "branch_id": tenant_a["branch_id"]}]
+    assert me["permissions"] == [
+        {"permission": "users.read", "scope": "branch", "branch_id": tenant_a["branch_id"], "cash_point_id": None}
+    ]
     # a branch-scoped grant does not open the tenant-wide endpoint
     assert client.get(f"{V2}/users", headers=h(login(client, "branchy@example.com"))).status_code == 403
 
@@ -907,3 +909,48 @@ def test_recovery_token_is_single_use_under_concurrency(sink, tenant_a):
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(attempt, range(6)))
     assert results.count(200) == 1 and all(r == 400 for r in results if r != 200)
+
+
+# ---------------------------- /auth/me exposes the CashPoint of a cash_point-scoped grant (WEB-CASH-PRE-01) ----------
+def _me_grants(client, email):
+    r = client.get(f"{V2}/auth/me", headers=h(login(client, email)))
+    assert r.status_code == 200, r.text
+    return r.json()["permissions"]
+
+
+def test_me_grants_expose_cash_point_id_per_scope(client, sink, tenant_a):
+    adm = admin_headers(client, tenant_a)
+    role = create_role(client, adm, "Apertura", ["cash.sessions.open"])
+    cp_a = client.post(
+        f"{V2}/cash-points", headers=adm, json={"branch_id": tenant_a["branch_id"], "code": "PA", "name": "A"}
+    ).json()
+    cp_b = client.post(
+        f"{V2}/cash-points", headers=adm, json={"branch_id": tenant_a["branch_id"], "code": "PB", "name": "B"}
+    ).json()
+    assert cp_a["id"] != cp_b["id"]
+
+    def assign(email, **body):
+        user = activate_user(client, sink, adm, email)
+        r = client.post(f"{V2}/users/{user['id']}/roles", headers=adm, json={"role_id": role["id"], **body})
+        assert r.status_code == 201, r.text
+
+    assign("tenant-u@example.com", scope="tenant")
+    assign("branch-u@example.com", scope="branch", branch_id=tenant_a["branch_id"])
+    assign("cp-u@example.com", scope="cash_point", cash_point_id=cp_a["id"])
+    assign("own-u@example.com", scope="own")
+
+    open_ = "cash.sessions.open"
+    assert _me_grants(client, "tenant-u@example.com") == [
+        {"permission": open_, "scope": "tenant", "branch_id": None, "cash_point_id": None}
+    ]
+    assert _me_grants(client, "branch-u@example.com") == [
+        {"permission": open_, "scope": "branch", "branch_id": tenant_a["branch_id"], "cash_point_id": None}
+    ]
+    cp_grants = _me_grants(client, "cp-u@example.com")
+    assert len(cp_grants) == 1 and cp_grants[0]["permission"] == open_ and cp_grants[0]["scope"] == "cash_point"
+    assert cp_grants[0]["cash_point_id"] == cp_a["id"]  # exact target, never the sibling CashPoint
+    assert cp_grants[0]["cash_point_id"] != cp_b["id"]
+    assert set(cp_grants[0]) == {"permission", "scope", "branch_id", "cash_point_id"}  # nothing else leaks
+    assert _me_grants(client, "own-u@example.com") == [
+        {"permission": open_, "scope": "own", "branch_id": None, "cash_point_id": None}
+    ]

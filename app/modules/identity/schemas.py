@@ -89,6 +89,7 @@ class GrantOut(BaseModel):
     permission: str
     scope: str
     branch_id: int | None
+    cash_point_id: int | None = None
 
 
 class MeOut(BaseModel):

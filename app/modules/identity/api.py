@@ -96,7 +96,8 @@ def me(ctx: AuthContext = Depends(get_auth_context), db: Session = Depends(get_s
         user=UserOut.model_validate(ctx.user),
         person=PersonOut.model_validate(person) if person else None,
         permissions=[
-            GrantOut(permission=g.permission, scope=g.scope_kind, branch_id=g.branch_id) for g in ctx.principal.grants
+            GrantOut(permission=g.permission, scope=g.scope_kind, branch_id=g.branch_id, cash_point_id=g.cash_point_id)
+            for g in ctx.principal.grants
         ],
     )
 
