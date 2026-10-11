@@ -188,3 +188,9 @@ class UserHasCashResponsibility(AppError):
         "El usuario tiene una jornada de caja abierta o en cierre, o una entrega pendiente por recibir: "
         "resuelvela antes de desactivarlo."
     )
+
+
+class PendingSurplusReview(AppError):
+    """FI-005 option A (EXPERIMENTAL): a v2 closing is refused while a reported surplus is still in review."""
+    status_code, code = 409, "cash_pending_surplus_review"
+    default_message = "El administrador debe resolver los sobrantes reportados antes del cuadre."

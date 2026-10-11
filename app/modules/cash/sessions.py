@@ -41,6 +41,7 @@ from app.models.cash import (
     CashBox,
     CashConfig,
     CashCustodyTransfer,
+    CashDelivery,
     CashDifferenceResolution,
     CashMovement,
     CashSession,
@@ -56,6 +57,7 @@ from app.modules.cash.errors import (
     CashSessionNotFound,
     HandoverNotFound,
     HandoverNotPending,
+    PendingSurplusReview,
     InsufficientCapital,
     InvalidCount,
     InvalidHandoverDestination,
@@ -666,6 +668,8 @@ def close_session(
     require(actor, CLOSE, **_scope(cp))
     if s.cashier_id != actor.user_id:
         raise NotSessionOwner()
+    if db.scalar(select(CashDelivery.id).where(CashDelivery.box_id == s.box_id, CashDelivery.state == "surplus_review")):
+        raise PendingSurplusReview()
     # locks: receiver user (FOR SHARE) -> box -> cash point -> session
     if counted > 0 and receiver_user_id is not None:
         _lock_user_share(db, receiver_user_id)
