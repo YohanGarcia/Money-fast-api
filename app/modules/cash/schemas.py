@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from app.modules.credit.rules import DecStr
 
@@ -12,7 +12,8 @@ class OpenIn(BaseModel):
 
     idempotency_key: str = Field(min_length=12, max_length=120)
     cash_point_id: int = Field(gt=0)
-    source: Literal["zero", "capital"]  # anonymous opening cash does not exist
+    # anonymous opening cash does not exist; ``initial`` (FM-SIMPLE-CASH-010) is a declared amount with no capital
+    source: Literal["zero", "capital", "initial"]
     amount: DecStr = "0"  # the capital fund (0 for a zero opening)
     denominations: dict[str, StrictInt] = Field(default_factory=dict)  # physical count; required for a capital opening
     observation_note: str | None = Field(default=None, max_length=2000)
@@ -22,11 +23,21 @@ class CloseIn(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     idempotency_key: str = Field(min_length=12, max_length=120)
-    denominations: dict[str, StrictInt] = Field(min_length=1)  # the physical count is always required
+    # the physical count is required for the legacy flow; a SIMPLE session (opened with ``initial``) sends ``counted`` instead
+    denominations: dict[str, StrictInt] = Field(default_factory=dict)
+    counted: DecStr | None = None  # FM-SIMPLE-CASH-010: money counted at a simple close (any difference is allowed)
     observation_note: str | None = Field(default=None, max_length=2000)  # required when counted != expected
     receiver_user_id: int | None = Field(default=None, gt=0)  # required when there is cash to hand over
     # T-023A: ``capital`` (default, the T-021 flow) or ``next_session`` (a named cashier of the SAME CashPoint takes it)
     destination: Literal["capital", "next_session"] = "capital"
+
+    @model_validator(mode="after")
+    def _one_way_to_count(self):
+        if self.counted is None and not self.denominations:
+            raise ValueError("el conteo por denominaciones es obligatorio")
+        if self.counted is not None and (self.denominations or self.receiver_user_id is not None or self.destination != "capital"):
+            raise ValueError("el cierre simple solo recibe el dinero contado")
+        return self
 
 
 class AcceptHandoverIn(BaseModel):

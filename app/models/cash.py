@@ -10,11 +10,11 @@ from sqlalchemy import (DDL, CheckConstraint, Date, DateTime, ForeignKey, Foreig
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
-from app.modules.cash import ddl, difference_ddl, handover_ddl
+from app.modules.cash import ddl, difference_ddl, handover_ddl, simple_ddl
 
 SESSION_STATES = ('open', 'closing', 'closed')
 ACTIVE_SESSION_STATES = ('open', 'closing')
-OPENING_SOURCES = ('legacy', 'zero', 'capital', 'handover')
+OPENING_SOURCES = ('legacy', 'zero', 'capital', 'handover', 'initial')
 CONTRACTS = ('legacy', 'v2')
 HANDOVER_PROVENANCES = ('legacy', 'migration', 'v2')
 DIFFERENCE_STATUSES = ('pending_review', 'under_review', 'resolved', 'dismissed')
@@ -213,6 +213,9 @@ class CashMovement(Base):
               postgresql_where=text("kind = 'opening_handover_fund'")),
         Index('ix_cash_movements_session_handover', 'session_handover_id',
               postgresql_where=text('session_handover_id IS NOT NULL')),
+        # FM-SIMPLE-CASH-010: a simple session has at most one declared initial fund
+        Index('uq_cash_movements_initial_fund', 'session_id', unique=True,
+              postgresql_where=text("kind = 'opening_initial_fund'")),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     box_id: Mapped[int] = mapped_column(ForeignKey('cash_boxes.id'), index=True)
@@ -466,3 +469,9 @@ for _table in sorted(ddl.TRIGGER_TABLES | {handover_ddl.HANDOVER_TABLE}):
 for _sql in handover_ddl.TRIGGERS:
     event.listen(Base.metadata.tables[_sql.split(' ON ')[1].split(' ')[0]], 'after_create',
                  DDL(_sql).execute_if(dialect='postgresql'))
+
+# FM-SIMPLE-CASH-010 backstops (app.modules.cash.simple_ddl): the four functions are re-installed once more, last, so the
+# simple-session guards (opening_source = 'initial') are the newest definition. Nothing here widens the other sources.
+for _table in sorted(ddl.TRIGGER_TABLES | {handover_ddl.HANDOVER_TABLE}):
+    for _fn in simple_ddl.FUNCTIONS:
+        event.listen(Base.metadata.tables[_table], 'after_create', DDL(_fn.replace('%', '%%')).execute_if(dialect='postgresql'))

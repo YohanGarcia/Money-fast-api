@@ -45,6 +45,18 @@ def open_session(body: OpenIn, request: Request, actor: Principal = Actor, db: S
 
 @router.post("/sessions/{session_id}/close")
 def close_session(session_id: int, body: CloseIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    if body.counted is not None:  # FM-SIMPLE-CASH-010: the cashier's simple close (no count, receiver or handover)
+        out = service.close_simple_session(
+            db,
+            actor,
+            session_id,
+            counted_amount=body.counted,
+            observation_note=body.observation_note,
+            idempotency_key=body.idempotency_key,
+            client_ip=client_ip(request),
+        )
+        db.commit()
+        return out
     out = service.close_session(
         db,
         actor,

@@ -36,6 +36,9 @@ class CashCommand(BaseModel):
     reference: str = Field(default='', max_length=160)
     kind: Literal['contribution','expense','withdrawal','bank_deposit'] | None = None
     capital: bool = False
+    # FM-SIMPLE-CASH-010: 'initial' opens with a declared amount (no capital); `counted` is the money counted at a simple close
+    opening_mode: Literal['initial','capital'] | None = None
+    counted: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
     resolution: Literal['approve','return'] | None = None
     denominations: dict[str,StrictInt] = Field(default_factory=dict)
     method: Literal['cash','transfer','check'] = 'cash'

@@ -239,3 +239,32 @@ def proof(kind:str,target_id:int,branch_id:int|None=None,inline:bool=False,db:Se
     if not row.proof:svc.fail('Sin comprobante.',404)
     disposition = 'inline' if inline else 'attachment'
     return Response(base64.b64decode(row.proof['content_base64']),media_type=row.proof['media_type'],headers={'Content-Disposition':f'{disposition}; filename="comprobante"','X-Content-Type-Options':'nosniff'})
+
+
+def _local(value):
+    if value is None: return None
+    return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(svc.TZ).isoformat()
+
+
+@router.get('/sessions/{session_id}/ticket')
+def session_ticket(session_id:int,kind:str='opening',branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+    """FM-SIMPLE-CASH-010: data of the opening / closing ticket, built ONLY from the persisted session (so a reprint is
+    identical and a failed print never needs a second financial write). Cashier: own sessions; admin/manager: their scope."""
+    svc.require_role(user,'admin','cashier','manager')
+    if kind not in ('opening','closing'): svc.fail('Tipo de ticket inválido.')
+    box=svc.scope(db,user,branch_id)
+    s=db.get(CashSession,session_id)
+    if not s or s.box_id!=box.id or (user.role=='cashier' and s.cashier_id!=user.id): svc.fail('Jornada no encontrada.',404)
+    if kind=='closing' and s.state!='closed': svc.fail('La jornada aún no está cerrada.',409)
+    names={u.id:u.full_name for u in db.scalars(select(User).where(User.company_id==user.company_id)).all()}
+    snap=s.snapshot or {}
+    data=dict(title='APERTURA DE CAJA' if kind=='opening' else 'CIERRE DE CAJA',kind=kind,brand='FACT MONEY',
+        ticket_number=f'J-{s.id:06d}',session_id=s.id,company=db.get(Company,user.company_id).name,branch=db.get(Branch,box.branch_id).name,
+        cashier=names.get(s.cashier_id,'Usuario histórico'),opening_source=s.opening_source,simple=s.opening_source=='initial',
+        opened_at=_local(s.opened_at),initial_amount=str(s.opening_expected))
+    if kind=='closing':
+        diff=s.difference or svc.ZERO
+        data.update(closed_at=_local(s.closed_at),closed_by=names.get(s.closed_by,'Usuario histórico'),
+            incoming=snap.get('incoming'),outgoing=snap.get('outgoing'),expected=str(s.closing_expected),counted=str(s.counted),
+            difference=str(diff),result='EXACTO' if diff==0 else ('SOBRANTE' if diff>0 else 'FALTANTE'))
+    return data

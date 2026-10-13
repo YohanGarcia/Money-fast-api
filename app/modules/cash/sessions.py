@@ -95,7 +95,10 @@ CLOSING_TRANSFER_KIND = "closing_capital_transfer"
 # T-023A: opening cash of a handover-opened session, and the source's matching exit (exactly one of each per handover)
 OPENING_HANDOVER_FUND_KIND = "opening_handover_fund"
 HANDOVER_OUT_KIND = "session_handover_out"
-OPENING_KINDS = (OPENING_FUND_KIND, OPENING_HANDOVER_FUND_KIND)  # opening cash, never operating incoming cash
+# FM-SIMPLE-CASH-010: the declared initial amount of a simple session (never backed by a capital movement)
+INITIAL_FUND_KIND = "opening_initial_fund"
+SIMPLE_CLOSE_NO_NOTE = "Diferencia de cierre registrada sin observacion de la cajera."
+OPENING_KINDS = (OPENING_FUND_KIND, OPENING_HANDOVER_FUND_KIND, INITIAL_FUND_KIND)  # opening cash, never operating incoming cash
 DESTINATIONS = ("capital", "next_session")
 
 
@@ -452,6 +455,8 @@ def open_session(
     note = _note(observation_note)
     counted_map, counted = count_denominations(denominations)
     fund = _money(amount, allow_zero=True)
+    if source == "initial":  # a declared amount: no denomination count, expected and counted are the same figure
+        counted_map, counted = {}, fund
     digest = _digest(
         {
             "operation": "open_cash_session",
@@ -470,6 +475,8 @@ def open_session(
     if source == "zero":
         if fund != 0 or counted != 0:
             raise InvalidOpening("Una apertura en cero no recibe ni cuenta efectivo.")
+    elif source == "initial":
+        pass  # any non-negative amount (zero allowed); the amount is declared, so it is never a difference
     elif source == "capital":
         if fund <= 0 or not counted_map:
             raise InvalidOpening(
@@ -478,7 +485,7 @@ def open_session(
         if counted != fund and len(note) < 3:
             raise ObservationRequired()
     else:
-        raise InvalidOpening("El origen de la apertura es cero o capital: no se admite efectivo sin origen.")
+        raise InvalidOpening("El origen de la apertura es cero, capital o monto inicial: no se admite efectivo sin origen.")
     # locks: box -> cash point (the active-slot check serialises here; the partial UNIQUE index is the backstop)
     box = _box(db, tenant_id, cp.branch_id)
     cp = _cash_point(db, tenant_id, cash_point_id, lock=True)
@@ -527,6 +534,21 @@ def open_session(
         if replay is None:
             raise
         return replay
+    if source == "initial" and fund > 0:
+        db.add(
+            CashMovement(
+                box_id=box.id,
+                session_id=s.id,
+                kind=INITIAL_FUND_KIND,
+                amount=fund,
+                actor_id=actor.user_id,
+                notes="Monto inicial de apertura",
+                reference=f"APE-{s.id}",
+            )
+        )
+        db.flush()
+        s.balance = s.balance + fund
+        s.version += 1
     if source == "capital":
         movement = CashMovement(
             box_id=box.id,
@@ -779,6 +801,125 @@ def close_session(
             from_user_id=direct.from_user_id,
             to_user_id=direct.to_user_id,
         )
+    if difference != 0:
+        _audit(
+            db,
+            "cash.difference.detected",
+            actor,
+            client_ip,
+            s.cashier_id,
+            session_id=s.id,
+            phase="closing",
+            expected=_amt(expected),
+            counted=_amt(counted),
+        )
+    return session_out(db, s, replayed=False)
+
+
+# --- simple close (FM-SIMPLE-CASH-010) -------------------------------------------------------------------
+def close_simple_session(
+    db: Session,
+    actor: Principal,
+    session_id: int,
+    *,
+    counted_amount,
+    observation_note: str | None,
+    idempotency_key: str,
+    client_ip: str | None = None,
+    snapshot_extra: dict | None = None,
+) -> dict:
+    """Close the actor's OWN ``initial`` session: ``open -> closed`` with the counted cash, whatever the difference.
+
+    ``difference = counted - expected`` (SOBRANTE > 0, FALTANTE < 0, EXACTO = 0) is a recorded difference, never a
+    balancing movement; no handover, receiver or denomination count exists in this flow. The counted cash stays with
+    the cashier: the next session declares its own initial amount.
+    """
+    tenant_id = _gate(actor)
+    note = _note(observation_note)
+    try:
+        counted = _money(counted_amount, allow_zero=True)
+    except InvalidOpening:
+        raise InvalidCount("El dinero contado debe ser un importe valido, no negativo y con centavos como maximo.") from None
+    digest = _digest(
+        {
+            "operation": "close_cash_session_simple",
+            "session_id": session_id,
+            "counted": format(counted, "f"),
+            "observation_note": note,
+        }
+    )
+    s = _session(db, tenant_id, session_id)
+    replay = _close_replay(db, tenant_id, s, idempotency_key, digest)
+    if replay is not None:
+        return replay
+    if s.opening_source != "initial":
+        raise InvalidOpening("Esta jornada no usa el cierre simple.")
+    cp = _cash_point(db, tenant_id, s.cash_point_id)
+    require(actor, CLOSE, **_scope(cp))
+    if s.cashier_id != actor.user_id:
+        raise NotSessionOwner()
+    if db.scalar(select(CashDelivery.id).where(CashDelivery.box_id == s.box_id, CashDelivery.state == "surplus_review")):
+        raise PendingSurplusReview()
+    _box(db, tenant_id, cp.branch_id)
+    cp = _cash_point(db, tenant_id, s.cash_point_id, lock=True)
+    s = _session(db, tenant_id, session_id, lock=True)
+    replay = _close_replay(db, tenant_id, s, idempotency_key, digest)  # an identical request closed it meanwhile
+    if replay is not None:
+        return replay
+    if s.state != "open":
+        raise SessionNotOpen()
+    expected = Decimal(s.balance)
+    difference = counted - expected
+    at = now_utc()
+    snapshot = _close_snapshot(db, s, expected, counted, difference) | (snapshot_extra or {})  # reads only
+    try:
+        with db.begin_nested():  # savepoint: only this UPDATE (which claims the tenant-global key) is undone
+            s.counted, s.closing_expected, s.difference = counted, expected, difference
+            s.denominations = {}
+            s.close_contract = "v2"
+            s.closed_by, s.closed_at = actor.user_id, at
+            s.close_idempotency_key, s.close_request_digest = idempotency_key, digest
+            s.snapshot = snapshot
+            if note:
+                s.notes = note
+            s.state = "closed"
+            s.version += 1
+            db.flush()
+    except IntegrityError as exc:
+        if not _violates(exc, CLOSE_KEY_CONSTRAINT):
+            raise
+        replay = _close_replay(db, tenant_id, s, idempotency_key, digest)
+        if replay is None:
+            raise
+        return replay
+    if difference != 0:
+        # the difference record always carries an observation (database backstop); when the cashier wrote none it carries
+        # this explicit system marker, never an invented explanation, and the session's own notes stay untouched
+        _record_difference(
+            db,
+            s,
+            phase="closing",
+            expected=expected,
+            counted=counted,
+            note=note or SIMPLE_CLOSE_NO_NOTE,
+            actor_id=actor.user_id,
+            at=at,
+        )
+    _audit(
+        db,
+        "cash.session.closed",
+        actor,
+        client_ip,
+        s.cashier_id,
+        session_id=s.id,
+        cash_point_id=cp.id,
+        branch_id=cp.branch_id,
+        expected=_amt(expected),
+        counted=_amt(counted),
+        difference=_amt(difference),
+        handover_id=None,
+        mode="simple",
+    )
     if difference != 0:
         _audit(
             db,

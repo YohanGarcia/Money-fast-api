@@ -236,7 +236,7 @@ def activate(db,user):
 
 def command(db,user,p):
     box=scope(db,user,p.branch_id,lock=True)
-    old,digest=replay(db,user,p.idempotency_key,p.model_dump(mode='json'))
+    old,digest=replay(db,user,p.idempotency_key,p.model_dump(mode='json',exclude_none=False,exclude={'opening_mode','counted'} if p.opening_mode is None and p.counted is None else set()))
     if old: return old
     action=p.action
     if action=='resolve':
@@ -254,10 +254,16 @@ def command(db,user,p):
         cash_point_id=p.cash_point_id or cash_core.base_cash_point_id(db,box.id)
         point=cash_core._cash_point(db,user.company_id,cash_point_id) if cash_point_id else None
         if point is None or point.branch_id!=box.branch_id: fail('Selecciona una caja de esta sucursal.',404)
-        if p.amount>0 and not p.capital:
-            fail('La apertura con efectivo debe indicar su origen: fondo desde capital (capital=true). No se admite efectivo sin origen.')
-        out=cash_core.open_session(db,actor,cash_point_id=point.id,source='capital' if p.amount>0 else 'zero',amount=p.amount,
-            denominations=p.denominations,observation_note=p.notes,idempotency_key=p.idempotency_key)
+        if p.opening_mode=='initial':
+            # FM-SIMPLE-CASH-010: a declared initial amount (zero allowed); it never touches Capital.
+            if p.capital: fail('La apertura simple no usa capital.')
+            out=cash_core.open_session(db,actor,cash_point_id=point.id,source='initial',amount=p.amount,
+                denominations=None,observation_note=p.notes,idempotency_key=p.idempotency_key)
+        else:
+            if p.amount>0 and not p.capital:
+                fail('La apertura con efectivo debe indicar su origen: fondo desde capital (capital=true). No se admite efectivo sin origen.')
+            out=cash_core.open_session(db,actor,cash_point_id=point.id,source='capital' if p.amount>0 else 'zero',amount=p.amount,
+                denominations=p.denominations,observation_note=p.notes,idempotency_key=p.idempotency_key)
         result=_legacy_result(out,opening_mode=out['opening_source'])
 
     elif action=='declare':
@@ -340,8 +346,14 @@ def command(db,user,p):
         if p.version is None or p.version!=session.version: fail('Los datos cambiaron. Actualiza antes de guardar.',409)
         if db.scalar(select(CashDelivery.id).where(CashDelivery.box_id==box.id,CashDelivery.state=='surplus_review')):
             fail('El administrador debe resolver los sobrantes reportados antes del cuadre.',409)
-        out=cash_core.close_session(db,actor,session.id,denominations=p.denominations,observation_note=p.notes,
-            receiver_user_id=p.receiver_id,idempotency_key=p.idempotency_key,snapshot_extra=dict(collector_pending=str(pending(db,box))))
+        if session.opening_source=='initial':
+            # FM-SIMPLE-CASH-010: counted vs expected, any difference allowed and recorded; no handover to Capital.
+            if p.counted is None: fail('Indica el dinero contado.')
+            out=cash_core.close_simple_session(db,actor,session.id,counted_amount=p.counted,observation_note=p.notes,
+                idempotency_key=p.idempotency_key,snapshot_extra=dict(collector_pending=str(pending(db,box))))
+        else:
+            out=cash_core.close_session(db,actor,session.id,denominations=p.denominations,observation_note=p.notes,
+                receiver_user_id=p.receiver_id,idempotency_key=p.idempotency_key,snapshot_extra=dict(collector_pending=str(pending(db,box))))
         result=_legacy_result(out)
     elif action=='confirm_closing_transfer':
         transfer=db.get(CashCustodyTransfer,p.target_id)
