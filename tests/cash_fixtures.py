@@ -124,7 +124,10 @@ def receiver_user(db, tenant_id: int, email: str = "receptor-fixture@x.com") -> 
     existing = db.scalar(select(UserAccount.id).where(UserAccount.company_id == tenant_id, UserAccount.email == email))
     if existing:
         return existing
-    u = UserAccount(full_name="Receptor de cierre", email=email, password_hash="!", status="active", company_id=tenant_id)
+    from app.models.user import UserRole
+
+    u = UserAccount(full_name="Receptor de cierre", email=email, password_hash="!", status="active", company_id=tenant_id,
+                    role=UserRole.cashier)  # FM-FUNCTIONAL-018-R2: a receiver must be a cashier
     db.add(u)
     db.flush()
     return u.id

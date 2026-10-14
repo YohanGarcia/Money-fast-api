@@ -210,6 +210,61 @@ class SecurityReviewTests(_cash.CashTests):
                                         kind='expense', amount='5', notes='no autorizado', session_id=sid, version=1),
                  self.admin, code=403)
 
+    # -- FM-FUNCTIONAL-018-R2: only the CASHIER operates Caja, whatever grants other roles hold --------------------
+    def test_explicit_operative_grants_are_ineffective_for_any_non_cashier(self):
+        from app.modules.identity.catalog import CASHIER_ONLY_PERMISSIONS
+        mid, kid = self.users['manager']['id'], self.users['collector']['id']
+        company = self.users['manager']['company_id']
+        for uid in (mid, kid):
+            grant_cash_permissions(company, uid, sorted(CASHIER_ONLY_PERMISSIONS) + ['cash.field_custody.render',
+                                                                                     'cash.points.read'])
+            held = {g.permission for g in self.principal(uid).grants}
+            self.assertFalse(held & set(CASHIER_ONLY_PERMISSIONS), uid)
+        mgr_h = self.roles['manager']
+        cp = self.v2('GET', f'/cash-points?branch_id={self.branch}', self.admin, code=200).json()[0]['id']
+        r = self.v2('POST', '/cash/sessions/open', mgr_h,
+                    dict(idempotency_key=uuid.uuid4().hex, cash_point_id=cp, source='initial', amount='10'))
+        self.assertEqual(r.status_code, 403, r.text)
+        # the collector's legitimate field collection (render) is a different flow and stays effective
+        self.assertIn('cash.field_custody.render', {g.permission for g in self.principal(kid).grants})
+
+    # -- FM-FUNCTIONAL-018-R2: accounting date of cash payroll = execution date ------------------------------------
+    def test_payroll_report_uses_the_execution_date_and_ignores_unexecuted_payments(self):
+        from datetime import timedelta
+        from app.core.time import now_utc
+        self.open_v1(self.roles['cashier'], amount='300')
+        authorized_only = self.pay_cash(amount='10')            # never executed: not an expense
+        cancelled = self.pay_cash(amount='20')
+        self.client.post(f"/api/v1/payroll/payments/{cancelled['id']}/cancel", headers=self.admin)   # not an expense
+        paid = self.pay_cash(amount='40')
+        self.execute_pay(paid['id'], self.roles['cashier'])
+        authorized_day = now_utc() - timedelta(days=10)          # authorized ten days before it was executed
+        executed_day = now_utc()
+        with SessionLocal() as db:
+            for pid in (authorized_only['id'], cancelled['id'], paid['id']):
+                db.get(PayrollPayment, pid).created_at = authorized_day
+            db.get(PayrollPayment, paid['id']).executed_at = executed_day
+            db.commit()
+        def nomina(day_from, day_to):
+            r = self.client.get(f'/api/v1/reports/finance?start={day_from}&end={day_to}', headers=self.admin)
+            self.assertEqual(r.status_code, 200, r.text)
+            return Decimal(r.json()['nomina_pagada'])
+        local = lambda d: d.astimezone().date().isoformat()
+        self.assertEqual(nomina(local(executed_day), local(executed_day)), Decimal('40'))      # on the execution day
+        self.assertEqual(nomina(local(authorized_day), local(authorized_day)), Decimal('0'))   # not on the authorization day
+        # a payment written before migration 0025 (no executed_at) keeps its original date
+        with SessionLocal() as db:
+            old = PayrollPayment(company_id=self.users['cashier']['company_id'], user_id=self.users['collector']['id'],
+                                 amount=Decimal('7'), source='cash', actor_id=self.admin_id, status='paid',
+                                 created_at=authorized_day, executed_at=None)
+            db.add(old)
+            db.commit()
+        self.assertEqual(nomina(local(authorized_day), local(authorized_day)), Decimal('7'))
+
+    def test_cashier_keeps_its_operative_powers(self):
+        held = {g.permission for g in self.principal(self.users['cashier']['id']).grants}
+        self.assertTrue({'cash.sessions.open', 'cash.sessions.close'} <= held)
+
     def test_general_loan_and_payment_permissions_do_not_let_the_administrator_touch_caja(self):
         # the administrator holds payments.create / loans.disburse (general permissions) but no operative cash power
         held = {g.permission for g in self.principal(self.admin_id).grants}

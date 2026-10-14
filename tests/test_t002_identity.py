@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.context import get_context
 from app.core.db import Base, SessionLocal, engine
 from app.core.security import get_password_hash
+from app.models.user import UserRole
 from app.core.time import now_utc
 from app.main import app, create_app
 from app.models.branch import Branch
@@ -23,6 +24,7 @@ from app.modules.identity.audit import clean_details
 from app.modules.identity.authorization import Grant, Principal
 from app.modules.identity.catalog import (
     ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS,
+    CASHIER_ONLY_PERMISSIONS,
     CATALOG,
     bootstrap_owner,
     sync_permission_catalog,
@@ -94,7 +96,10 @@ def make_tenant(name: str, admin_email: str) -> dict:
             full_name=f"Admin {name}",
             email=admin_email,
             password_hash=get_password_hash(PW),
-            role=None,
+            # FM-FUNCTIONAL-018-R2: only a CASHIER operates Caja. These v2 engine suites use the tenant owner as the
+            # operator of sessions, so the fixture gives it the operating role (v2 authorization ignores the legacy
+            # role otherwise; the administrator rules are covered by tests/test_fm_functional_018*.py).
+            role=UserRole.cashier,
             company_id=company.id,
             activated_at=now_utc(),
         )
@@ -163,6 +168,13 @@ def activate_user(client, sink, admin_hdrs, email, *, roles=(), scope="tenant", 
     assert msg and msg["purpose"] == "activation"
     done = client.post(f"{V2}/auth/recovery/complete", json={"token": msg["secret"], "new_password": PW})
     assert done.status_code == 200, done.text
+    operating = ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS | CASHIER_ONLY_PERMISSIONS | {
+        "payments.create", "payments.reverse", "loans.disburse", "cash.field_custody.accept", "cash.field_custody.refund"}
+    if any(set(r.get("permissions") or []) & operating for r in roles):
+        # FM-FUNCTIONAL-018-R2: a user that moves a session's money must have the operating role of a cashier
+        with SessionLocal() as db:
+            db.execute(update(UserAccount).where(UserAccount.id == user["id"]).values(role=UserRole.cashier))
+            db.commit()
     for role in roles:
         if set(role.get("permissions") or []) & ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS:
             # FM-FUNCTIONAL-018-R1: the API only lets a company administrator hand operative cash powers to a CASHIER at
@@ -967,6 +979,7 @@ def test_me_grants_expose_cash_point_id_per_scope(client, sink, tenant_a):
         # API only to cashiers at branch/cash-point scope, so the fixture assigns them directly.
         with SessionLocal() as db:
             owner = db.get(UserAccount, user["id"])
+            owner.role = UserRole.cashier  # FM-FUNCTIONAL-018-R2: operative grants are effective only for a cashier
             db.add(UserRoleAssignment(tenant_id=owner.company_id, user_id=owner.id, role_id=role["id"],
                                       scope_kind=body["scope"], branch_id=body.get("branch_id"),
                                       cash_point_id=body.get("cash_point_id")))
