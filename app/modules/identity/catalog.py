@@ -175,6 +175,17 @@ ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS = frozenset(
         "cash.field_custody.refund",
     }
 )
+# FM-FUNCTIONAL-018-R2: opening, closing and handing over a session, and accepting a field rendition into one, belong to
+# the CASHIER only: they are effective solely for a user whose operating (legacy) role is ``cashier``, whatever grants
+# it holds. The collector's own field collection (``render``) and custodian refund are a different flow and untouched.
+CASHIER_ONLY_PERMISSIONS = frozenset(
+    {
+        "cash.sessions.open",
+        "cash.sessions.close",
+        "cash.handovers.receive",
+        "cash.field_custody.accept",
+    }
+)
 TENANT_ADMIN_ROLE = "Administrador de agencia"
 PLATFORM_ADMIN_ROLE = "Administrador de plataforma"
 

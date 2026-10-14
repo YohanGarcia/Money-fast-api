@@ -30,6 +30,9 @@ class PayrollPayment(Base):
         CheckConstraint("status IN ('authorized', 'paid', 'cancelled')", name="status_valid"),
         CheckConstraint("status <> 'authorized' OR (source = 'cash' AND cash_movement_id IS NULL)",
                         name="authorized_is_cash_without_movement"),
+        CheckConstraint("executed_by IS NULL OR status = 'paid'", name="executed_only_when_paid"),
+        CheckConstraint("(status = 'cancelled') = (cancelled_by IS NOT NULL)", name="cancelled_has_canceller"),
+        Index("ix_payroll_payments_authorized", "company_id", "branch_id", postgresql_where=text("status = 'authorized'")),
         Index("uq_payroll_payments_idempotency", "company_id", "idempotency_key", unique=True,
               postgresql_where=text("idempotency_key IS NOT NULL")),
     )

@@ -99,8 +99,10 @@ def _record(
     # moves its money (a company administrator never owns a session it could operate), whatever route got here.
     if session.cashier_id != actor_user_id:
         raise CashSessionNotOwned()
-    operator = db.get(UserAccount, actor_user_id)  # a legacy session owned by an administrator is not operable either
-    if operator is None or getattr(operator.role, "value", operator.role) == "admin":
+    # FM-FUNCTIONAL-018-R2: only a CASHIER moves a session's money (a session owned by an administrator, a manager or
+    # anyone else whose operating role is not cashier is not operable, whatever its grants say).
+    operator = db.get(UserAccount, actor_user_id)
+    if operator is None or getattr(operator.role, "value", operator.role) != "cashier":
         raise PermissionDenied()
     session.balance += signed
     session.version += 1

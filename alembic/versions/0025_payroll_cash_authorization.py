@@ -33,6 +33,12 @@ def upgrade() -> None:
                                "status IN ('authorized', 'paid', 'cancelled')")
     op.create_check_constraint(op.f('ck_payroll_payments_authorized_is_cash_without_movement'), 'payroll_payments',
                                "status <> 'authorized' OR (source = 'cash' AND cash_movement_id IS NULL)")
+    op.create_check_constraint(op.f('ck_payroll_payments_executed_only_when_paid'), 'payroll_payments',
+                               "executed_by IS NULL OR status = 'paid'")
+    op.create_check_constraint(op.f('ck_payroll_payments_cancelled_has_canceller'), 'payroll_payments',
+                               "(status = 'cancelled') = (cancelled_by IS NOT NULL)")
+    op.create_index('ix_payroll_payments_authorized', 'payroll_payments', ['company_id', 'branch_id'],
+                    postgresql_where=sa.text("status = 'authorized'"))
 
 
 def downgrade() -> None:
@@ -40,6 +46,10 @@ def downgrade() -> None:
     n = bind.execute(sa.text("SELECT count(*) FROM payroll_payments WHERE status <> 'paid'")).scalar()
     if n:
         raise RuntimeError(f"cannot downgrade 0025: {n} authorized/cancelled payroll payment(s) exist")
+    op.drop_index('ix_payroll_payments_authorized', table_name='payroll_payments',
+                  postgresql_where=sa.text("status = 'authorized'"))
+    op.drop_constraint(op.f('ck_payroll_payments_cancelled_has_canceller'), 'payroll_payments', type_='check')
+    op.drop_constraint(op.f('ck_payroll_payments_executed_only_when_paid'), 'payroll_payments', type_='check')
     op.drop_constraint(op.f('ck_payroll_payments_authorized_is_cash_without_movement'), 'payroll_payments', type_='check')
     op.drop_constraint(op.f('ck_payroll_payments_status_valid'), 'payroll_payments', type_='check')
     op.drop_constraint(op.f('fk_payroll_payments_executed_by_users'), 'payroll_payments', type_='foreignkey')

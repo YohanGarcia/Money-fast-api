@@ -90,7 +90,8 @@ def list_payments(db: Session = Depends(get_db), company_id: int = Depends(get_c
                                actor_name=users.get(p.actor_id, "—"), reference=p.reference or "",
                                has_proof=bool(p.proof), bank_account_id=p.bank_account_id,
                                bank_label=banks.get(p.id), cash_movement_id=p.cash_movement_id,
-                               historical_capital=p.source == "capital", status=p.status, branch_id=p.branch_id) for p in rows])
+                               historical_capital=p.source == "capital", status=p.status, branch_id=p.branch_id,
+                               executed_at=p.executed_at) for p in rows])
 
 
 def _digest(payload: PayrollPaymentCreate, employee_branch_id) -> str:

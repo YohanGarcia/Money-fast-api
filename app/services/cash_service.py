@@ -124,7 +124,7 @@ def pending(db,box,collector_id=None): return sum((n for _,n in outstanding_rows
 def add_movement(db,box,session,user,kind,amount,notes,reviewed_report=False,**kw):
     # FM-FUNCTIONAL-018-R1: single choke point of the legacy v1 balance changes. Only the session's own cashier moves
     # its money; the lone exception is the administrator's CONFIRMATION of a surplus that session's own cashier reported.
-    if (session.cashier_id!=user.id or user.role=='admin') and not reviewed_report: fail('La jornada pertenece a otro usuario: solo su cajero opera su efectivo.',403)
+    if (session.cashier_id!=user.id or user.role!='cashier') and not reviewed_report: fail('Solo el cajero dueño de la jornada opera su efectivo.',403)
     if session.state!='open': fail('La jornada no admite movimientos.',409)
     if session.balance+amount<0: fail('El efectivo disponible no alcanza para esta salida.',409)
     session.balance += amount

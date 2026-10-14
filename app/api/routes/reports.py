@@ -49,8 +49,11 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
     desembolsado = sum((l.principal_amount for l in loans if low <= _aware(l.created_at) < high), ZERO)
     prestamos_nuevos = sum(1 for l in loans if low <= _aware(l.created_at) < high)
 
-    nomina_rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id, PayrollPayment.status == 'paid')).all()  # authorized/cancelled moved no money
-    nomina_pagada = sum((p.amount for p in nomina_rows if low <= _aware(p.created_at) < high), ZERO)
+    # FM-FUNCTIONAL-018-R2: only EXECUTED payments are an expense (authorized / cancelled ones moved no money) and a cash
+    # payment counts on the day the cashier executed it, not the day the administrator authorized it. Rows written before
+    # migration 0025 (and bank payments) have no ``executed_at`` and keep their original date.
+    nomina_rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id, PayrollPayment.status == 'paid')).all()
+    nomina_pagada = sum((p.amount for p in nomina_rows if low <= _aware(p.executed_at or p.created_at) < high), ZERO)
 
     efectivo = None
     if svc.enabled(db, company_id):

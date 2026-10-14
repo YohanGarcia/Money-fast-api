@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.identity.catalog import ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS, CATALOG_CODES
+from app.modules.identity.catalog import (
+    ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS,
+    CASHIER_ONLY_PERMISSIONS,
+    CATALOG_CODES,
+)
 from app.modules.identity.errors import DelegationCeilingViolation, PermissionDenied
 from app.modules.identity.models import Permission, Role, RolePermission, UserAccount, UserRoleAssignment
 
@@ -108,15 +112,18 @@ def effective_grants(db: Session, user: UserAccount) -> tuple[Grant, ...]:
             Permission.scope_kind == kind,
         )
     ).all()
-    # FM-FUNCTIONAL-018: a company administrator never operates Caja, even with inherited or legacy grants.
-    is_admin = getattr(getattr(user, "role", None), "value", getattr(user, "role", None)) == "admin"
+    # FM-FUNCTIONAL-018-R2: only a CASHIER operates Caja. Whatever grants a user holds (legacy or explicit), the
+    # cashier-only permissions are not effective unless its operating role is ``cashier``; a company administrator also
+    # loses the operative refund. Platform users have no operating role and no tenant cash grants anyway.
+    role = getattr(getattr(user, "role", None), "value", getattr(user, "role", None))
+    denied: frozenset[str] = frozenset()
+    if user.company_id is not None and role != "cashier":
+        denied = CASHIER_ONLY_PERMISSIONS
+    if role == "admin":
+        denied = denied | ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS
     return tuple(
         sorted(
-            {
-                Grant(code, scope, branch, cp)
-                for code, scope, branch, cp in rows
-                if not (is_admin and code in ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS)
-            },
+            {Grant(code, scope, branch, cp) for code, scope, branch, cp in rows if code not in denied},
             key=lambda g: (g.permission, g.scope_kind, g.branch_id or 0, g.cash_point_id or 0),
         )
     )
