@@ -55,17 +55,12 @@ from app.modules.cash.errors import (
     CashPointNotActive,
     CashPointNotFound,
     CashSessionNotFound,
-    HandoverNotFound,
-    HandoverNotPending,
     PendingSurplusReview,
-    InsufficientCapital,
     InvalidCount,
     InvalidHandoverDestination,
     InvalidOpening,
     InvalidReceiver,
-    MakerCannotAccept,
     NextSessionRequiresCash,
-    NotNamedReceiver,
     NotSessionOwner,
     ObservationRequired,
     ReceiverRequired,
@@ -79,7 +74,6 @@ from app.modules.identity.errors import PermissionDenied, TenantMismatch
 from app.modules.identity.models import UserAccount
 from app.modules.organization.models import CashPoint
 from app.modules.organization.service import ensure_cash_point_usable
-from app.services import capital_service
 
 READ, OPEN, CLOSE = "cash.sessions.read", "cash.sessions.open", "cash.sessions.close"
 ACCEPT, DIFF_READ = "cash.handovers.accept", "cash.differences.read"
@@ -99,7 +93,7 @@ HANDOVER_OUT_KIND = "session_handover_out"
 INITIAL_FUND_KIND = "opening_initial_fund"
 SIMPLE_CLOSE_NO_NOTE = "Diferencia de cierre registrada sin observacion de la cajera."
 OPENING_KINDS = (OPENING_FUND_KIND, OPENING_HANDOVER_FUND_KIND, INITIAL_FUND_KIND)  # opening cash, never operating incoming cash
-DESTINATIONS = ("capital", "next_session")
+DESTINATIONS = ("next_session",)
 
 
 # --- helpers --------------------------------------------------------------------------------------------
@@ -301,15 +295,8 @@ def session_out(db: Session, s: CashSession, *, replayed: bool | None = None) ->
     ).all()
     dh = None if s.state == "open" else _live_session_handover(db, s.id)  # only a closing / closed source can have one
     next_action = None
-    if s.state == "closing" and h is not None and h.state == "pending":
-        next_action = {
-            "action": "accept_closing_handover",
-            "handover_id": h.id,
-            "receiver_user_id": h.to_user_id,
-            "endpoint": f"/api/v2/cash/handovers/{h.id}/accept",
-            "legacy_command": "confirm_closing_transfer",
-        }
-    elif s.state == "closing" and dh is not None and dh.state == "pending":
+    # (a pending handover TO CAPITAL can only be historical now: nothing completes it, so no next action is offered)
+    if s.state == "closing" and dh is not None and dh.state == "pending":
         declined = dh.declined_at is not None
         next_action = {
             "action": "redirect_session_handover" if declined else "accept_session_handover",
@@ -420,22 +407,6 @@ def _close_replay(db: Session, tenant_id: int, s: CashSession, idempotency_key: 
     return None
 
 
-def _accept_replay(
-    db: Session, tenant_id: int, actor: Principal, h: CashCustodyTransfer, idempotency_key: str, digest: str
-) -> dict | None:
-    """The answer to a repeated acceptance of THIS handover by the same actor; the key elsewhere conflicts."""
-    if h.accept_idempotency_key == idempotency_key:
-        if h.accept_request_digest == digest and h.accepted_by == actor.user_id:
-            return session_out(db, _session(db, tenant_id, h.session_id), replayed=True)
-        raise IdempotencyConflict()
-    if db.scalar(
-        select(CashCustodyTransfer.id).where(
-            CashCustodyTransfer.company_id == tenant_id, CashCustodyTransfer.accept_idempotency_key == idempotency_key
-        )
-    ):
-        raise IdempotencyConflict()
-    return None
-
 
 # --- open ------------------------------------------------------------------------------------------------
 def open_session(
@@ -477,15 +448,8 @@ def open_session(
             raise InvalidOpening("Una apertura en cero no recibe ni cuenta efectivo.")
     elif source == "initial":
         pass  # any non-negative amount (zero allowed); the amount is declared, so it is never a difference
-    elif source == "capital":
-        if fund <= 0 or not counted_map:
-            raise InvalidOpening(
-                "Una apertura desde capital necesita un fondo positivo y su conteo por denominaciones."
-            )
-        if counted != fund and len(note) < 3:
-            raise ObservationRequired()
     else:
-        raise InvalidOpening("El origen de la apertura es cero, capital o monto inicial: no se admite efectivo sin origen.")
+        raise InvalidOpening("El origen de la apertura es cero o monto inicial: no se admite efectivo sin origen.")
     # locks: box -> cash point (the active-slot check serialises here; the partial UNIQUE index is the backstop)
     box = _box(db, tenant_id, cp.branch_id)
     cp = _cash_point(db, tenant_id, cash_point_id, lock=True)
@@ -499,8 +463,6 @@ def open_session(
         select(CashSession.id).where(CashSession.cash_point_id == cp.id, CashSession.state.in_(ACTIVE_SESSION_STATES))
     ):
         raise CashPointBusy()
-    if source == "capital" and capital_service.balance(db, tenant_id) < fund:
-        raise InsufficientCapital()
     at = now_utc()
     s = CashSession(
         box_id=box.id,
@@ -547,29 +509,6 @@ def open_session(
             )
         )
         db.flush()
-        s.balance = s.balance + fund
-        s.version += 1
-    if source == "capital":
-        movement = CashMovement(
-            box_id=box.id,
-            session_id=s.id,
-            kind=OPENING_FUND_KIND,
-            amount=fund,
-            actor_id=actor.user_id,
-            notes="Fondo de apertura desde capital",
-            reference=f"APE-{s.id}",
-        )
-        db.add(movement)
-        db.flush()
-        capital_service.record(
-            db,
-            tenant_id,
-            actor.user_id,
-            "to_cash",
-            fund,
-            f"Fondo de apertura jornada {s.id}",
-            cash_movement_id=movement.id,
-        )
         s.balance = s.balance + fund
         s.version += 1
     if counted != fund:
@@ -628,14 +567,6 @@ def _close_snapshot(db: Session, s: CashSession, expected: Decimal, counted: Dec
     }
 
 
-def _valid_receiver(db: Session, tenant_id: int, cp: CashPoint, receiver_user_id: int, maker_id: int) -> None:
-    user = db.get(UserAccount, receiver_user_id)
-    if user is None or user.company_id != tenant_id or not user.is_active or user.id == maker_id:
-        raise InvalidReceiver()
-    if not build_principal(db, user, 0).allows(ACCEPT, **_scope(cp)):
-        raise InvalidReceiver()
-
-
 def _valid_direct_receiver(db: Session, tenant_id: int, cp: CashPoint, receiver_user_id: int, maker_id: int) -> None:
     """A named next cashier: an active user of the tenant, never the maker, who may receive AND open HERE."""
     user = db.get(UserAccount, receiver_user_id)
@@ -657,13 +588,12 @@ def close_session(
     idempotency_key: str,
     client_ip: str | None = None,
     snapshot_extra: dict | None = None,
-    destination: str = "capital",
+    destination: str = "next_session",
 ) -> dict:
     """Operational close by the session owner. The difference (if any) is a record; it never blocks the next session.
 
-    ``destination = capital`` (default) is the T-021 flow and its digest is the historical one; ``next_session``
-    leaves the counted cash in a pending DIRECT handover to a named cashier of the same CashPoint (the digest
-    adds ``destination``).
+    The counted cash is left in a pending DIRECT handover (``next_session``) to a named cashier of the same CashPoint.
+    Handing the cash over to Capital no longer exists.
     """
     tenant_id = _gate(actor)
     note = _note(observation_note)
@@ -681,8 +611,7 @@ def close_session(
         "observation_note": note,
         "receiver_user_id": receiver_user_id if counted > 0 else None,
     }
-    if destination == "next_session":
-        payload["destination"] = "next_session"  # the capital / default digest stays byte-for-byte the historical one
+    payload["destination"] = "next_session"
     digest = _digest(payload)
     s = _session(db, tenant_id, session_id)
     replay = _close_replay(db, tenant_id, s, idempotency_key, digest)
@@ -712,10 +641,7 @@ def close_session(
     if counted > 0:
         if receiver_user_id is None:
             raise ReceiverRequired()
-        if destination == "next_session":
-            _valid_direct_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
-        else:
-            _valid_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
+        _valid_direct_receiver(db, tenant_id, cp, receiver_user_id, s.cashier_id)
     at = now_utc()
     snapshot = _close_snapshot(db, s, expected, counted, difference) | (snapshot_extra or {})  # reads only
     try:
@@ -756,22 +682,6 @@ def close_session(
             state="pending",
         )
         db.add(direct)
-        db.flush()
-    elif counted > 0:
-        handover = CashCustodyTransfer(
-            company_id=tenant_id,
-            box_id=s.box_id,
-            session_id=s.id,
-            kind="closing_capital",
-            from_user_id=s.cashier_id,
-            to_user_id=receiver_user_id,
-            amount=counted,
-            currency_code="DOP",
-            state="pending",
-            provenance="v2",
-            notes=note,
-        )
-        db.add(handover)
         db.flush()
     _audit(
         db,
@@ -937,121 +847,6 @@ def close_simple_session(
     return session_out(db, s, replayed=False)
 
 
-# --- closing handover acceptance -------------------------------------------------------------------------
-def accept_handover(
-    db: Session,
-    actor: Principal,
-    handover_id: int,
-    *,
-    idempotency_key: str,
-    acceptance_id: str | None = None,
-    notes: str | None = None,
-    client_ip: str | None = None,
-) -> dict:
-    """The receiver confirms the physical cash: one transfer out of the session + one capital entry, then ``closed``."""
-    tenant_id = _gate(actor)
-    digest = _digest({"operation": "accept_closing_handover", "handover_id": handover_id})
-    h = db.scalar(
-        select(CashCustodyTransfer).where(
-            CashCustodyTransfer.id == handover_id,
-            CashCustodyTransfer.company_id == tenant_id,
-            CashCustodyTransfer.kind == "closing_capital",
-        )
-    )
-    if h is None:
-        raise HandoverNotFound()
-    replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)
-    if replay is not None:
-        return replay
-    s = _session(db, tenant_id, h.session_id)
-    cp = _cash_point(db, tenant_id, s.cash_point_id)
-    require(actor, ACCEPT, **_scope(cp))
-    # locks: box -> session -> handover
-    _box(db, tenant_id, cp.branch_id)
-    s = _session(db, tenant_id, h.session_id, lock=True)
-    h = db.scalar(
-        select(CashCustodyTransfer)
-        .where(CashCustodyTransfer.id == handover_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)  # an identical request won meanwhile
-    if replay is not None:
-        return replay
-    if h.state != "pending" or s.state != "closing":
-        raise HandoverNotPending()
-    if actor.user_id == h.from_user_id:
-        raise MakerCannotAccept()
-    if h.provenance == "v2" and actor.user_id != h.to_user_id:
-        raise NotNamedReceiver()
-    at = now_utc()
-    # The key is claimed FIRST, alone in a savepoint, before any movement / capital row / balance / state change: a
-    # collision with another branch's key can then only ever undo this one UPDATE, so no economic row has to escape a
-    # rollback. A later failure aborts the whole request transaction (services never commit).
-    try:
-        with db.begin_nested():
-            h.accept_idempotency_key, h.accept_request_digest = idempotency_key, digest
-            db.flush()
-    except IntegrityError as exc:
-        if not _violates(exc, ACCEPT_KEY_CONSTRAINT):
-            raise
-        replay = _accept_replay(db, tenant_id, actor, h, idempotency_key, digest)
-        if replay is None:
-            raise
-        return replay
-    if h.amount > 0:
-        movement = CashMovement(
-            box_id=s.box_id,
-            session_id=s.id,
-            kind=CLOSING_TRANSFER_KIND,
-            amount=-h.amount,
-            actor_id=actor.user_id,
-            notes="Entrega de cierre a capital",
-            reference=f"CUST-{h.id}",
-            custody_transfer_id=h.id,
-        )
-        db.add(movement)
-        db.flush()
-        capital = capital_service.record(
-            db,
-            tenant_id,
-            actor.user_id,
-            "from_cash",
-            h.amount,
-            f"Entrega de cierre jornada {s.id}",
-            cash_movement_id=movement.id,
-        )
-        s.balance = s.balance - h.amount
-        h.cash_movement_id, h.capital_movement_id = movement.id, capital.id
-    h.state = "confirmed"
-    h.accepted_by, h.accepted_at = actor.user_id, at
-    h.acceptance_id = acceptance_id or f"T021-{tenant_id}-{idempotency_key}"[:80]
-    h.acceptance_method = "authenticated_confirmation"
-    if notes:
-        h.notes = notes
-    h.version += 1
-    db.flush()
-    s.state = "closed"
-    s.version += 1
-    db.flush()
-    _audit(
-        db,
-        "cash.handover.accepted",
-        actor,
-        client_ip,
-        h.from_user_id,
-        handover_id=h.id,
-        session_id=s.id,
-        cash_point_id=cp.id,
-        branch_id=cp.branch_id,
-        amount=_amt(h.amount),
-        provenance=h.provenance,
-        cash_movement_id=h.cash_movement_id,
-        capital_movement_id=h.capital_movement_id,
-    )
-    return session_out(db, s, replayed=False)
-
-
 # --- reads (pure) ----------------------------------------------------------------------------------------
 def _can_read_session(actor: Principal, cp: CashPoint, s: CashSession) -> bool:
     return s.cashier_id == actor.user_id or actor.allows(READ, **_scope(cp))
@@ -1106,30 +901,6 @@ def _scoped(stmt, branches: list[int] | None, points: list[int], branch_id: int 
     return stmt
 
 
-def list_handovers(
-    db: Session, actor: Principal, *, state: str, branch_id: int | None, limit: int, before_id: int | None
-) -> dict:
-    tenant_id = _gate(actor)
-    branches, points = _visible(actor, ACCEPT, branch_id)
-    stmt = (
-        select(CashCustodyTransfer)
-        .join(CashSession, CashSession.id == CashCustodyTransfer.session_id)
-        .join(CashPoint, CashPoint.id == CashSession.cash_point_id)
-        .where(
-            CashCustodyTransfer.company_id == tenant_id,
-            CashCustodyTransfer.kind == "closing_capital",
-            CashCustodyTransfer.state == state,
-        )
-        .order_by(CashCustodyTransfer.id.desc())
-        .limit(limit)
-    )
-    stmt = _scoped(stmt, branches, points, branch_id)
-    if before_id is not None:
-        stmt = stmt.where(CashCustodyTransfer.id < before_id)
-    items = [handover_out(h) for h in db.scalars(stmt).all()]
-    return {"items": items, "next_before_id": items[-1]["id"] if len(items) == limit else None}
-
-
 def list_differences(
     db: Session,
     actor: Principal,
@@ -1178,18 +949,12 @@ def base_cash_point_id(db: Session, box_id: int) -> int | None:
 
 # --- user lifecycle guard (T-023A, D20) ---------------------------------------------------------------------
 def has_cash_responsibility(db: Session, tenant_id: int, user_id: int) -> bool:
-    """The user owns an open / closing session, or is the named receiver of a pending capital handover, or of a pending,
+    """The user owns an open / closing session, or is the named receiver of a pending,
     NOT declined direct handover (a receiver who declined has discharged that responsibility). ONE query."""
     owns_session = exists().where(
         CashSession.tenant_id == tenant_id,
         CashSession.cashier_id == user_id,
         CashSession.state.in_(ACTIVE_SESSION_STATES),
-    )
-    capital_receiver = exists().where(
-        CashCustodyTransfer.company_id == tenant_id,
-        CashCustodyTransfer.to_user_id == user_id,
-        CashCustodyTransfer.kind == "closing_capital",
-        CashCustodyTransfer.state == "pending",
     )
     direct_receiver = exists().where(
         CashSessionHandover.tenant_id == tenant_id,
@@ -1197,4 +962,4 @@ def has_cash_responsibility(db: Session, tenant_id: int, user_id: int) -> bool:
         CashSessionHandover.state == "pending",
         CashSessionHandover.declined_at.is_(None),
     )
-    return bool(db.scalar(select(or_(owns_session, capital_receiver, direct_receiver))))
+    return bool(db.scalar(select(or_(owns_session, direct_receiver))))

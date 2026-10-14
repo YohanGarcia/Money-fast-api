@@ -22,11 +22,14 @@ class Proof(BaseModel):
 
 class CashCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['open','movement','declare','receive','receive_collector','reject_delivery','close','resolve','confirm_closing_transfer','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','cash_addition','confirm_surplus','reject_surplus']
+    action: Literal['open','movement','declare','receive','receive_collector','reject_delivery','close','resolve','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','cash_addition','cash_withdrawal','request_addition','cancel_addition','reject_addition','confirm_surplus','reject_surplus']
     branch_id: int | None = None
     session_id: int | None = Field(default=None, gt=0)
     cash_point_id: int | None = Field(default=None, gt=0)  # T-021: the cash position to open (default: the box's base one)
     receiver_id: int | None = Field(default=None, gt=0)
+    # request_addition: the cashier the money goes to / is taken from and the direction ('in' = into the box)
+    cashier_id: int | None = Field(default=None, gt=0)
+    direction: Literal['in','out'] | None = None
     idempotency_key: str = Field(min_length=12, max_length=80)
     version: int | None = None
     transfer_version: int | None = None

@@ -63,7 +63,6 @@ from app.modules.cash.sessions import (
     _scope,
     _session,
     _valid_direct_receiver,
-    _valid_receiver,
     _violates,
     _visible,
     count_denominations,
@@ -432,7 +431,7 @@ def redirect_session_handover(
 ) -> dict:
     """Atomically cancel the row, create its replacement and fill its single forward pointer (no bare cancel exists)."""
     tenant_id = _gate(actor)
-    if destination not in ("next_session", "capital"):
+    if destination != "next_session":  # a direct handover can only be re-assigned to another next-session cashier
         raise InvalidHandoverDestination()
     reason = _reason(reason)
     digest = _digest(
@@ -468,10 +467,7 @@ def redirect_session_handover(
             raise RedirectNotAuthorized()
     elif actor.user_id != h.from_user_id and not supervisor:
         raise RedirectNotAuthorized()
-    if destination == "next_session":
-        _valid_direct_receiver(db, tenant_id, cp, receiver_user_id, h.from_user_id)
-    else:
-        _valid_receiver(db, tenant_id, cp, receiver_user_id, h.from_user_id)
+    _valid_direct_receiver(db, tenant_id, cp, receiver_user_id, h.from_user_id)
     at = now_utc()
     # 1. cancel the old row, claiming the redirect key as the first write (one UPDATE inside a savepoint)
     try:
@@ -489,8 +485,7 @@ def redirect_session_handover(
             raise
         return replay
     # 2. the replacement
-    if destination == "next_session":
-        replacement = CashSessionHandover(
+    replacement = CashSessionHandover(
             tenant_id=tenant_id,
             box_id=h.box_id,
             cash_point_id=h.cash_point_id,
@@ -500,28 +495,11 @@ def redirect_session_handover(
             amount=h.amount,
             currency_code="DOP",
             state="pending",
-        )
-    else:
-        replacement = CashCustodyTransfer(
-            company_id=tenant_id,
-            box_id=h.box_id,
-            session_id=h.source_session_id,
-            kind="closing_capital",
-            from_user_id=h.from_user_id,
-            to_user_id=receiver_user_id,
-            amount=h.amount,
-            currency_code="DOP",
-            state="pending",
-            provenance="v2",
-            notes="",
-        )
+    )
     db.add(replacement)
     db.flush()
     # 3. the single immutable forward pointer of the cancelled row
-    if destination == "next_session":
-        h.redirected_to_session_handover_id = replacement.id
-    else:
-        h.redirected_to_capital_handover_id = replacement.id
+    h.redirected_to_session_handover_id = replacement.id
     db.flush()
     _audit(
         db,

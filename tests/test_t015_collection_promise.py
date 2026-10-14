@@ -928,7 +928,7 @@ def test_the_promise_code_has_no_legacy_money_activity_text_scheduler_or_stored_
     assert "CreditCollectionPromise" not in worklist_src and "promises.current_mini_views(" in worklist_src
     assert "promises.create" not in worklist_src and "promises.cancel" not in worklist_src and "record_event" not in worklist_src
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
-    assert catalog.count("collections.promises") == 1 and promise_service.CREATE == CREATE
+    assert len(__import__("re").findall(r'PermissionDef\(\s*"collections\.promises', catalog)) == 1 and promise_service.CREATE == CREATE
     assert "'fulfilled'" not in model[model.index("PROMISE_CLOSED_KINDS") : model.index("class CreditCollectionPromise")]
 
 

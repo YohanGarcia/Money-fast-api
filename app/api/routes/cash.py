@@ -119,7 +119,10 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
             custody_transfers=[t for t in custody_transfers if t.to_user_id==user.id or t.from_user_id==user.id]
         last=sessions[0] if sessions else None
         historical_users={m.actor_id for m in movements}|{d.collector_id for d in deliveries}|{d.cashier_id for d in deliveries}
-        branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
+        # A user holding the "Notario" role is a legacy `collector` but never collects: keep it out of the cash lists.
+        branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values()
+            if (u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users)
+            and not (u.id not in historical_users and 'Notario' in u.branch_roles)]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
         data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','closing')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
@@ -129,6 +132,15 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
           audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
         data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
+    if not mine:
+        # Money the administration asked to send to / take from a cashier's box (the cashier only confirms it).
+        from app.models.cash import CashAdditionRequest
+        reqs=db.scalars(select(CashAdditionRequest).where(CashAdditionRequest.box_id==box.id).order_by(CashAdditionRequest.id.desc()).limit(60)).all()
+        if user.role=='cashier': reqs=[r for r in reqs if r.cashier_id==user.id]
+        name=lambda uid: users[uid].full_name if uid in users else 'Usuario histórico'
+        data['addition_requests']=[dict(id=r.id,direction=r.direction,amount=str(r.amount),notes=r.notes,reference=r.reference,state=r.state,
+            version=r.version,cashier_id=r.cashier_id,cashier_name=name(r.cashier_id),requested_by=r.requested_by,requested_by_name=name(r.requested_by),
+            requested_at=r.requested_at,resolved_at=r.resolved_at,resolution_note=r.resolution_note) for r in reqs]
     if user.role == 'admin':
         # Administrative supervision is company-wide. This read-only
         # aggregate never becomes an operable session or replaces workspace

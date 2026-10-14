@@ -18,7 +18,7 @@ from app.models.cash import CashBox, CashSession
 from app.models.payroll import PayrollConfig, PayrollPayment
 from app.models.user import User
 from app.schemas.payroll import PayrollConfigUpdate, PayrollPaymentCreate
-from app.services import capital_service, cash_service as svc, payroll_service
+from app.services import cash_service as svc, payroll_service
 from app.services.cash_live import publish
 
 router = APIRouter()

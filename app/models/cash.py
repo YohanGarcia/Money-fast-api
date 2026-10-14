@@ -430,6 +430,39 @@ class CashAudit(Base):
     details: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
+ADDITION_DIRECTIONS = ('in', 'out')
+ADDITION_STATES = ('pending', 'confirmed', 'rejected', 'cancelled')
+
+
+class CashAdditionRequest(Base):
+    """Money the ADMINISTRATION sends to (``in``) or takes from (``out``) a cashier's box. Nothing moves when it is
+    requested: only the cashier's confirmation writes the cash movement (the cashier never originates it)."""
+    __tablename__ = 'cash_addition_requests'
+    __table_args__ = (
+        CheckConstraint("direction IN ('in', 'out')", name='direction_valid'),
+        CheckConstraint("state IN ('pending', 'confirmed', 'rejected', 'cancelled')", name='state_valid'),
+        CheckConstraint('amount > 0', name='amount_positive'),
+        CheckConstraint("(state = 'confirmed') = (movement_id IS NOT NULL)", name='movement_iff_confirmed'),
+        Index('ix_cash_addition_requests_pending', 'box_id', 'cashier_id', postgresql_where=text("state = 'pending'")),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey('companies.id'), index=True)
+    box_id: Mapped[int] = mapped_column(ForeignKey('cash_boxes.id'), index=True)
+    cashier_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    direction: Mapped[str] = mapped_column(String(3))
+    amount: Mapped[Decimal] = mapped_column(Numeric(12,2))
+    notes: Mapped[str] = mapped_column(Text, default='')
+    reference: Mapped[str] = mapped_column(String(160), default='')
+    state: Mapped[str] = mapped_column(String(12), default='pending')
+    requested_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    resolved_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str] = mapped_column(Text, default='')
+    movement_id: Mapped[int | None] = mapped_column(ForeignKey('cash_movements.id'))
+    version: Mapped[int] = mapped_column(default=1)
+
+
 class CashRequest(Base):
     __tablename__ = 'cash_requests'
     __table_args__ = (UniqueConstraint('company_id','actor_id','key'),)

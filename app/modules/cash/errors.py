@@ -33,7 +33,7 @@ class CashPointBusy(AppError):
 
 class InvalidOpening(AppError):
     status_code, code = 422, "invalid_cash_opening"
-    default_message = "Apertura invalida: el origen es cero o capital, con importe y conteo por denominaciones exactos."
+    default_message = "Apertura invalida: el origen es cero o un monto inicial declarado."
 
 
 class InvalidCount(AppError):
@@ -44,11 +44,6 @@ class InvalidCount(AppError):
 class ObservationRequired(AppError):
     status_code, code = 422, "observation_required"
     default_message = "Hay una diferencia entre lo contado y lo esperado: describe lo observado."
-
-
-class InsufficientCapital(AppError):
-    status_code, code = 409, "insufficient_capital"
-    default_message = "El capital disponible no alcanza para este fondo de apertura."
 
 
 class NotSessionOwner(AppError):
@@ -169,7 +164,7 @@ class NextSessionRequiresCash(AppError):
 
 class InvalidHandoverDestination(AppError):
     status_code, code = 422, "invalid_handover_destination"
-    default_message = "El destino del efectivo es capital o la siguiente jornada de la misma caja."
+    default_message = "El efectivo contado pasa a la siguiente jornada de la misma caja."
 
 
 class HandoverReasonRequired(AppError):

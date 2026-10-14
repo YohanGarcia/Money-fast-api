@@ -96,7 +96,7 @@ class CashRefactorTests(unittest.TestCase):
         return self.req(f'/cash/workspace?branch_id={self.branch}', headers=headers or self.roles['cashier'])
 
     def test_finance_report_sums_each_cashier_and_excludes_confirmed_closes(self):
-        """Cash moves from session to reserve once, without disappearing or doubling."""
+        """Open-session cash is summed per cashier and a confirmed close leaves the sessions total once."""
         from app.services.cash_service import today
 
         first = self.open_for('cashier', '800')
@@ -104,9 +104,6 @@ class CashRefactorTests(unittest.TestCase):
         path = f'/reports/finance?start={today()}&end={today()}'
         report = self.req(path)
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('3600.00'))  # T-021: the fund left capital
-        self.assertEqual(Decimal(report['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(report['capital_en_negocio']), Decimal('5000.00'))  # no capital inflation
 
         current = self.workspace(self.roles['cashier'])['session']
         pending = self.cmd('close', headers=self.roles['cashier'],
@@ -116,7 +113,6 @@ class CashRefactorTests(unittest.TestCase):
         self.assertEqual(pending['state'], 'closing')
         before_confirmation = self.req(path)
         self.assertEqual(Decimal(before_confirmation['efectivo_caja']), Decimal('1400.00'))
-        self.assertEqual(Decimal(before_confirmation['reserva_capital']), Decimal('3600.00'))
 
         with SessionLocal() as db:
             version = db.get(CashSession, first['session_id']).version
@@ -127,9 +123,6 @@ class CashRefactorTests(unittest.TestCase):
                  acceptance_method='authenticated_confirmation')
         after = self.req(path)
         self.assertEqual(Decimal(after['efectivo_caja']), Decimal('600.00'))
-        self.assertEqual(Decimal(after['reserva_capital']), Decimal('4400.00'))
-        self.assertEqual(Decimal(after['aportes_netos']), Decimal('5000.00'))
-        self.assertEqual(Decimal(after['capital_en_negocio']), Decimal('5000.00'))
 
     def test_finance_report_uses_physical_count_for_unresolved_shortfall(self):
         """A disputed closing difference must not be silently shown as actual cash."""
@@ -143,7 +136,6 @@ class CashRefactorTests(unittest.TestCase):
         self.assertEqual(pending['state'], 'closing')  # the counted cash awaits its handover; the difference is a record
         report = self.req(f'/reports/finance?start={today()}&end={today()}')
         self.assertEqual(Decimal(report['efectivo_caja']), Decimal('700.00'))
-        self.assertEqual(Decimal(report['reserva_capital']), Decimal('4100.00'))
 
     def test_composed_transfer_is_pending_and_preserves_exact_amount(self):
         """A bank transfer with explicit split components does not credit the loan early."""

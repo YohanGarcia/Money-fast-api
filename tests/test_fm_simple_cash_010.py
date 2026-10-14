@@ -169,10 +169,14 @@ class SimpleCashTests(_cash.CashTests):
         with SessionLocal() as db:
             return dict(db.get(CashSession,session_id).snapshot)
 
-    def test_capital_expense_flow_is_hidden_from_simple_sessions_but_withdrawal_without_capital_works(self):
+    def test_capital_expense_flow_is_hidden_from_simple_sessions_but_a_requested_withdrawal_works(self):
         self.simple_open('1000')
         w=self.workspace()
-        self.cmd('movement',headers=self.roles['cashier'],kind='withdrawal',amount='200',notes='Retiro del dueño',version=w['session']['version'])
+        # the cashier no longer originates a withdrawal: the administration requests it and the cashier confirms
+        self.cmd('movement',headers=self.roles['cashier'],kind='withdrawal',amount='200',notes='Retiro del dueño',version=w['session']['version'],code=403)
+        req=self.cmd('request_addition',direction='out',cashier_id=self.users['cashier']['id'],amount='200',notes='Retiro del dueño')
+        pending=[r for r in self.workspace()['addition_requests'] if r['id']==req['request_id']][0]
+        self.cmd('cash_withdrawal',headers=self.roles['cashier'],target_id=pending['id'],version=pending['version'])
         self.assertEqual(Decimal(self.workspace()['session']['balance']),800)
 
     # -- tickets --------------------------------------------------------------------------------------------------

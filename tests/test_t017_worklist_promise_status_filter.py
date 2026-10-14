@@ -515,9 +515,9 @@ def test_the_parameter_is_one_exact_enum_value_and_adds_no_other_surface(client,
     }
     assert worklist_service.SORTS == ("days_overdue", "overdue_outstanding", "oldest_overdue_date")
     versions = sorted(p.name for p in (ROOT / "alembic/versions").glob("0*.py"))
-    assert versions[-1].startswith("0024_") and not [v for v in versions if v.startswith("0025")]  # 0018 = T-019, 0019 = T-020, 0020 = T-021, 0021 = T-022A, 0022 = T-023A
+    assert versions[-1].startswith("0026_") and not [v for v in versions if v.startswith("0027")]  # 0018 = T-019, 0019 = T-020, 0020 = T-021, 0021 = T-022A, 0022 = T-023A
     catalog = (ROOT / "app/modules/identity/catalog.py").read_text(encoding="utf-8")
-    assert "collections.promise_status" not in catalog and catalog.count("collections.promises.create") == 1
+    assert "collections.promise_status" not in catalog and len(__import__("re").findall(r'PermissionDef\(\s*"collections\.promises\.create"', catalog)) == 1
     src = (ROOT / "app/modules/loans/worklist.py").read_text(encoding="utf-8")
     assert "activity_type" not in src  # T-018 adds only an existence filter, never an Activity type filter
     for formula in ("received_at", "promised_amount", "closed_kind", "is_broken", "broken_at", "fulfilled_at"):
@@ -589,4 +589,4 @@ def test_the_alembic_schema_is_unchanged_by_t017(scratch_db):
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0024" in _alembic(scratch_db, "heads").stdout  # T-019 / T-020 / T-021 / T-022A / T-023A added 0018 / 0019 / 0020 / 0021 / 0022
+    assert "0026" in _alembic(scratch_db, "heads").stdout  # T-019 / T-020 / T-021 / T-022A / T-023A added 0018 / 0019 / 0020 / 0021 / 0022

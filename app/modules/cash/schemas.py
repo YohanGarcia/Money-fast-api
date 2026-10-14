@@ -13,9 +13,9 @@ class OpenIn(BaseModel):
     idempotency_key: str = Field(min_length=12, max_length=120)
     cash_point_id: int = Field(gt=0)
     # anonymous opening cash does not exist; ``initial`` (FM-SIMPLE-CASH-010) is a declared amount with no capital
-    source: Literal["zero", "capital", "initial"]
-    amount: DecStr = "0"  # the capital fund (0 for a zero opening)
-    denominations: dict[str, StrictInt] = Field(default_factory=dict)  # physical count; required for a capital opening
+    source: Literal["zero", "initial"]
+    amount: DecStr = "0"  # the declared initial amount (0 for a zero opening)
+    denominations: dict[str, StrictInt] = Field(default_factory=dict)  # not used by the openings that remain
     observation_note: str | None = Field(default=None, max_length=2000)
 
 
@@ -28,23 +28,16 @@ class CloseIn(BaseModel):
     counted: DecStr | None = None  # FM-SIMPLE-CASH-010: money counted at a simple close (any difference is allowed)
     observation_note: str | None = Field(default=None, max_length=2000)  # required when counted != expected
     receiver_user_id: int | None = Field(default=None, gt=0)  # required when there is cash to hand over
-    # T-023A: ``capital`` (default, the T-021 flow) or ``next_session`` (a named cashier of the SAME CashPoint takes it)
-    destination: Literal["capital", "next_session"] = "capital"
+    # the counted cash always goes to ``next_session`` (a named cashier of the SAME CashPoint takes it)
+    destination: Literal["next_session"] = "next_session"
 
     @model_validator(mode="after")
     def _one_way_to_count(self):
         if self.counted is None and not self.denominations:
             raise ValueError("el conteo por denominaciones es obligatorio")
-        if self.counted is not None and (self.denominations or self.receiver_user_id is not None or self.destination != "capital"):
+        if self.counted is not None and (self.denominations or self.receiver_user_id is not None):
             raise ValueError("el cierre simple solo recibe el dinero contado")
         return self
-
-
-class AcceptHandoverIn(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    idempotency_key: str = Field(min_length=12, max_length=120)
-    notes: str | None = Field(default=None, max_length=2000)
 
 
 class ResolveDifferenceIn(BaseModel):
@@ -78,6 +71,6 @@ class RedirectSessionHandoverIn(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     idempotency_key: str = Field(min_length=12, max_length=120)
-    destination: Literal["next_session", "capital"]
+    destination: Literal["next_session"]
     receiver_user_id: int = Field(gt=0)
     reason: str = Field(default="", max_length=2000)

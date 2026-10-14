@@ -9,7 +9,6 @@ from app.core.db import get_session
 from app.modules.cash import differences, session_handovers
 from app.modules.cash import sessions as service
 from app.modules.cash.schemas import (
-    AcceptHandoverIn,
     AcceptSessionHandoverIn,
     CloseIn,
     DeclineSessionHandoverIn,
@@ -72,17 +71,6 @@ def close_session(session_id: int, body: CloseIn, request: Request, actor: Princ
     return out
 
 
-@router.post("/handovers/{handover_id}/accept")
-def accept_handover(
-    handover_id: int, body: AcceptHandoverIn, request: Request, actor: Principal = Actor, db: Session = Db
-):
-    out = service.accept_handover(
-        db, actor, handover_id, idempotency_key=body.idempotency_key, notes=body.notes, client_ip=client_ip(request)
-    )
-    db.commit()
-    return out
-
-
 @router.get("/sessions/current")
 def current_session(cash_point_id: int = Query(gt=0), actor: Principal = Actor, db: Session = Db):
     return {"session": service.current_session(db, actor, cash_point_id)}
@@ -93,19 +81,7 @@ def get_session_(session_id: int, actor: Principal = Actor, db: Session = Db):
     return service.get_session(db, actor, session_id)
 
 
-@router.get("/handovers")
-def list_handovers(
-    state: Literal["pending", "confirmed"] = "pending",
-    branch_id: int | None = Query(default=None, gt=0),
-    limit: int = Query(default=50, ge=1, le=100),
-    before_id: int | None = Query(default=None, gt=0),
-    actor: Principal = Actor,
-    db: Session = Db,
-):
-    return service.list_handovers(db, actor, state=state, branch_id=branch_id, limit=limit, before_id=before_id)
-
-
-# --- T-023A: same-CashPoint direct session handovers (the /handovers routes above stay capital-only) ------------
+# --- T-023A: same-CashPoint direct session handovers ---------------------------------------------------------
 @router.get("/session-handovers")
 def list_session_handovers(
     state: Literal["pending", "confirmed", "cancelled"] = "pending",

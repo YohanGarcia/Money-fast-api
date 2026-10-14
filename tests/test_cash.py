@@ -52,6 +52,15 @@ class CashTests(unittest.TestCase):
         self.req('/cash/activate',{})
         self.bank_account=self.req('/bank-accounts',dict(bank_name='Banco QA',account_number='1234567890',account_holder='Empresa QA'),code=201)
 
+    def test_notary_is_not_a_collector_in_the_cash_workspace(self):
+        """A user holding the "Notario" role is a legacy collector but never collects: it must not be offered as one."""
+        names=lambda: {u['id'] for u in self.workspace()['users'] if u['role']=='collector'}
+        collector_id=self.users['collector']['id']
+        self.assertIn(collector_id,names())
+        branch=self.req(f'/branches/{self.branch}',method='PUT',body=dict(name='Central',address='Calle Centro 1',phone='8095555555',is_active=True,notary_user_id=collector_id))
+        self.assertEqual(branch['notary_user_id'],collector_id)
+        self.assertNotIn(collector_id,names())
+
     def workspace(self,headers=None): return self.req(f'/cash/workspace?branch_id={self.branch}',headers=headers or self.roles['cashier'])
     def cmd(self,action,headers=None,code=200,**fields):
         if headers is None:
@@ -346,7 +355,10 @@ class CashTests(unittest.TestCase):
         self.assertEqual((opened['state'],opened['opening_mode']),('open','capital'))
         w=self.workspace();s=w['session']
         self.assertNotIn('open_idempotency_key',s);self.assertNotIn('open_request_digest',s)
-        self.cmd('movement',kind='contribution',amount='10',notes='Aporte sin origen',version=s['version'],code=422)  # D3
+        # A cashier never adds money to its own box nor moves company Capital (administration does, the cashier confirms)
+        self.cmd('movement',kind='contribution',amount='10',notes='Aporte sin origen',version=s['version'],code=403)  # D3
+        self.cmd('movement',kind='contribution',capital=True,amount='10',notes='Aporte desde capital',version=s['version'],code=403)
+        self.cmd('movement',kind='withdrawal',capital=True,amount='10',notes='Retiro hacia capital',version=s['version'],code=403)
         self.cmd('close',version=s['version']-1,denominations={'200':1,'100':1},code=409)  # stale version: nothing closes
         closed=self.cmd('close',version=s['version'],denominations={'200':1,'100':1})
         self.assertEqual(closed['state'],'closing');self.assertEqual(closed['next_action']['legacy_command'],'confirm_closing_transfer')

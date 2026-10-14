@@ -55,10 +55,22 @@ class ClosureTests(_cash.CashTests):
         with SessionLocal() as db:
             return [(Decimal(m.amount), m.reference, m.kind) for m in db.scalars(select(BankAccountMovement).order_by(BankAccountMovement.id)).all()]
 
+    def request_money(self, amount='500', reference='REC-1001', notes='Reposición de fondo', direction='in', code=200):
+        """The ADMINISTRATION asks for money to go into / out of the cashier's box (nothing moves yet)."""
+        body = dict(action='request_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), direction=direction,
+                    cashier_id=self.users['cashier']['id'], amount=amount, reference=reference, notes=notes)
+        out = self.req('/cash/commands', body, self.admin, code)
+        if code != 200:
+            return out
+        return [r for r in self.workspace()['addition_requests'] if r['id'] == out['request_id']][0]
+
     def addition(self, amount='500', reference='REC-1001', notes='Reposición de fondo', headers=None, code=200, key=None, **extra):
-        session = self.workspace(headers)['session']
+        """Admin requests, the cashier confirms receipt. Validation errors are raised by the REQUEST."""
+        if code != 200:
+            return self.request_money(amount, reference, notes, code=code)
+        pending = self.request_money(amount, reference, notes)
         body = dict(action='cash_addition', branch_id=self.branch, idempotency_key=key or str(uuid.uuid4()),
-                    version=session['version'], amount=amount, reference=reference, notes=notes, **extra)
+                    target_id=pending['id'], version=pending['version'], **extra)
         return self.req('/cash/commands', body, headers or self.roles['cashier'], code)
 
     # -- payroll from cash -------------------------------------------------------------------------------------
@@ -183,8 +195,8 @@ class ClosureTests(_cash.CashTests):
     def test_cash_addition_retry_and_double_click_are_idempotent(self):
         sid = self.simple_open('1000')['session_id']
         key = str(uuid.uuid4())
-        session = self.workspace()['session']
-        body = dict(action='cash_addition', branch_id=self.branch, idempotency_key=key, version=session['version'], amount='200', reference='R-1', notes='Aporte')
+        pending = self.request_money('200', 'R-1', 'Aporte')
+        body = dict(action='cash_addition', branch_id=self.branch, idempotency_key=key, target_id=pending['id'], version=pending['version'])
         a = self.req('/cash/commands', body, self.roles['cashier'])
         b = self.req('/cash/commands', body, self.roles['cashier'])
         self.assertEqual(a, b)
@@ -200,20 +212,51 @@ class ClosureTests(_cash.CashTests):
         self.addition('0', code=422)
         self.addition('500', notes='   ', code=422)
         self.addition('500', reference='  ', code=422)
+        pending = self.request_money('5', 'R', 'n')
+        # only the target cashier confirms; nobody else (nor the administration) can move the money
         for role in ('collector', 'manager'):
-            self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), version=1,
-                                           amount='5', reference='R', notes='n'), self.roles[role], 403)
-        self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), version=1,
-                                       amount='5', reference='R', notes='n'), self.admin, 403)
+            self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                           target_id=pending['id'], version=pending['version']), self.roles[role], 403)
+        self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=pending['id'], version=pending['version']), self.admin, 403)
+        # and the cashier can no longer originate a request nor a movement of its own
+        for role in ('cashier', 'collector', 'manager'):
+            self.req('/cash/commands', dict(action='request_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                           direction='in', cashier_id=self.users['cashier']['id'], amount='5', reference='R', notes='n'),
+                     self.roles[role], 403)
         self.assertEqual(Decimal(self.workspace()['session']['balance']), 1000)
 
+    def test_cash_addition_request_lifecycle_reject_cancel_and_out_direction(self):
+        sid = self.simple_open('1000')['session_id']
+        rejected = self.request_money('100', 'R-9', 'Para rechazar')
+        self.req('/cash/commands', dict(action='reject_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=rejected['id'], version=rejected['version'], notes=''), self.roles['cashier'], 422)
+        self.req('/cash/commands', dict(action='reject_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=rejected['id'], version=rejected['version'], notes='No llegó'), self.roles['cashier'])
+        again = dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), target_id=rejected['id'], version=rejected['version'] + 1)
+        self.req('/cash/commands', again, self.roles['cashier'], 409)  # already resolved
+        cancelled = self.request_money('50', 'R-8', 'Para cancelar')
+        self.req('/cash/commands', dict(action='cancel_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=cancelled['id'], version=cancelled['version']), self.admin)
+        out = self.request_money('300', '', 'Retiro del dueño', direction='out')
+        self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=out['id'], version=out['version']), self.roles['cashier'], 409)  # wrong direction
+        self.req('/cash/commands', dict(action='cash_withdrawal', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=out['id'], version=out['version']), self.roles['cashier'])
+        self.assertEqual(Decimal(self.workspace()['session']['balance']), 700)
+        self.assertEqual([m[:2] for m in self.movements(sid)][1:], [('withdrawal', Decimal('-300'))])
+        # a withdrawal larger than the cash on hand is refused at confirmation
+        too_much = self.request_money('5000', '', 'Demasiado', direction='out')
+        self.req('/cash/commands', dict(action='cash_withdrawal', branch_id=self.branch, idempotency_key=str(uuid.uuid4()),
+                                       target_id=too_much['id'], version=too_much['version']), self.roles['cashier'], 409)
+
     def test_cash_addition_not_on_closed_or_missing_session(self):
-        self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), version=1,
-                                       amount='5', reference='R', notes='n'), self.roles['cashier'], 409)
+        pending = self.request_money('5', 'R', 'n')
+        confirm = dict(action='cash_addition', branch_id=self.branch, target_id=pending['id'], version=pending['version'])
+        self.req('/cash/commands', dict(confirm, idempotency_key=str(uuid.uuid4())), self.roles['cashier'], 409)  # no open session
         self.simple_open('100')
         self.simple_close('100')
-        self.req('/cash/commands', dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), version=1,
-                                       amount='5', reference='R', notes='n'), self.roles['cashier'], 409)
+        self.req('/cash/commands', dict(confirm, idempotency_key=str(uuid.uuid4())), self.roles['cashier'], 409)  # closed session
 
     def test_closing_breakdown_counts_additions_inside_entries_and_expected(self):
         sid = self.simple_open('1000')['session_id']
@@ -328,8 +371,8 @@ class ClosureTests(_cash.CashTests):
 
     def test_cash_addition_cannot_cross_companies_and_records_its_responsible_user(self):
         sid = self.simple_open('1000')['session_id']
-        body = dict(action='cash_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), version=1,
-                    amount='50', reference='R-X', notes='intento ajeno')
+        body = dict(action='request_addition', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), direction='in',
+                    cashier_id=self.users['cashier']['id'], amount='50', reference='R-X', notes='intento ajeno')
         r = self.client.post('/api/v1/cash/commands', json=body, headers=self._other_owner_headers())
         self.assertIn(r.status_code, (403, 404, 409), r.text)
         self.assertEqual([m for m in self.movements(sid) if m[0] == 'cash_addition'], [])
