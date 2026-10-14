@@ -615,8 +615,10 @@ def _close_snapshot(db: Session, s: CashSession, expected: Decimal, counted: Dec
     flows = [r for r in rows if r.kind not in OPENING_KINDS]
     incoming = sum((r.amount for r in flows if r.amount > 0), Decimal(0))
     outgoing = -sum((r.amount for r in flows if r.amount < 0), Decimal(0))
+    additions = sum((r.amount for r in flows if r.kind == "cash_addition"), Decimal(0))
     return {
         "opening": _amt(expected - incoming + outgoing),
+        "additions": _amt(additions),  # FM-FINANCIAL-CLOSURE-012: already part of ``incoming``; shown apart, never added twice
         "incoming": _amt(incoming),
         "outgoing": _amt(outgoing),
         "expected": _amt(expected),

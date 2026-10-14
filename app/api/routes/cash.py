@@ -265,6 +265,6 @@ def session_ticket(session_id:int,kind:str='opening',branch_id:int|None=None,db:
     if kind=='closing':
         diff=s.difference or svc.ZERO
         data.update(closed_at=_local(s.closed_at),closed_by=names.get(s.closed_by,'Usuario histórico'),
-            incoming=snap.get('incoming'),outgoing=snap.get('outgoing'),expected=str(s.closing_expected),counted=str(s.counted),
+            incoming=snap.get('incoming'),outgoing=snap.get('outgoing'),additions=snap.get('additions'),expected=str(s.closing_expected),counted=str(s.counted),
             difference=str(diff),result='EXACTO' if diff==0 else ('SOBRANTE' if diff>0 else 'FALTANTE'))
     return data

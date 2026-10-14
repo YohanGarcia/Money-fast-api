@@ -341,6 +341,15 @@ def command(db,user,p):
         if p.capital:
             capital_service.record(db,box.company_id,user.id,'to_cash' if p.kind=='contribution' else 'from_cash',p.amount,p.notes,cash_movement_id=row.id)
         result={'movement_id':row.id}
+    elif action=='cash_addition':
+        # FM-FINANCIAL-CLOSURE-012: cash physically received and added to the cashier's OWN open session. It is an inflow of
+        # its own kind and origin; it never touches Capital, a bank account or income.
+        session=operational_session(db,box,user,p.session_id);check_version(session,p.version)
+        if p.amount<=0: fail('Indica un monto mayor que cero.')
+        if not p.notes.strip(): fail('Indica el motivo del aporte.')
+        if not p.reference.strip(): fail('Indica el comprobante o la referencia del aporte.')
+        row=add_movement(db,box,session,user,'cash_addition',p.amount,p.notes,reference=p.reference,proof=p.proof.model_dump() if p.proof else None)
+        result={'movement_id':row.id}
     elif action=='close':
         session=operational_session(db,box,user,p.session_id)
         if p.version is None or p.version!=session.version: fail('Los datos cambiaron. Actualiza antes de guardar.',409)
@@ -365,7 +374,7 @@ def command(db,user,p):
     elif action=='reverse':
         original=db.get(CashMovement,p.target_id)
         if not original or original.box_id!=box.id: fail('Movimiento no encontrado.',404)
-        if original.kind not in ('contribution','expense','withdrawal','bank_deposit','delivery','counter_payment','disbursement','surplus'): fail('Este tipo de movimiento no admite otro reverso.')
+        if original.kind not in ('contribution','cash_addition','expense','withdrawal','bank_deposit','delivery','counter_payment','disbursement','surplus'): fail('Este tipo de movimiento no admite otro reverso.')
         if not p.notes.strip(): fail('Indica el motivo del reverso.')
         if db.scalar(select(CashMovement).where(CashMovement.reverses_id==original.id)): fail('Movimiento ya revertido.',409)
         session=operational_session(db,box,user,p.session_id);check_version(session,p.version)

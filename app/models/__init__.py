@@ -1,6 +1,6 @@
 from app.models.cash import CashConfig, CashBox, CashSession, CashCustodyTransfer, CashMovement, CashDelivery, CashAllocation, CashTransfer, CashAudit, CashRequest, CashSessionDifference, CashDifferenceResolution
 from app.models.app_setting import AppSetting
-from app.models.bank_account import BankAccount
+from app.models.bank_account import BankAccount, BankAccountMovement
 from app.models.capital import CapitalMovement
 from app.models.payroll import PayrollConfig, PayrollPayment
 from app.models.loan_application import LoanApplication, ApplicationDocument
@@ -45,6 +45,7 @@ from app.modules.identity.models import (  # noqa: F401
 __all__ = [
     "AppSetting",
     "BankAccount",
+    "BankAccountMovement",
     "CashCustodyTransfer",
     "CapitalMovement",
     "PayrollConfig",
