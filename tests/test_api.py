@@ -1230,9 +1230,65 @@ class MoneyFastApiTests(unittest.TestCase):
         printed = self.client.get('/api/v1/print-settings', headers=headers).json()
         self.assertEqual(self.client.put('/api/v1/print-settings', headers=headers, json={**printed, 'receipt_footer_text': '   '}).status_code, 422)
         branch = dict(name='Sucursal QA', address='Calle de prueba', manager_name='Gerente QA', notary_name='Notario QA', phone='8095550100')
-        self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json={**branch, 'manager_name': '   '}).status_code, 422)
+        # Manager / notary are optional: they are picked from real users (see the branch staff-role test) or left empty.
+        blank = self.client.post('/api/v1/branches', headers=headers, json={**branch, 'name': 'Sucursal QA 2', 'manager_name': '   '})
+        self.assertEqual(blank.status_code, 201, blank.text)
+        self.assertEqual(blank.json()['manager_name'], '')
         self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json=branch).status_code, 201)
         self.assertEqual(self.client.post('/api/v1/branches', headers=headers, json=branch).status_code, 409)
+
+    def test_branch_manager_and_notary_are_real_users_with_branch_scoped_roles(self):
+        from app.core.database import SessionLocal
+        from app.modules.identity.models import Role, UserRoleAssignment
+
+        def active(branch_id):
+            with SessionLocal() as db:
+                rows = db.query(UserRoleAssignment, Role.name).join(Role, Role.id == UserRoleAssignment.role_id).filter(
+                    UserRoleAssignment.branch_id == branch_id, UserRoleAssignment.revoked_at.is_(None)
+                ).all()
+                return sorted((a.user_id, name, a.scope_kind) for a, name in rows)
+
+        headers = self.owner_session()
+        manager = self.create_user(headers, 'gerente@example.com', 'manager', 'Gerente Real')
+        notary = self.create_user(headers, 'notario@example.com', 'collector', 'Notario Real')
+        base = dict(name='Sucursal Roles', address='Calle de roles 1', phone='8095550111')
+        # an id that is not a user of this company is rejected, nothing is created
+        bad = self.client.post('/api/v1/branches', headers=headers, json={**base, 'manager_user_id': 999999})
+        self.assertEqual(bad.status_code, 422, bad.text)
+
+        created = self.client.post(
+            '/api/v1/branches', headers=headers,
+            json={**base, 'manager_user_id': manager['id'], 'notary_user_id': notary['id']},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        branch = created.json()
+        self.assertEqual((branch['manager_name'], branch['notary_name']), ('Gerente Real', 'Notario Real'))
+        self.assertEqual(
+            active(branch['id']),
+            sorted([(manager['id'], 'Gerente de sucursal', 'branch'), (notary['id'], 'Notario', 'branch')]),
+        )
+
+        # the web labels each user from this list (a notary is not shown as a collector)
+        def roles_of(email):
+            me = self.client.post('/api/v1/auth/login', json={'email': email, 'password': 'workerpass123'}).json()
+            got = self.client.get('/api/v1/auth/me', headers=self.auth_headers(me['access_token']))
+            self.assertEqual(got.status_code, 200, got.text)
+            return got.json()['branch_roles']
+
+        self.assertEqual(roles_of('notario@example.com'), ['Notario'])
+        self.assertEqual(roles_of('gerente@example.com'), ['Gerente de sucursal'])
+        # a notary never shows up as a cash responsible still waiting for a cash box
+        pending = self.client.get('/api/v1/cash/config', headers=headers).json()['pending_users']
+        self.assertNotIn('notario@example.com', [u['email'] for u in pending])
+
+        # swapping the manager revokes the previous holder (history is kept) and clearing the notary revokes theirs
+        other = self.create_user(headers, 'gerente2@example.com', 'manager', 'Otro Gerente')
+        update = {**base, 'is_active': True, 'manager_user_id': other['id'], 'notary_user_id': None, 'notary_name': ''}
+        changed = self.client.put(f"/api/v1/branches/{branch['id']}", headers=headers, json=update)
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertEqual(changed.json()['manager_name'], 'Otro Gerente')
+        self.assertEqual(active(branch['id']), [(other['id'], 'Gerente de sucursal', 'branch')])
+        self.assertEqual(roles_of('notario@example.com'), [])
 
     def test_cash_activation_allows_unassigned_staff_but_blocks_operations(self):
         headers = self.owner_session()

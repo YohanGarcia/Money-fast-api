@@ -8,9 +8,29 @@ from app.models.cash import CashBox, CashSession, CashTransfer, CashDelivery
 from app.services import cash_service
 from app.models.route import Route
 from app.models.user import User
+from app.modules.identity.catalog import sync_branch_staff
 from app.schemas.branch import BranchCreate, BranchRead, BranchUpdate
 
 router = APIRouter()
+
+
+def _apply_staff(db: Session, branch: Branch, payload: BranchCreate, actor_id: int | None) -> None:
+    """Assign the manager / notary roles (branch scope) from real users of the SAME company and keep the displayed
+    names in sync. ``None`` for an id means "leave the free text as is"; an explicit clear is an empty name + no id."""
+    for kind, user_id_attr, name_attr in (
+        ("manager", "manager_user_id", "manager_name"),
+        ("notary", "notary_user_id", "notary_name"),
+    ):
+        user_id = getattr(payload, user_id_attr)
+        if user_id is not None:
+            user = db.scalar(select(User).where(User.id == user_id, User.company_id == branch.company_id))
+            if user is None or not user.is_active:
+                raise HTTPException(status_code=422, detail="El usuario elegido no existe o esta inactivo.")
+            setattr(branch, name_attr, user.full_name.strip())
+        else:
+            setattr(branch, name_attr, getattr(payload, name_attr).strip())
+        setattr(branch, user_id_attr, user_id)
+        sync_branch_staff(db, branch.company_id, branch.id, kind, user_id, actor_id)
 
 
 @router.get("", response_model=list[BranchRead])
@@ -31,16 +51,17 @@ def create_branch(
     payload: BranchCreate,
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
-    _=Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> Branch:
     existing = db.scalar(select(Branch).where(Branch.name == payload.name.strip(), Branch.company_id == company_id))
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe una sucursal con ese nombre.")
 
     branch = Branch(company_id=company_id, name=payload.name.strip(), address=payload.address.strip(),
-                    manager_name=payload.manager_name.strip(), notary_name=payload.notary_name.strip(),
                     phone=payload.phone.strip())
     db.add(branch)
+    db.flush()
+    _apply_staff(db, branch, payload, current_user.id)
     db.commit()
     db.refresh(branch)
     return branch
@@ -52,7 +73,7 @@ def update_branch(
     payload: BranchUpdate,
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
-    _=Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> Branch:
     branch = db.scalar(select(Branch).where(Branch.id == branch_id, Branch.company_id == company_id))
     if branch is None:
@@ -69,8 +90,7 @@ def update_branch(
             raise HTTPException(409, 'Cierra la jornada y resuelve entregas pendientes antes de desactivar la sucursal.')
     branch.name = payload.name.strip()
     branch.address = payload.address.strip()
-    branch.manager_name = payload.manager_name.strip()
-    branch.notary_name = payload.notary_name.strip()
+    _apply_staff(db, branch, payload, current_user.id)
     branch.phone = payload.phone.strip()
     branch.is_active = payload.is_active
     db.commit()

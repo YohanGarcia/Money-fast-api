@@ -29,6 +29,10 @@ class Branch(Base):
     address: Mapped[str] = mapped_column(String(255), default="")
     manager_name: Mapped[str] = mapped_column(String(140), default="")
     notary_name: Mapped[str] = mapped_column(String(140), default="")
+    # Real users holding the "Gerente de sucursal" / "Notario" role on this branch. The *_name columns above are kept
+    # in sync with the user's full name (and stay as the free text of branches created before the roles existed).
+    manager_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    notary_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     phone: Mapped[str] = mapped_column(String(30), default="")
     status: Mapped[str] = mapped_column(String(20), default="active")
     # IANA zone overriding the tenant default; NULL = inherit (ADR-006)

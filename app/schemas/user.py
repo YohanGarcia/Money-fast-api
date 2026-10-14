@@ -33,4 +33,6 @@ class UserRead(BaseModel):
     company_id: int | None = None
     branch_id: int | None = None
     branch_name: str | None = None
+    # Branch-scoped staff roles held now ("Gerente de sucursal", "Notario"); display only.
+    branch_roles: list[str] = Field(default_factory=list)
     created_at: datetime

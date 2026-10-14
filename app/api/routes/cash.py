@@ -61,7 +61,7 @@ def config(db:Session=Depends(get_db),user:User=Depends(get_current_user)):
         users=db.scalars(select(User).where(User.company_id==user.company_id,User.is_active==True,User.role.in_(['collector','cashier'])).order_by(User.full_name)).all()
         pending_users=[dict(id=u.id,name=u.full_name,email=u.email,role=u.role,
             reason='Sin sucursal asignada' if not u.branch_id else 'Su sucursal está inactiva o no tiene caja configurada')
-            for u in users if u.branch_id not in ready]
+            for u in users if u.branch_id not in ready and 'Notario' not in u.branch_roles]
     return dict(enabled=svc.enabled(db,user.company_id),pending_users=pending_users,branches=[dict(id=b.id,name=b.name,active=b.is_active,configured=any(x.branch_id==b.id for x in boxes)) for b in bs],role=user.role,branch_id=user.branch_id)
 
 @router.post('/setup')

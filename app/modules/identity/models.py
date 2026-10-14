@@ -179,6 +179,29 @@ class UserAccount(Base):
     def branch_name(self) -> str | None:
         return self.branch.name if self.branch is not None else None
 
+    @property
+    def branch_roles(self) -> list[str]:
+        """Names of the branch-scoped staff roles ("Gerente de sucursal", "Notario") this user holds NOW.
+        The web reads it to label the user and trim its menu; authorization never relies on it."""
+        from sqlalchemy import select
+        from sqlalchemy.orm import object_session
+
+        session = object_session(self)
+        if session is None or self.id is None:
+            return []
+        rows = session.scalars(
+            select(Role.name)
+            .join(UserRoleAssignment, UserRoleAssignment.role_id == Role.id)
+            .where(
+                UserRoleAssignment.user_id == self.id,
+                UserRoleAssignment.scope_kind == "branch",
+                UserRoleAssignment.revoked_at.is_(None),
+                Role.system_defined.is_(True),
+                Role.name.in_(("Gerente de sucursal", "Notario")),
+            )
+        ).all()
+        return sorted(set(rows))
+
     @hybrid_property
     def is_active(self) -> bool:
         return self.status == "active"

@@ -281,3 +281,101 @@ def sync_cashier_assignment(db: Session, user: UserAccount, actor_id: int | None
             )
         )
     db.flush()
+
+
+BRANCH_MANAGER_ROLE = "Gerente de sucursal"
+BRANCH_NOTARY_ROLE = "Notario"
+# Supervision WITHOUT money: reviews and decides credit, follows collections and sees cash, but never disburses,
+# records/reverses payments nor resolves cash differences. Always assigned at branch scope.
+BRANCH_MANAGER_PERMISSIONS = (
+    "organization.branches.read",
+    "customers.read",
+    "customers.read_sensitive",
+    "customers.update",
+    "credit.products.read",
+    "credit.applications.read",
+    "credit.applications.evaluate",
+    "credit.applications.approve",
+    "credit.applications.reject",
+    "loans.read",
+    "loans.delinquency.assess",
+    "payments.read",
+    "collections.read",
+    "collections.assign",
+    "collections.actions.create",
+    "collections.promises.create",
+    "cash.points.read",
+    "cash.sessions.read",
+    "cash.differences.read",
+    "cash.field_custody.read",
+)
+# Read-only: sees the customer's identity and the credit/loan documents to attest them. Nothing that moves money.
+BRANCH_NOTARY_PERMISSIONS = (
+    "customers.read",
+    "customers.read_sensitive",
+    "credit.products.read",
+    "credit.applications.read",
+    "loans.read",
+)
+BRANCH_STAFF_ROLES = {
+    "manager": (
+        BRANCH_MANAGER_ROLE,
+        "Rol de gerente de sucursal (supervision sin manejo de dinero)",
+        BRANCH_MANAGER_PERMISSIONS,
+    ),
+    "notary": (BRANCH_NOTARY_ROLE, "Rol de notario de sucursal (consulta)", BRANCH_NOTARY_PERMISSIONS),
+}
+
+
+def ensure_branch_staff_role(db: Session, tenant_id: int, kind: str) -> Role:
+    """The tenant's system role for ``kind`` ("manager" | "notary"), created once and topped up (never reduced)."""
+    name, description, codes = BRANCH_STAFF_ROLES[kind]
+    perms = sync_permission_catalog(db)
+    role = db.scalar(select(Role).where(Role.tenant_id == tenant_id, Role.name == name))
+    if role is None:
+        role = Role(tenant_id=tenant_id, name=name, description=description, system_defined=True)
+        db.add(role)
+        db.flush()
+    have = {rp.permission_id for rp in db.scalars(select(RolePermission).where(RolePermission.role_id == role.id))}
+    for code in codes:
+        if perms[code].id not in have:
+            db.add(RolePermission(role_id=role.id, permission_id=perms[code].id))
+    db.flush()
+    return role
+
+
+def sync_branch_staff(
+    db: Session, tenant_id: int, branch_id: int, kind: str, user_id: int | None, actor_id: int | None = None
+) -> None:
+    """Make ``user_id`` the only active holder of the ``kind`` role on ``branch_id`` (None clears it).
+    Revocations keep their row (history is never deleted)."""
+    from datetime import UTC, datetime
+
+    role = ensure_branch_staff_role(db, tenant_id, kind)
+    active = db.scalars(
+        select(UserRoleAssignment).where(
+            UserRoleAssignment.role_id == role.id,
+            UserRoleAssignment.scope_kind == "branch",
+            UserRoleAssignment.branch_id == branch_id,
+            UserRoleAssignment.revoked_at.is_(None),
+        )
+    ).all()
+    kept = False
+    for a in active:
+        if user_id is not None and a.user_id == user_id and not kept:
+            kept = True
+        else:
+            a.revoked_at = datetime.now(UTC)
+            a.revoked_by = actor_id
+    if user_id is not None and not kept:
+        db.add(
+            UserRoleAssignment(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role_id=role.id,
+                scope_kind="branch",
+                branch_id=branch_id,
+                assigned_by=actor_id,
+            )
+        )
+    db.flush()
