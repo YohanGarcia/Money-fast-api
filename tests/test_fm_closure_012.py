@@ -42,6 +42,12 @@ class ClosureTests(_cash.CashTests):
         self.assertEqual(r.status_code, code, r.text)
         return r.json()
 
+    def execute(self, payment_id, headers=None, code=200):
+        """FM-FUNCTIONAL-018-R1: the cashier executes an AUTHORIZED cash payment out of its own open session."""
+        r = self.client.post(f'/api/v1/payroll/payments/{payment_id}/execute', headers=headers or self.roles['cashier'])
+        self.assertEqual(r.status_code, code, r.text)
+        return r.json()
+
     def capital_count(self):
         with SessionLocal() as db:
             return db.scalar(select(func.count()).select_from(CapitalMovement))
@@ -66,7 +72,12 @@ class ClosureTests(_cash.CashTests):
         sid = self.simple_open('1000')['session_id']
         cap = self.capital_count()
         out = self.payroll(amount='300')
-        self.assertEqual(out['source'], 'cash')
+        self.assertEqual((out['source'], out['status']), ('cash', 'authorized'))
+        self.assertEqual(Decimal(self.workspace()['session']['balance']), 1000)  # authorizing moves nothing
+        self.assertEqual(len(self.movements(sid)), 1)
+        done = self.execute(out['id'])
+        self.assertEqual((done['status'], done['session_id']), ('paid', sid))
+        out = dict(out, movement_id=done['movement_id'])
         self.assertEqual(Decimal(self.workspace()['session']['balance']), 700)
         moves = self.movements(sid)
         self.assertEqual(len(moves), 2)
@@ -76,7 +87,9 @@ class ClosureTests(_cash.CashTests):
         with SessionLocal() as db:
             row = db.get(PayrollPayment, out['id'])
             self.assertEqual((row.source, row.cash_movement_id, row.capital_movement_id), ('cash', out['movement_id'], None))
+            self.assertEqual((row.status, row.executed_by is not None, row.actor_id == self.admin_id), ('paid', True, True))
             self.assertEqual(db.scalar(select(func.count()).select_from(CashAudit).where(CashAudit.action == 'payroll_payment')), 1)
+            self.assertEqual(db.scalar(select(func.count()).select_from(CashAudit).where(CashAudit.action == 'payroll_payment_authorized')), 1)
 
     def test_payroll_retry_with_same_key_replays_and_other_content_conflicts(self):
         sid = self.simple_open('1000')['session_id']
@@ -85,6 +98,10 @@ class ClosureTests(_cash.CashTests):
         again = self.payroll(idempotency_key=key)
         self.assertEqual((again['id'], again['replayed']), (first['id'], True))
         self.payroll(idempotency_key=key, amount='301', code=409)
+        self.assertEqual(len(self.movements(sid)), 1)  # nothing moved yet
+        a = self.execute(first['id'])
+        b = self.execute(first['id'])  # the cashier retrying answers the same movement
+        self.assertEqual((a['movement_id'], b['movement_id'], b['replayed']), (a['movement_id'], a['movement_id'], True))
         self.assertEqual(len(self.movements(sid)), 2)
         self.assertEqual(Decimal(self.workspace()['session']['balance']), 700)
 
@@ -98,18 +115,26 @@ class ClosureTests(_cash.CashTests):
             codes = list(pool.map(go, range(4)))
         self.assertTrue(all(c in (200, 409) for c in codes), codes)
         self.assertGreaterEqual(codes.count(200), 1)
-        self.assertEqual(len([m for m in self.movements(sid) if m[0] == 'expense']), 1)
         with SessionLocal() as db:
+            pid = db.scalar(select(PayrollPayment.id).where(PayrollPayment.idempotency_key == key))
             self.assertEqual(db.scalar(select(func.count()).select_from(PayrollPayment).where(PayrollPayment.idempotency_key == key)), 1)
+        def run(_):
+            return self.client.post(f'/api/v1/payroll/payments/{pid}/execute', headers=self.roles['cashier']).status_code
+        with ThreadPoolExecutor(4) as pool:
+            codes = list(pool.map(run, range(4)))
+        self.assertTrue(all(c in (200, 409) for c in codes), codes)
+        self.assertEqual(len([m for m in self.movements(sid) if m[0] == 'expense']), 1)
 
     def test_payroll_needs_an_open_session_and_enough_cash(self):
-        out = self.payroll(code=409)  # nothing open
+        first = self.payroll()  # authorizing needs no open session
+        out = self.execute(first['id'], code=409)  # nothing open for the cashier
         self.assertIn('caja', str(out).lower())
         sid = self.simple_open('100')['session_id']
-        self.payroll(amount='101', code=409)
+        big = self.payroll(amount='101')
+        self.execute(big['id'], code=409)
         self.assertEqual(self.movements(sid), [('opening_initial_fund', Decimal('100'), f'APE-{sid}')])
         self.simple_close('100')
-        self.payroll(code=409)  # closed
+        self.execute(first['id'], code=409)  # closed
 
     def test_payroll_never_draws_from_capital_and_history_stays_readable(self):
         self.simple_open('500')
@@ -166,7 +191,8 @@ class ClosureTests(_cash.CashTests):
         self.payroll(headers=other_headers, source='bank', bank_account_id=self.bank_account['id'], reference='X', code=404)
         # cash of ANOTHER branch of the same company: needs its own open session, ours is not used
         self.simple_open('1000')
-        self.payroll(branch_id=self.other, code=409)
+        elsewhere = self.payroll(branch_id=self.other)
+        self.execute(elsewhere['id'], code=403)  # our cashier cannot execute a payment of another branch's cash
         self.assertEqual(Decimal(self.workspace()['session']['balance']), 1000)
 
     # -- Agregar dinero a caja -------------------------------------------------------------------------------------
@@ -218,7 +244,7 @@ class ClosureTests(_cash.CashTests):
     def test_closing_breakdown_counts_additions_inside_entries_and_expected(self):
         sid = self.simple_open('1000')['session_id']
         self.addition('500', 'REC-1')
-        self.payroll(amount='200')                       # leaves as an expense
+        self.execute(self.payroll(amount='200')['id'])   # leaves as an expense (authorized, then paid by the cashier)
         closed = self.simple_close('1300')
         self.assertEqual((closed['session']['closing_expected'], closed['session']['difference']), ('1300.00', '0.00'))
         with SessionLocal() as db:
@@ -234,8 +260,9 @@ class ClosureTests(_cash.CashTests):
         version = self.workspace()['session']['version']
         body = dict(action='reverse', branch_id=self.branch, idempotency_key=str(uuid.uuid4()), target_id=mid, session_id=sid, version=version, notes='Registrado por error')
         self.req('/cash/commands', body, self.roles['cashier'], 403)
-        self.req('/cash/commands', body, self.admin)
-        self.assertEqual(Decimal(self.workspace()['session']['balance']), 1000)
+        # FM-FUNCTIONAL-018-R1: neither does the administrator post into the cashier's session (decision pending)
+        self.req('/cash/commands', body, self.admin, 403)
+        self.assertEqual(Decimal(self.workspace()['session']['balance']), 1500)
 
     # -- differences -----------------------------------------------------------------------------------------------
     def v2(self, method, path, body=None, headers=None, code=200):

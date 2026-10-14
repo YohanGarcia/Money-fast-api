@@ -202,7 +202,12 @@ def test_refund_prerequisites_counter_pre_custody_permission_and_custodian(clien
     assert code(refund(client, x.rcol_h, 999999, expect=404)) == "reversal_not_found"  # F01
     _counter, crv = counter_reversal(client, x, tenant_a)
     withdrawals = count("cash_movements")
-    assert code(refund(client, x.adm, crv["id"], expect=409)) == "field_refund_not_applicable"  # S06
+    # FM-FUNCTIONAL-018: the company administrator no longer holds the operative refund permission, so a holder of it
+    # (a cashier-like custodian) makes the S06 request; the administrator is refused outright.
+    holder_h, _ = mkuser(client, sink, x.adm, tenant_a, "hold@x.com", ["payments.create", RENDER, REFUND],
+                         scope="branch", branch_id=x.b)
+    assert code(refund(client, x.adm, crv["id"], expect=403)) == "permission_denied"
+    assert code(refund(client, holder_h, crv["id"], expect=409)) == "field_refund_not_applicable"  # S06
     assert count("cash_movements") == withdrawals  # never a second withdrawal
     monkeypatch.setattr(pay_service, "create_receipt", lambda db, payment: None)
     old = fpay(client, x.rcol_h, x.w, "7.00")  # pre-T-019 shape: no receipt
@@ -441,7 +446,7 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0024" in _alembic(scratch_db, "heads").stdout
+    assert "0025" in _alembic(scratch_db, "heads").stdout
     assert _alembic(scratch_db, "downgrade", "0018").returncode == 0
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     eng = create_engine(scratch_db)
@@ -458,5 +463,5 @@ def test_migration_0019_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
     with eng.connect() as c:
         assert c.execute(text("SELECT count(*) FROM credit_field_refunds")).scalar() == 1
         assert c.execute(text("SELECT count(*) FROM permissions WHERE code = 'cash.field_custody.refund'")).scalar() == 1
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0024"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0025"
     eng.dispose()

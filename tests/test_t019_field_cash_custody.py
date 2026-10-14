@@ -148,7 +148,9 @@ def test_a_field_payment_creates_exactly_one_receipt_atomically_and_a_counter_pa
     before = count("credit_payments")
     assert code(fpay(client, only_pay, x.w, "1.00", expect=403)) == "permission_denied"
     assert count("credit_payments") == before
-    assert pay(client, only_pay, x.w, "1.00", session=x.w.cash.session_id)["origin"] == "counter"
+    # FM-FUNCTIONAL-018-R1: a counter payment needs payments.create (not render) AND the session must be the operator's
+    r = client.post(f"{LOANS}/{x.w.loan['id']}/payments", headers=only_pay, json=pbody(x.w, "1.00", session=x.w.cash.session_id))
+    assert r.status_code == 403 and r.json()["error"]["code"] == "cash_session_not_owned", r.text
     # the receipt insert failing rolls the whole payment back (debt, applications, number)
     def boom(db, payment):
         raise RuntimeError("receipt failure")
@@ -557,7 +559,7 @@ def test_no_legacy_dual_write_no_direct_session_write_no_new_sort_or_side_effect
 def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scratch_db):
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0024" in _alembic(scratch_db, "heads").stdout  # T-020 / T-021 / T-022A / T-023A added 0019 / 0020 / 0021 / 0022 on top of 0018
+    assert "0025" in _alembic(scratch_db, "heads").stdout  # T-020 / T-021 / T-022A / T-023A added 0019 / 0020 / 0021 / 0022 on top of 0018
     assert _alembic(scratch_db, "downgrade", "0017").returncode == 0  # empty: clean
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     from sqlalchemy import create_engine
@@ -577,7 +579,7 @@ def test_migration_0018_upgrade_downgrade_reupgrade_and_refusal_with_history(scr
                               "'cash.field_custody.render', 'cash.field_custody.accept')")).scalar() == 3
         assert c.execute(text("SELECT count(*) FROM credit_field_renditions")).scalar() == 1
         assert c.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_credit_field%' AND tgname NOT LIKE 'trg_credit_field_refunds%'")).scalar() == 8
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0024"  # the refused chain rolls back (head)
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0025"  # the refused chain rolls back (head)
     eng.dispose()
 
 

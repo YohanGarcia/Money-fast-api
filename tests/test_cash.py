@@ -153,10 +153,10 @@ class CashTests(unittest.TestCase):
     def test_reversal_restores_custody_not_loan(self):
         self.open();self.payment();self.receive(self.delivery())
         w=self.workspace();m=w['movements'][0]
-        self.cmd('reverse',target_id=m['id'],version=w['session']['version'],notes='Corrección recepción')
-        w=self.workspace();self.assertEqual(Decimal(w['pending']),1000);self.assertEqual(Decimal(w['session']['balance']),1000)
+        # FM-FUNCTIONAL-018-R1: the administrator can no longer post a reversal into a cashier's session; nothing moves
+        self.cmd('reverse',target_id=m['id'],version=w['session']['version'],notes='Corrección recepción',code=403)
+        after=self.workspace();self.assertEqual(Decimal(after['pending']),Decimal(w['pending']));self.assertEqual(Decimal(after['session']['balance']),Decimal(w['session']['balance']))
         self.assertEqual(len(self.req('/payments')),1)
-        self.cmd('reverse',target_id=m['id'],version=w['session']['version'],notes='Repetido',code=409)
 
     def test_permissions_branches_and_company_isolation(self):
         self.req(f'/cash/workspace?branch_id={self.other}',headers=self.roles['cashier'],code=403)
@@ -291,9 +291,11 @@ class CashTests(unittest.TestCase):
         self.cmd('close',version=w['session']['version'],denominations={'1000':1,'500':1,'100':1})
         snapshot=self.workspace()['sessions'][0]['snapshot']
         self.open('1600')
-        self.cmd('reverse',target_id=m['id'],version=self.workspace()['session']['version'],notes='Reverso de jornada anterior')
+        before=self.workspace()
+        # FM-FUNCTIONAL-018-R1: the administrator can no longer post a reversal into a cashier's session
+        self.cmd('reverse',target_id=m['id'],version=before['session']['version'],notes='Reverso de jornada anterior',code=403)
         w=self.workspace();self.assertEqual(w['sessions'][1]['snapshot'],snapshot)
-        self.assertEqual(Decimal(w['pending']),1000);self.assertEqual(Decimal(w['session']['balance']),1000)
+        self.assertEqual(Decimal(w['pending']),Decimal(before['pending']));self.assertEqual(Decimal(w['session']['balance']),Decimal(before['session']['balance']))
 
     def test_websocket_payment_after_commit(self):
         from unittest.mock import patch

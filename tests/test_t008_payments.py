@@ -584,7 +584,6 @@ def test_payment_permissions_branch_scope_and_visibility(client, sink, tenant_a,
     adm = admin_headers(client, tenant_a)
     w = loan_world(client, adm, tenant_a)
     b2 = mk_branch(client, adm, "B2")
-    cash_b2 = cash_for(tenant_a, b2["id"])
     clock(monkeypatch, days=35)
     first = schedule(client, adm, w.loan["id"])[0]
     # approve / formalize / disburse / read do NOT allow collecting
@@ -613,6 +612,10 @@ def test_payment_permissions_branch_scope_and_visibility(client, sink, tenant_a,
         scope="branch",
         branch_id=b2["id"],
     )
+    # FM-FUNCTIONAL-018: the collector at the counter must OWN the session the cash goes into
+    with SessionLocal() as _db:
+        _c2_id = _db.scalar(text("SELECT id FROM users WHERE email = 'c2@x.com'"))
+    cash_b2 = cash_for(tenant_a, b2["id"], cashier_id=_c2_id)
     # scoped to B2: may collect at B2 (a B1 loan), may not collect at B1
     assert (
         client.post(f"{LOANS}/{w.loan['id']}/payments", headers=collector_b2, json=pbody(w, "5.00")).status_code == 403

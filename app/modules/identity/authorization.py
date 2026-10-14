@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.identity.catalog import CATALOG_CODES
+from app.modules.identity.catalog import (
+    ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS,
+    CASHIER_ONLY_PERMISSIONS,
+    CATALOG_CODES,
+)
 from app.modules.identity.errors import DelegationCeilingViolation, PermissionDenied
 from app.modules.identity.models import Permission, Role, RolePermission, UserAccount, UserRoleAssignment
 
@@ -108,9 +112,18 @@ def effective_grants(db: Session, user: UserAccount) -> tuple[Grant, ...]:
             Permission.scope_kind == kind,
         )
     ).all()
+    # FM-FUNCTIONAL-018-R2: only a CASHIER operates Caja. Whatever grants a user holds (legacy or explicit), the
+    # cashier-only permissions are not effective unless its operating role is ``cashier``; a company administrator also
+    # loses the operative refund. Platform users have no operating role and no tenant cash grants anyway.
+    role = getattr(getattr(user, "role", None), "value", getattr(user, "role", None))
+    denied: frozenset[str] = frozenset()
+    if user.company_id is not None and role != "cashier":
+        denied = CASHIER_ONLY_PERMISSIONS
+    if role == "admin":
+        denied = denied | ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS
     return tuple(
         sorted(
-            {Grant(code, scope, branch, cp) for code, scope, branch, cp in rows},
+            {Grant(code, scope, branch, cp) for code, scope, branch, cp in rows if code not in denied},
             key=lambda g: (g.permission, g.scope_kind, g.branch_id or 0, g.cash_point_id or 0),
         )
     )
@@ -139,6 +152,7 @@ def assert_within_ceiling(
     branch_id: int | None = None,
     cash_point_id: int | None = None,
     cash_point_branch_id: int | None = None,
+    delegable_operative: bool = False,
 ) -> None:
     """Delegation ceiling: the actor may only hand out permissions they hold themselves, at least as widely.
 
@@ -146,7 +160,11 @@ def assert_within_ceiling(
     branch grants require tenant-wide or the same branch; cash-point grants require tenant-wide, the cash
     point's branch, or that cash point.
     """
-    for code in permission_codes:
+    # FM-FUNCTIONAL-018-R1: the operative cash permissions are exempt from the "hold it yourself" ceiling ONLY when the
+    # caller proved (``may_delegate_operative``) that a company administrator is handing them to a cashier of its own
+    # company; every other actor stays bound by the plain ceiling and can never delegate them.
+    exempt = ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS if delegable_operative else frozenset()
+    for code in permission_codes - exempt:
         if scope_kind == "branch" and branch_id is not None:
             ok = actor.holds_for_branch(code, branch_id)
         elif scope_kind == "cash_point" and cash_point_id is not None:
@@ -155,3 +173,44 @@ def assert_within_ceiling(
             ok = actor.holds_at_tenant_scope(code)
         if not ok:
             raise DelegationCeilingViolation()
+
+
+def is_company_administrator(db: Session, actor: Principal) -> bool:
+    """The caller is an ACTIVE administrator of the tenant it acts in: it holds the tenant-wide system administrator
+    role of THAT tenant (the role registration / bootstrap gives the owner). Platform principals never qualify."""
+    if actor.is_platform:
+        return False
+    from app.modules.identity.catalog import TENANT_ADMIN_ROLE
+
+    user = db.get(UserAccount, actor.user_id)
+    if user is None or user.company_id != actor.tenant_id or not user.is_active:
+        return False
+    return (
+        db.scalar(
+            select(UserRoleAssignment.id)
+            .join(Role, Role.id == UserRoleAssignment.role_id)
+            .where(
+                UserRoleAssignment.user_id == user.id,
+                UserRoleAssignment.scope_kind == "tenant",
+                UserRoleAssignment.revoked_at.is_(None),
+                Role.tenant_id == actor.tenant_id,
+                Role.name == TENANT_ADMIN_ROLE,
+                Role.status == "active",
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def may_delegate_operative(db: Session, actor: Principal, target: UserAccount | None, scope_kind: str = "branch") -> bool:
+    """FM-FUNCTIONAL-018-R1: operative cash permissions are handed out only by a company administrator, only to an
+    active CASHIER of the same company and only scoped to a branch or a cash point (never tenant-wide)."""
+    if scope_kind not in ("branch", "cash_point") or target is None:
+        return False
+    return (
+        is_company_administrator(db, actor)
+        and target.company_id == actor.tenant_id
+        and target.is_active
+        and getattr(target.role, "value", target.role) == "cashier"
+    )

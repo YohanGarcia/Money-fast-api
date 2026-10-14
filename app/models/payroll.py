@@ -27,6 +27,12 @@ class PayrollPayment(Base):
     __table_args__ = (
         CheckConstraint("source IN ('cash', 'capital', 'bank')", name="source_valid"),
         CheckConstraint("(source = 'bank') = (bank_account_id IS NOT NULL)", name="bank_source_has_account"),
+        CheckConstraint("status IN ('authorized', 'paid', 'cancelled')", name="status_valid"),
+        CheckConstraint("status <> 'authorized' OR (source = 'cash' AND cash_movement_id IS NULL)",
+                        name="authorized_is_cash_without_movement"),
+        CheckConstraint("executed_by IS NULL OR status = 'paid'", name="executed_only_when_paid"),
+        CheckConstraint("(status = 'cancelled') = (cancelled_by IS NOT NULL)", name="cancelled_has_canceller"),
+        Index("ix_payroll_payments_authorized", "company_id", "branch_id", postgresql_where=text("status = 'authorized'")),
         Index("uq_payroll_payments_idempotency", "company_id", "idempotency_key", unique=True,
               postgresql_where=text("idempotency_key IS NOT NULL")),
     )
@@ -53,3 +59,10 @@ class PayrollPayment(Base):
     proof: Mapped[dict | None] = mapped_column(JSON)
     idempotency_key: Mapped[str | None] = mapped_column(String(80))
     request_digest: Mapped[str | None] = mapped_column(String(80))
+    # FM-FUNCTIONAL-018-R1: a CASH payment is authorized by the administrator (``actor_id``) and executed by the
+    # cashier out of ITS OWN open session (``executed_by``); nobody debits another user's session directly.
+    status: Mapped[str] = mapped_column(String(20), default="paid", server_default="paid")
+    executed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.models.cash import CashAudit, CashBox, CashConfig, CashMovement, CashSession
+from app.modules.identity.errors import PermissionDenied
+from app.modules.identity.models import UserAccount
 
 CASH_CURRENCY = "DOP"  # the legacy cash ledger has no currency column: every amount is RD$ (T-008 will change this)
 CENT = Decimal("0.01")
@@ -93,6 +95,15 @@ def _record(
     notes: str,
     reverses_id: int | None = None,
 ) -> CashWithdrawal:
+    # FM-FUNCTIONAL-018-R1: the single choke point of every v2 balance change. Nobody but the session's own cashier
+    # moves its money (a company administrator never owns a session it could operate), whatever route got here.
+    if session.cashier_id != actor_user_id:
+        raise CashSessionNotOwned()
+    # FM-FUNCTIONAL-018-R2: only a CASHIER moves a session's money (a session owned by an administrator, a manager or
+    # anyone else whose operating role is not cashier is not operable, whatever its grants say).
+    operator = db.get(UserAccount, actor_user_id)
+    if operator is None or getattr(operator.role, "value", operator.role) != "cashier":
+        raise PermissionDenied()
     session.balance += signed
     session.version += 1
     movement = CashMovement(
@@ -258,7 +269,13 @@ def deposit(
     ``kind`` must be a kind the legacy cash reversal does not accept (``credit_payment_receipt``): reversing only the cash
     would leave the debt applied. Never commits."""
     box, session = _open_custody(
-        db, tenant_id=tenant_id, branch_id=branch_id, session_id=session_id, amount=amount, currency=currency
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        session_id=session_id,
+        amount=amount,
+        currency=currency,
+        cashier_id=actor_user_id,  # FM-FUNCTIONAL-018: only the session's own cashier takes money into it
     )
     return _record(
         db, box, session, signed=amount, actor_user_id=actor_user_id, kind=kind, reference=reference, notes=notes

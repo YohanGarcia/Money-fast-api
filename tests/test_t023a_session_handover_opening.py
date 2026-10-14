@@ -1835,7 +1835,7 @@ def test_migration_0022_upgrade_check_clean_downgrade_restores_0021_exactly_and_
     assert at_0021["version"] == "0021" and "cash_session_handovers" not in {r[0] for r in at_0021["columns"]}
     up = _alembic(scratch_db, "upgrade", "0022")
     assert up.returncode == 0, up.stderr[-800:]
-    # `alembic check` compares the models with HEAD (0024): it runs after the final upgrade below
+    # `alembic check` compares the models with HEAD (0025): it runs after the final upgrade below
     at_0022 = _schema(eng)
     assert at_0022["version"] == "0022" and at_0022["permissions"] == [
         "cash.handovers.accept",
@@ -1860,7 +1860,7 @@ def test_migration_0022_upgrade_check_clean_downgrade_restores_0021_exactly_and_
     assert _alembic(scratch_db, "upgrade", "0022").returncode == 0
     assert _schema(eng) == at_0022  # the same 0022 schema, byte for byte
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
-    assert _alembic(scratch_db, "check").returncode == 0  # `alembic check` compares against head (0024)
+    assert _alembic(scratch_db, "check").returncode == 0  # `alembic check` compares against head (0025)
     eng.dispose()
 
 
@@ -1969,7 +1969,7 @@ def test_migration_0022_downgrade_refuses_every_class_of_handover_history(scratc
         -600:
     ]
     assert _schema(eng) == before and before["version"] == "0022"  # nothing changed: no deletion, rewrite or repair
-    assert _alembic(scratch_db, "upgrade", "head").returncode == 0  # `alembic check` compares against head (0024)
+    assert _alembic(scratch_db, "upgrade", "head").returncode == 0  # `alembic check` compares against head (0025)
     assert _alembic(scratch_db, "check").returncode == 0
     eng.dispose()
 
