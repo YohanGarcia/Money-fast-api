@@ -220,8 +220,15 @@ class SimpleCashTests(_cash.CashTests):
         grant_cash_permissions(far['company_id'],far['id'],CASHIER_PERMS,self.other)
         hf=self.auth_headers(self.login('norte@example.com','workerpass123')['access_token'])
         self.ticket(sid,'opening',headers=hf,code=404,branch=self.other)
-        # the cashier without the explicit permission cannot open
+        # FM-PRODUCTION-PREPARATION-013: a new cashier now receives the operative "Cajero" role on its branch; the
+        # cashier whose grant was REVOKED (no active assignment) still cannot open
         nop=self.req('/users',dict(full_name='sin permiso',email='sinperm@example.com',password='workerpass123',role='cashier',branch_id=self.other),code=201)
+        from datetime import UTC, datetime
+        from app.modules.identity.models import UserRoleAssignment
+        with SessionLocal() as db:
+            for a in db.scalars(select(UserRoleAssignment).where(UserRoleAssignment.user_id==nop['id'],UserRoleAssignment.revoked_at.is_(None))).all():
+                a.revoked_at=datetime.now(UTC)
+            db.commit()
         hn=self.auth_headers(self.login('sinperm@example.com','workerpass123')['access_token'])
         self.req('/cash/commands',dict(action='open',branch_id=self.other,idempotency_key=str(uuid.uuid4()),opening_mode='initial',amount='5'),hn,403)
         self.assertEqual(nop['role'],'cashier')

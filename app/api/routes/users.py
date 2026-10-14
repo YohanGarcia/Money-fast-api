@@ -19,7 +19,7 @@ from app.models.location_ping import LocationPing
 from app.models.user import User, UserRole
 from app.modules.identity.audit import record_event
 from app.modules.identity.auth import revoke_user_sessions
-from app.modules.identity.catalog import ensure_person
+from app.modules.identity.catalog import ensure_person, sync_cashier_assignment
 from app.schemas.user import UserCreate, UserRead, UserUpdate
 from app.services.plan_limits import enforce_can_create
 from app.services.route_service import haversine_km
@@ -239,6 +239,7 @@ def create_user(
     db.add(user)
     db.flush()
     ensure_person(db, user)
+    sync_cashier_assignment(db, user, current_user.id)
     record_event(db, "user.created", tenant_id=company_id, actor_id=current_user.id, subject_id=user.id,
                  details={"via": "legacy_api_v1"})
     db.commit()
@@ -290,6 +291,8 @@ def update_user(
     user.role = payload.role
     user.is_active = payload.is_active
     user.branch_id = _validate_branch(db, payload.branch_id, company_id)
+    db.flush()
+    sync_cashier_assignment(db, user, current_user.id)
     if previous_status != user.status:
         revoked = revoke_user_sessions(db, user.id, "user_disabled" if user.status == "disabled" else "status_changed")
         record_event(db, "user.disabled" if user.status == "disabled" else "user.enabled", tenant_id=company_id,

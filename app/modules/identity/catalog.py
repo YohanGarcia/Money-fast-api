@@ -222,3 +222,62 @@ def ensure_person(db: Session, user: UserAccount) -> None:
         db.add(person)
         db.flush()
         user.person_id = person.id
+
+
+CASHIER_ROLE = "Cajero"
+# The operative cashier: open/close ITS OWN session and see ITS OWN cash points. Nothing else, nothing tenant-wide:
+# the assignment is always branch-scoped (see ``sync_cashier_assignment``).
+CASHIER_PERMISSIONS = ("cash.sessions.open", "cash.sessions.close", "cash.sessions.read", "cash.points.read")
+
+
+def ensure_cashier_role(db: Session, tenant_id: int) -> Role:
+    """The tenant's system "Cajero" role, created once and topped up with any missing permission (never reduced)."""
+    perms = sync_permission_catalog(db)
+    role = db.scalar(select(Role).where(Role.tenant_id == tenant_id, Role.name == CASHIER_ROLE))
+    if role is None:
+        role = Role(tenant_id=tenant_id, name=CASHIER_ROLE, description="Rol operativo de cajero", system_defined=True)
+        db.add(role)
+        db.flush()
+    have = {rp.permission_id for rp in db.scalars(select(RolePermission).where(RolePermission.role_id == role.id))}
+    for code in CASHIER_PERMISSIONS:
+        if perms[code].id not in have:
+            db.add(RolePermission(role_id=role.id, permission_id=perms[code].id))
+    db.flush()
+    return role
+
+
+def sync_cashier_assignment(db: Session, user: UserAccount, actor_id: int | None = None) -> None:
+    """Keep the "Cajero" role aligned with the legacy cashier role: an ACTIVE cashier holds it on its branch only;
+    anyone else (other role, disabled, no branch, other branch) has no active "Cajero" assignment for that branch."""
+    from datetime import UTC, datetime
+
+    if user.company_id is None:
+        return
+    role = ensure_cashier_role(db, user.company_id)
+    active = db.scalars(
+        select(UserRoleAssignment).where(
+            UserRoleAssignment.user_id == user.id,
+            UserRoleAssignment.role_id == role.id,
+            UserRoleAssignment.revoked_at.is_(None),
+        )
+    ).all()
+    wanted = user.branch_id if (user.role is not None and user.role.value == "cashier" and user.is_active) else None
+    kept = False
+    for a in active:
+        if wanted is not None and a.scope_kind == "branch" and a.branch_id == wanted and not kept:
+            kept = True
+        else:
+            a.revoked_at = datetime.now(UTC)
+            a.revoked_by = actor_id
+    if wanted is not None and not kept:
+        db.add(
+            UserRoleAssignment(
+                tenant_id=user.company_id,
+                user_id=user.id,
+                role_id=role.id,
+                scope_kind="branch",
+                branch_id=wanted,
+                assigned_by=actor_id,
+            )
+        )
+    db.flush()
