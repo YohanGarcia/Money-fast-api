@@ -160,9 +160,9 @@ class RecoveryAndRegistrationTests(legacy.MoneyFastApiTests):
         with patch.object(settings, 'public_registration', True):
             self.assertEqual(self.client.post('/api/v1/auth/register', json=body).status_code, 201)
 
-    def test_registration_default_follows_the_environment(self):
+    def test_registration_is_open_by_default_in_every_environment(self):
         with patch.object(settings, 'public_registration', None):
-            for env, expected in (('development', True), ('test', True), ('staging', False), ('production', False)):
+            for env, expected in (('development', True), ('test', True), ('staging', True), ('production', True)):
                 with patch.object(settings, 'environment', env):
                     self.assertEqual(settings.registration_open, expected, env)
 

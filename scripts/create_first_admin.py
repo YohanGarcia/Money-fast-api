@@ -1,6 +1,6 @@
 """Create the FIRST administrator (and its company) of a fresh installation.
 
-Public registration is closed in staging/production, so this is the supported way to bootstrap an install:
+Self-service registration of new companies is also available (/auth/register); this CLI is the way to bootstrap an\ninstallation without exposing a form (e.g. when PUBLIC_REGISTRATION=false):
 
     FM_ADMIN_PASSWORD='...' python scripts/create_first_admin.py --email admin@empresa.com \
         --name "Nombre Apellido" --company "Mi Empresa"

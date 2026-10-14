@@ -60,8 +60,11 @@ class Settings(BaseSettings):
     recovery_max_failures_ip: int = Field(default=10, ge=1)
     # Legacy clients (Web/mobile) use a 6-digit code: after this many wrong codes the live code is revoked.
     recovery_code_max_attempts: int = Field(default=5, ge=1)
-    # None = decided by the environment: open in development/test, CLOSED in staging/production.
+    # Self-service registration of NEW companies (/auth/register) is part of the product: OPEN everywhere unless
+    # PUBLIC_REGISTRATION=false is set (kill-switch). Employees are never created here: only by an administrator.
     public_registration: bool | None = None
+    # Anti-abuse: registrations accepted per client IP within auth_throttle_window_seconds before answering 429.
+    register_max_per_ip: int = Field(default=10, ge=1)
 
     # IANA identifier of the platform default business timezone (ADR-006).
     default_timezone: str = "America/Santo_Domingo"
@@ -104,10 +107,8 @@ class Settings(BaseSettings):
 
     @property
     def registration_open(self) -> bool:
-        """Self-service ``/auth/register``. Staging/production default to CLOSED; set PUBLIC_REGISTRATION=true to open."""
-        if self.public_registration is not None:
-            return self.public_registration
-        return self.environment not in STRICT_ENVIRONMENTS
+        """Self-service ``/auth/register`` (new companies). Open by default in every environment."""
+        return True if self.public_registration is None else self.public_registration
 
     @property
     def is_strict(self) -> bool:

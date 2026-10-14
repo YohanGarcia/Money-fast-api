@@ -8,26 +8,35 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
+from app.core.time import now_utc
 from app.models.user import User
 from app.modules.identity import auth as auth_service
-from app.modules.identity import recovery
+from app.modules.identity import recovery, throttle
 from app.modules.identity.deps import client_ip
+from app.modules.identity.errors import RateLimited
 from app.modules.identity.notifications import SecretNotifier, get_notifier
 from app.modules.identity.onboarding import create_tenant_owner
 from app.schemas.auth import LoginInput, RefreshInput, RegisterInput, TokenPair
 from app.schemas.user import UserRead
 
 router = APIRouter()
+S_REGISTER_IP = "register_ip"
+
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterInput, request: Request, db: Session = Depends(get_db)) -> User:
-    """Self-service onboarding. CLOSED by default in staging/production (PUBLIC_REGISTRATION): there, users are created
-    by authorised administrators and the first administrator comes from ``scripts/create_first_admin.py``."""
+    """Self-service registration of a NEW company: the caller becomes the administrator of that company. It never
+    joins an existing company and never creates employees (those are created by an administrator in /users).
+    PUBLIC_REGISTRATION=false is a kill-switch; per-IP throttling limits abuse."""
     if not settings.registration_open:
-        raise HTTPException(
-            status_code=403,
-            detail="El registro publico esta deshabilitado. Solicita tu acceso a un administrador.",
-        )
+        raise HTTPException(status_code=403, detail="El registro de nuevas empresas esta temporalmente deshabilitado.")
+    ip = client_ip(request) or "unknown"
+    now = now_utc()
+    wait = throttle.retry_after(db, S_REGISTER_IP, ip, now)
+    if wait:
+        raise RateLimited(wait)
+    throttle.register_failure(db, S_REGISTER_IP, ip, settings.register_max_per_ip, now)
+    db.commit()
     return create_tenant_owner(
         db,
         full_name=payload.full_name,
@@ -35,7 +44,7 @@ def register(payload: RegisterInput, request: Request, db: Session = Depends(get
         password=payload.password,
         company_name=payload.company_name,
         tenant_slug=payload.tenant_slug,
-        client_ip=client_ip(request),
+        client_ip=ip,
     )
 
 

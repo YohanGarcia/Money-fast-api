@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import get_password_hash
+from app.core.security import get_password_hash, password_policy_violation
 from app.models.company import Company
 from app.models.user import User, UserRole
 from app.modules.identity.audit import record_event
@@ -28,6 +29,9 @@ def create_tenant_owner(
 ) -> User:
     """A new company (tenant) and its owner, who receives the tenant admin role. Commits."""
     email = email.lower().strip()
+    violation = password_policy_violation(password)
+    if violation:
+        raise HTTPException(status_code=422, detail=violation)
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
     if tenant_slug is not None:
@@ -39,24 +43,29 @@ def create_tenant_owner(
     else:
         slug = unique_slug(db, company_name)
     free_plan = get_free_plan(db)
-    company = Company(name=company_name, slug=slug, plan_id=free_plan.id if free_plan else None)
-    db.add(company)
-    db.flush()
-    user = User(
-        full_name=full_name.strip(),
-        email=email,
-        password_hash=get_password_hash(password),
-        role=UserRole.admin,  # LEGACY coarse role; real authorization comes from the assigned tenant role
-        company_id=company.id,
-        activated_at=datetime.now(UTC),
-        password_changed_at=datetime.now(UTC),
-    )
-    db.add(user)
-    db.flush()
-    bootstrap_owner(db, user)
-    record_event(
-        db, "user.created", tenant_id=company.id, subject_id=user.id, client_ip=client_ip, details={"via": via}
-    )
-    db.commit()
+    try:
+        # ALWAYS a brand-new company: there is no way to attach the new administrator to an existing one.
+        company = Company(name=company_name, slug=slug, plan_id=free_plan.id if free_plan else None)
+        db.add(company)
+        db.flush()
+        user = User(
+            full_name=full_name.strip(),
+            email=email,
+            password_hash=get_password_hash(password),
+            role=UserRole.admin,  # LEGACY coarse role; real authorization comes from the assigned tenant role
+            company_id=company.id,
+            activated_at=datetime.now(UTC),
+            password_changed_at=datetime.now(UTC),
+        )
+        db.add(user)
+        db.flush()
+        bootstrap_owner(db, user)
+        record_event(
+            db, "user.created", tenant_id=company.id, subject_id=user.id, client_ip=client_ip, details={"via": via}
+        )
+        db.commit()
+    except IntegrityError as exc:  # a concurrent registration took the same e-mail / identifier
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Ya existe un usuario o una agencia con esos datos.") from exc
     db.refresh(user)
     return user
