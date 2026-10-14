@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.models.cash import CashAudit, CashBox, CashConfig, CashMovement, CashSession
+from app.modules.identity.errors import PermissionDenied
+from app.modules.identity.models import UserAccount
 
 CASH_CURRENCY = "DOP"  # the legacy cash ledger has no currency column: every amount is RD$ (T-008 will change this)
 CENT = Decimal("0.01")
@@ -93,6 +95,13 @@ def _record(
     notes: str,
     reverses_id: int | None = None,
 ) -> CashWithdrawal:
+    # FM-FUNCTIONAL-018-R1: the single choke point of every v2 balance change. Nobody but the session's own cashier
+    # moves its money (a company administrator never owns a session it could operate), whatever route got here.
+    if session.cashier_id != actor_user_id:
+        raise CashSessionNotOwned()
+    operator = db.get(UserAccount, actor_user_id)  # a legacy session owned by an administrator is not operable either
+    if operator is None or getattr(operator.role, "value", operator.role) == "admin":
+        raise PermissionDenied()
     session.balance += signed
     session.version += 1
     movement = CashMovement(

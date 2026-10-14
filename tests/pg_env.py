@@ -31,3 +31,17 @@ os.environ["SMTP_HOST"] = ""
 os.environ["SMTP_USER"] = ""
 os.environ["SMTP_PASSWORD"] = ""
 TEST_DATABASE_URL = url
+
+# The suites recreate tables and enum types between tests (``drop_all``/``create_all``). With psycopg's server-side
+# prepared statements a pooled connection could keep a cached plan of the OLD type and fail with "cached plan must not
+# change result type" in whichever test ran next (a pre-existing, order dependent flake). Tests never need them.
+from sqlalchemy import event  # noqa: E402
+from sqlalchemy.engine import Engine  # noqa: E402
+
+
+@event.listens_for(Engine, "connect")
+def _no_server_side_prepared_statements(dbapi_connection, _record):  # pragma: no cover - harness only
+    try:
+        dbapi_connection.prepare_threshold = None
+    except Exception:
+        pass

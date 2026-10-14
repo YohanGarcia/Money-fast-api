@@ -7,7 +7,7 @@ from datetime import timedelta
 import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 
 from app.core.config import settings
 from app.core.context import get_context
@@ -21,7 +21,12 @@ from app.models.session import UserSession
 from app.modules.identity import auth as auth_service
 from app.modules.identity.audit import clean_details
 from app.modules.identity.authorization import Grant, Principal
-from app.modules.identity.catalog import CATALOG, bootstrap_owner, sync_permission_catalog
+from app.modules.identity.catalog import (
+    ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS,
+    CATALOG,
+    bootstrap_owner,
+    sync_permission_catalog,
+)
 from app.modules.identity.deps import get_auth_context
 from app.modules.identity.errors import AccountLocked, InvalidCredentials, RateLimited
 from app.modules.identity.models import (
@@ -125,6 +130,23 @@ def admin_headers(client, tenant) -> dict:
 
 
 def create_role(client, headers, name, perms, expect=201):
+    if expect == 201 and set(perms) & ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS:
+        # FM-FUNCTIONAL-018-R1: a company administrator no longer holds the operative cash powers, so the API refuses to
+        # define a role richer than itself for these ENGINE suites; the fixture defines it directly (the delegation
+        # rules themselves are covered by tests/test_fm_functional_018_r1.py).
+        from app.modules.identity.models import Permission, RolePermission
+
+        me = client.get(f"{V2}/auth/me", headers=headers).json()
+        with SessionLocal() as db:
+            role = Role(tenant_id=me["user"]["tenant_id"], name=name, description="")
+            db.add(role)
+            db.flush()
+            for code in perms:
+                pid = db.scalar(select(Permission.id).where(Permission.code == code))
+                db.add(RolePermission(role_id=role.id, permission_id=pid))
+            db.commit()
+            return {"id": role.id, "name": name, "description": "", "status": role.status, "system_defined": False,
+                    "permissions": sorted(perms)}
     r = client.post(f"{V2}/roles", headers=headers, json={"name": name, "permissions": perms})
     assert r.status_code == expect, r.text
     return r.json()
@@ -142,6 +164,16 @@ def activate_user(client, sink, admin_hdrs, email, *, roles=(), scope="tenant", 
     done = client.post(f"{V2}/auth/recovery/complete", json={"token": msg["secret"], "new_password": PW})
     assert done.status_code == 200, done.text
     for role in roles:
+        if set(role.get("permissions") or []) & ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS:
+            # FM-FUNCTIONAL-018-R1: the API only lets a company administrator hand operative cash powers to a CASHIER at
+            # branch/cash-point scope (covered by tests/test_fm_functional_018_r1.py). These engine suites use plain
+            # operators, so the fixture assigns them directly, as the database owner would.
+            with SessionLocal() as db:
+                owner = db.get(UserAccount, user["id"])
+                db.add(UserRoleAssignment(tenant_id=owner.company_id, user_id=owner.id, role_id=role["id"],
+                                          scope_kind=scope, branch_id=branch_id or None))
+                db.commit()
+            continue
         body = {"role_id": role["id"], "scope": scope}
         if branch_id:
             body["branch_id"] = branch_id
@@ -931,8 +963,14 @@ def test_me_grants_expose_cash_point_id_per_scope(client, sink, tenant_a):
 
     def assign(email, **body):
         user = activate_user(client, sink, adm, email)
-        r = client.post(f"{V2}/users/{user['id']}/roles", headers=adm, json={"role_id": role["id"], **body})
-        assert r.status_code == 201, r.text
+        # FM-FUNCTIONAL-018-R1: this test pins how /me EXPOSES grants per scope; operative powers are handed out by the
+        # API only to cashiers at branch/cash-point scope, so the fixture assigns them directly.
+        with SessionLocal() as db:
+            owner = db.get(UserAccount, user["id"])
+            db.add(UserRoleAssignment(tenant_id=owner.company_id, user_id=owner.id, role_id=role["id"],
+                                      scope_kind=body["scope"], branch_id=body.get("branch_id"),
+                                      cash_point_id=body.get("cash_point_id")))
+            db.commit()
 
     assign("tenant-u@example.com", scope="tenant")
     assign("branch-u@example.com", scope="branch", branch_id=tenant_a["branch_id"])

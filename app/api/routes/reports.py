@@ -49,7 +49,7 @@ def compute(db: Session, company_id: int, start: date, end: date) -> dict:
     desembolsado = sum((l.principal_amount for l in loans if low <= _aware(l.created_at) < high), ZERO)
     prestamos_nuevos = sum(1 for l in loans if low <= _aware(l.created_at) < high)
 
-    nomina_rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id)).all()
+    nomina_rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id, PayrollPayment.status == 'paid')).all()  # authorized/cancelled moved no money
     nomina_pagada = sum((p.amount for p in nomina_rows if low <= _aware(p.created_at) < high), ZERO)
 
     efectivo = None

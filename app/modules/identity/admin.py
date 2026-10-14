@@ -16,7 +16,14 @@ from app.core.time import now_utc
 from app.models.branch import Branch
 from app.modules.identity.audit import record_event
 from app.modules.identity.auth import normalize_identifier, require_state, revoke_user_sessions
-from app.modules.identity.authorization import Principal, assert_within_ceiling, effective_grants, require
+from app.modules.identity.authorization import (
+    Principal,
+    assert_within_ceiling,
+    effective_grants,
+    is_company_administrator,
+    may_delegate_operative,
+    require,
+)
 from app.modules.identity.catalog import sync_permission_catalog
 from app.modules.identity.errors import (
     DuplicateAssignment,
@@ -50,7 +57,8 @@ def _role_permission_codes(role: Role) -> set[str]:
 def _within_actor_authority(db: Session, actor: Principal, target: UserAccount) -> None:
     """The actor may not act on a user holding permissions the actor does not hold (conservative)."""
     held = {g.permission for g in effective_grants(db, target)}
-    assert_within_ceiling(actor, held)
+    # a company administrator administers (disables, edits) its cashiers although it can never exercise their powers
+    assert_within_ceiling(actor, held, delegable_operative=is_company_administrator(db, actor))
 
 
 # --- users ---------------------------------------------------------------------------------------
@@ -236,7 +244,8 @@ def create_role(
     unknown = codes - set(catalog)
     if unknown or any(p.scope_kind != "tenant" for p in catalog.values()):
         raise ResourceNotFound("Permiso no encontrado.")
-    assert_within_ceiling(actor, codes)  # cannot create a role richer than oneself
+    # cannot create a role richer than oneself (a role is inert until assigned; assignment is restricted to cashiers)
+    assert_within_ceiling(actor, codes, delegable_operative=is_company_administrator(db, actor))
     role = Role(tenant_id=actor.tenant_id, name=name.strip(), description=description.strip())
     db.add(role)
     try:
@@ -307,6 +316,7 @@ def assign_role(
         branch_id=branch_id,
         cash_point_id=cash_point_id,
         cash_point_branch_id=cp_branch_id,
+        delegable_operative=may_delegate_operative(db, actor, target, scope_kind),
     )
     row = UserRoleAssignment(
         tenant_id=actor.tenant_id,
@@ -342,7 +352,9 @@ def remove_role(db: Session, actor: Principal, user_id: int, role_id: int, clien
     role = db.get(Role, role_id)
     if role is None or role.tenant_id != actor.tenant_id:
         raise TenantMismatch()
-    assert_within_ceiling(actor, _role_permission_codes(role))  # cannot strip a role richer than oneself
+    assert_within_ceiling(
+        actor, _role_permission_codes(role), delegable_operative=is_company_administrator(db, actor)
+    )  # cannot strip a role richer than oneself
     now: datetime = now_utc()
     rows = db.scalars(
         select(UserRoleAssignment).where(

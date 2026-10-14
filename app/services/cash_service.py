@@ -121,7 +121,10 @@ def outstanding_rows(db,box,collector_id=None):
 
 def pending(db,box,collector_id=None): return sum((n for _,n in outstanding_rows(db,box,collector_id)),ZERO)
 
-def add_movement(db,box,session,user,kind,amount,notes,**kw):
+def add_movement(db,box,session,user,kind,amount,notes,reviewed_report=False,**kw):
+    # FM-FUNCTIONAL-018-R1: single choke point of the legacy v1 balance changes. Only the session's own cashier moves
+    # its money; the lone exception is the administrator's CONFIRMATION of a surplus that session's own cashier reported.
+    if (session.cashier_id!=user.id or user.role=='admin') and not reviewed_report: fail('La jornada pertenece a otro usuario: solo su cajero opera su efectivo.',403)
     if session.state!='open': fail('La jornada no admite movimientos.',409)
     if session.balance+amount<0: fail('El efectivo disponible no alcanza para esta salida.',409)
     session.balance += amount
@@ -320,9 +323,12 @@ def command(db,user,p):
         check_version(row,p.version)
         if not p.notes.strip(): fail('Registra el resultado de la revisión del sobrante.')
         if action=='confirm_surplus':
-            session=operational_session(db,box,user,p.session_id)
+            # FM-FUNCTIONAL-018-R1: the surplus goes to the session of the cashier that REPORTED it, never to one the
+            # administrator picks; the administrator only confirms what that cashier declared.
+            session=db.get(CashSession,row.session_id) if row.session_id else None
+            if session is None or session.box_id!=box.id or session.state!='open': fail('La jornada que reportó el sobrante ya no está abierta.',409)
             row.received=row.declared;row.remaining=pending(db,box,row.collector_id);row.state='surplus_confirmed'
-            add_movement(db,box,session,user,'surplus',row.declared,p.notes,collector_id=row.collector_id,delivery_id=row.id,reference=f'SOB-{row.id}')
+            add_movement(db,box,session,user,'surplus',row.declared,p.notes,reviewed_report=True,collector_id=row.collector_id,delivery_id=row.id,reference=f'SOB-{row.id}')
         else: row.state='surplus_rejected'
         row.cashier_id=user.id;row.confirmed_at=now();row.notes=p.notes
         result={'delivery_id':row.id,'state':row.state}

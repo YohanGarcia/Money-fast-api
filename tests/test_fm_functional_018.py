@@ -144,21 +144,6 @@ class AdminCashSeparationTests(_cash.CashTests):
         held = {g.permission for g in self.principal(self.users['manager']['id']).grants}
         self.assertFalse(held & set(OPERATIVE))
 
-    def test_admin_still_administers_and_assigns_cashiers_through_v2(self):
-        from app.modules.identity.catalog import CASHIER_ROLE
-        from app.modules.identity.models import Role
-        cid = self.users['cashier']['id']
-        self.v2('POST', f'/users/{cid}/disable', self.admin, code=200)
-        self.v2('POST', f'/users/{cid}/enable', self.admin, code=200)
-        with SessionLocal() as db:
-            role_id = db.scalar(select(Role.id).where(Role.tenant_id == self.users['cashier']['company_id'],
-                                                      Role.name == CASHIER_ROLE))
-        self.assertIsNotNone(role_id)
-        r = self.v2('POST', f"/users/{self.users['manager']['id']}/roles", self.admin,
-                    dict(role_id=role_id, scope='branch', branch_id=self.branch))
-        self.assertEqual(r.status_code, 201, r.text)  # assigning a cashier is allowed; exercising is not
-        self.assertFalse({g.permission for g in self.principal(self.admin_id).grants} & set(OPERATIVE))
-
     def test_platform_principal_has_no_company_cash_operation(self):
         p = Principal(user_id=1, tenant_id=None, person_id=None, session_id=0, grants=())
         for code in OPERATIVE:

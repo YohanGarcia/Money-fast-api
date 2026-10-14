@@ -1207,7 +1207,7 @@ def test_migration_0021_legacy_differences_resolve_only_after_the_session_closes
         _snapshot(eng) == before and _rows(eng, "SELECT * FROM cash_difference_resolutions ORDER BY id") == res_before
     )
     assert _rows(eng, "SELECT version_num FROM alembic_version") == [
-        ("0024",)
+        ("0025",)
     ]  # the refused chain rolls back whole: the head stays
     assert _alembic(scratch_db, "check").returncode == 0
     eng.dispose()
@@ -1237,7 +1237,7 @@ def test_migration_0021_downgrade_also_refuses_resolved_status_or_security_evide
     out = _alembic(scratch_db, "downgrade", "0020")
     assert out.returncode != 0 and "cannot downgrade 0021: cash difference resolution history exists" in out.stderr
     assert _snapshot(eng) == before and _rows(eng, "SELECT version_num FROM alembic_version") == [
-        ("0024",)
+        ("0025",)
     ]  # the refused chain rolls back whole: the head stays
     eng.dispose()
 

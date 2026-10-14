@@ -1,6 +1,8 @@
 from collections.abc import Generator
 from typing import Callable
 
+import re
+
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -31,6 +33,9 @@ def get_current_user(
         allowed = path.startswith('/cash/') or path in ('/auth/me','/auth/logout','/auth/refresh')
         allowed = allowed or (request.method == 'GET' and (path == '/customers' or path.startswith('/customers/') or path == '/loans' or path.startswith('/loans/') or path == '/payments'))
         allowed = allowed or (request.method == 'POST' and path == '/payments')
+        # FM-FUNCTIONAL-018-R1: the cashier sees the payroll payments authorized for its branch and executes them
+        allowed = allowed or (request.method == 'GET' and path == '/payroll/authorizations')
+        allowed = allowed or (request.method == 'POST' and re.fullmatch(r'/payroll/payments/\d+/execute', path) is not None)
         if not allowed: raise HTTPException(403, 'Esta operación no está disponible para el cajero.')
     return user
 
