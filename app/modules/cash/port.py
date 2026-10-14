@@ -258,7 +258,13 @@ def deposit(
     ``kind`` must be a kind the legacy cash reversal does not accept (``credit_payment_receipt``): reversing only the cash
     would leave the debt applied. Never commits."""
     box, session = _open_custody(
-        db, tenant_id=tenant_id, branch_id=branch_id, session_id=session_id, amount=amount, currency=currency
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        session_id=session_id,
+        amount=amount,
+        currency=currency,
+        cashier_id=actor_user_id,  # FM-FUNCTIONAL-018: only the session's own cashier takes money into it
     )
     return _record(
         db, box, session, signed=amount, actor_user_id=actor_user_id, kind=kind, reference=reference, notes=notes

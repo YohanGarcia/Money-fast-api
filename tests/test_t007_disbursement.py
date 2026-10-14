@@ -65,7 +65,7 @@ TZ = "America/Santo_Domingo"
 
 
 # ================================ helpers ============================================================
-def cash_for(tenant, branch_id, balance="1000000.00", state="open", enable=True):
+def cash_for(tenant, branch_id, balance="1000000.00", state="open", enable=True, cashier_id=None):
     """Cash runtime fixture: CashConfig + the branch's CashBox (its base CashPoint comes with it) + one OPEN custody
     session owned by the tenant admin, funded from capital (T-021 v2 contract: no anonymous opening cash)."""
     assert state == "open", "T-021: a session is born open; close it through tests.cash_fixtures"
@@ -75,7 +75,7 @@ def cash_for(tenant, branch_id, balance="1000000.00", state="open", enable=True)
         box = CashBox(company_id=tenant["tenant_id"], branch_id=branch_id, initial_balance=Decimal(0))
         db.add(box)
         db.flush()
-        session = open_v2_session(db, box_id=box.id, cashier_id=tenant["admin_id"], balance=balance)
+        session = open_v2_session(db, box_id=box.id, cashier_id=cashier_id or tenant["admin_id"], balance=balance)
         db.commit()
         return SimpleNamespace(box_id=box.id, session_id=session.id, branch_id=branch_id)
 
@@ -316,7 +316,6 @@ def test_cross_tenant_and_branch_scope_authorization(client, sink, tenant_a, ten
     adm_a, adm_b = admin_headers(client, tenant_a), admin_headers(client, tenant_b)
     w = world7(client, adm_a, tenant_a)
     b2 = mk_branch(client, adm_a, "B2")
-    cash_b2 = cash_for(tenant_a, b2["id"])
     # another tenant cannot see or disburse the contract; nor use its branches or cash sessions
     assert client.post(f"{F}/{w.f['id']}/disburse", headers=adm_b, json=body(w)).status_code == 404
     wb_branch = mk_branch(client, adm_b, "BB")
@@ -348,6 +347,10 @@ def test_cross_tenant_and_branch_scope_authorization(client, sink, tenant_a, ten
     scoped = user_hdr(
         client, sink, adm_a, tenant_a, "d2@x.com", ["loans.read", "loans.disburse"], scope="branch", branch_id=b2["id"]
     )
+    # FM-FUNCTIONAL-018: the operator must OWN the session it pays out of
+    with SessionLocal() as _db:
+        _scoped_id = _db.scalar(text("SELECT id FROM users WHERE email = 'd2@x.com'"))
+    cash_b2 = cash_for(tenant_a, b2["id"], cashier_id=_scoped_id)
     assert client.post(f"{F}/{w.f['id']}/disburse", headers=scoped, json=body(w)).status_code == 403  # B1 is not theirs
     out = client.post(
         f"{F}/{w.f['id']}/disburse", headers=scoped, json=body(w, branch=b2["id"], session=cash_b2.session_id)

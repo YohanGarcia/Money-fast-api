@@ -163,6 +163,18 @@ CATALOG: tuple[PermissionDef, ...] = (
     PermissionDef("platform.users.disable", "platform", "Desactivar usuarios de plataforma", True),
 )
 CATALOG_CODES = frozenset(p.code for p in CATALOG)
+# FM-FUNCTIONAL-018 (owner decision): the company administrator configures and supervises Caja, it NEVER operates a
+# session. These permissions are the operative ones; they are not part of the tenant-admin role and, whatever the
+# stored grants say, they are never effective for a user whose legacy role is ``admin`` (see ``effective_grants``).
+ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS = frozenset(
+    {
+        "cash.sessions.open",
+        "cash.sessions.close",
+        "cash.handovers.receive",
+        "cash.field_custody.accept",
+        "cash.field_custody.refund",
+    }
+)
 TENANT_ADMIN_ROLE = "Administrador de agencia"
 PLATFORM_ADMIN_ROLE = "Administrador de plataforma"
 
@@ -195,7 +207,7 @@ def ensure_system_role(db: Session, tenant_id: int | None) -> Role:
     db.add(role)
     db.flush()
     for d in CATALOG:
-        if d.scope_kind == kind:
+        if d.scope_kind == kind and d.code not in ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS:
             db.add(RolePermission(role_id=role.id, permission_id=perms[d.code].id))
     db.flush()
     return role

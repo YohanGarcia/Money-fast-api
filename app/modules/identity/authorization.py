@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.identity.catalog import CATALOG_CODES
+from app.modules.identity.catalog import ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS, CATALOG_CODES
 from app.modules.identity.errors import DelegationCeilingViolation, PermissionDenied
 from app.modules.identity.models import Permission, Role, RolePermission, UserAccount, UserRoleAssignment
 
@@ -108,9 +108,15 @@ def effective_grants(db: Session, user: UserAccount) -> tuple[Grant, ...]:
             Permission.scope_kind == kind,
         )
     ).all()
+    # FM-FUNCTIONAL-018: a company administrator never operates Caja, even with inherited or legacy grants.
+    is_admin = getattr(getattr(user, "role", None), "value", getattr(user, "role", None)) == "admin"
     return tuple(
         sorted(
-            {Grant(code, scope, branch, cp) for code, scope, branch, cp in rows},
+            {
+                Grant(code, scope, branch, cp)
+                for code, scope, branch, cp in rows
+                if not (is_admin and code in ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS)
+            },
             key=lambda g: (g.permission, g.scope_kind, g.branch_id or 0, g.cash_point_id or 0),
         )
     )
@@ -146,7 +152,9 @@ def assert_within_ceiling(
     branch grants require tenant-wide or the same branch; cash-point grants require tenant-wide, the cash
     point's branch, or that cash point.
     """
-    for code in permission_codes:
+    # FM-FUNCTIONAL-018: the company administrator may ASSIGN and administer cashiers although it can never EXERCISE
+    # the operative cash permissions itself, so those codes are not subject to the "hold it yourself" ceiling.
+    for code in permission_codes - ADMIN_FORBIDDEN_OPERATIVE_PERMISSIONS:
         if scope_kind == "branch" and branch_id is not None:
             ok = actor.holds_for_branch(code, branch_id)
         elif scope_kind == "cash_point" and cash_point_id is not None:

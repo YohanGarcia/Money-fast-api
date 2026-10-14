@@ -249,6 +249,7 @@ def disburse(db: Session, actor: Principal, formalization_id: int, body: Disburs
         kind=DISBURSEMENT_KIND,
         reference=loan_number,
         notes=f"Desembolso {f.reference} / {loan_number}",
+        require_cashier_id=actor.user_id,  # FM-FUNCTIONAL-018: only the session's own cashier pays out of it
     )
     rows = schedule["schedule"]
     loan = CreditLoan(

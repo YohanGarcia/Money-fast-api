@@ -202,7 +202,12 @@ def test_refund_prerequisites_counter_pre_custody_permission_and_custodian(clien
     assert code(refund(client, x.rcol_h, 999999, expect=404)) == "reversal_not_found"  # F01
     _counter, crv = counter_reversal(client, x, tenant_a)
     withdrawals = count("cash_movements")
-    assert code(refund(client, x.adm, crv["id"], expect=409)) == "field_refund_not_applicable"  # S06
+    # FM-FUNCTIONAL-018: the company administrator no longer holds the operative refund permission, so a holder of it
+    # (a cashier-like custodian) makes the S06 request; the administrator is refused outright.
+    holder_h, _ = mkuser(client, sink, x.adm, tenant_a, "hold@x.com", ["payments.create", RENDER, REFUND],
+                         scope="branch", branch_id=x.b)
+    assert code(refund(client, x.adm, crv["id"], expect=403)) == "permission_denied"
+    assert code(refund(client, holder_h, crv["id"], expect=409)) == "field_refund_not_applicable"  # S06
     assert count("cash_movements") == withdrawals  # never a second withdrawal
     monkeypatch.setattr(pay_service, "create_receipt", lambda db, payment: None)
     old = fpay(client, x.rcol_h, x.w, "7.00")  # pre-T-019 shape: no receipt
