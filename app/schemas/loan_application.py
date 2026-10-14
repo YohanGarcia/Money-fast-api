@@ -60,14 +60,16 @@ SECTIONS = [
     ]),
 ]
 
+# Every document is OPTIONAL: nothing here blocks saving, evaluating, approving, signing nor disbursing. The list only
+# names the categories a user may attach (and that secured applications add).
 DOCUMENTS = [
-    dict(key="identity", label="Cédula de identidad", required=True),
-    dict(key="income_1", label="Comprobante de ingresos · mes 1", required=True),
-    dict(key="income_2", label="Comprobante de ingresos · mes 2", required=True),
-    dict(key="address", label="Comprobante de domicilio", required=True),
-    dict(key="application", label="Solicitud y autorización firmadas", required=True),
-    dict(key="property", label="Documento de propiedad / matrícula", required=True, secured=True),
-    dict(key="appraisal", label="Tasación del bien", required=True, secured=True),
+    dict(key="identity", label="Cédula de identidad", required=False),
+    dict(key="income_1", label="Comprobante de ingresos · mes 1", required=False),
+    dict(key="income_2", label="Comprobante de ingresos · mes 2", required=False),
+    dict(key="address", label="Comprobante de domicilio", required=False),
+    dict(key="application", label="Solicitud y autorización firmadas", required=False),
+    dict(key="property", label="Documento de propiedad / matrícula", required=False, secured=True),
+    dict(key="appraisal", label="Tasación del bien", required=False, secured=True),
     dict(key="other_collateral", label="Otros documentos de la garantía (si aplica)", required=False, secured=True),
     dict(key="contract", label="Contrato y pagaré firmados", required=False),
 ]

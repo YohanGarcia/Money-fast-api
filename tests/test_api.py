@@ -956,10 +956,8 @@ class MoneyFastApiTests(unittest.TestCase):
             response = self.app_action(headers, application, "disburse")
             self.assertEqual(response.status_code, 409)
             application = self.app_action(headers, application, "submit").json()
-            self.assertEqual(self.app_action(headers, application, "evaluate").status_code, 422)
-            for document in DOCUMENTS:
-                if document["required"] and (not document.get("secured") or modality == "secured"):
-                    application = self.app_document(headers, application, document["key"])
+            # every document is optional: evaluating, approving and signing never wait for an attachment
+            self.assertFalse([d["key"] for d in DOCUMENTS if d["required"]])
             response = self.app_action(headers, application, "evaluate")
             self.assertEqual(response.status_code, 200, response.text)
             application = response.json()
@@ -968,9 +966,9 @@ class MoneyFastApiTests(unittest.TestCase):
                 terms={"interest_rate": "10", "installment_count": 6})
             self.assertEqual(response.status_code, 200, response.text)
             application = response.json()
-            self.assertEqual(self.app_action(headers, application, "sign").status_code, 422)
-            application = self.app_document(headers, application, "contract")
-            application = self.app_action(headers, application, "sign").json()
+            response = self.app_action(headers, application, "sign")
+            self.assertEqual(response.status_code, 200, response.text)
+            application = response.json()
             from datetime import date, timedelta
             response = self.app_action(headers, application, "disburse", first_payment_date=str(date.today() + timedelta(days=30)), disbursement_reference="REC-TEST")
             self.assertEqual(response.status_code, 200, response.text)
@@ -992,8 +990,13 @@ class MoneyFastApiTests(unittest.TestCase):
         application = self.app_action(headers, application, "submit").json()
         self.assertEqual(self.client.put(f'/api/v1/loan-applications/{application["id"]}', headers=headers,
             json={"modality": "secured", "version": application["version"], "data": application["data"]}).status_code, 409)
-        self.assertEqual(self.app_action(headers, application, "reject").status_code, 409)
-        result = self.app_action(headers, application, "return", notes="Corregir domicilio")
+        # the evaluation / reason note is optional: returning to draft or rejecting needs no text
+        other = self.app_action(headers, self.application_fixture(headers, "unsecured"), "submit").json()
+        rejected = self.app_action(headers, other, "reject")
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(rejected.json()["status"], "rejected")
+        result = self.app_action(headers, application, "return")
+        self.assertEqual(result.status_code, 200, result.text)
         self.assertEqual(result.json()["status"], "draft")
         edited = self.client.put(f'/api/v1/loan-applications/{application["id"]}', headers=headers,
             json={"modality": "unsecured", "version": result.json()["version"], "data": application["data"], "customer_id": application["customer_id"], "customer_version": application["customer_version"]})

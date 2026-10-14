@@ -226,8 +226,9 @@ def transition(application_id: int, payload: TransitionInput,
                    "disburse": ("signed", "disbursed")}
     action = payload.action
     if action in ("return", "reject"):
-        if item.status not in ("receiving", "evaluation", "approved") or not payload.notes.strip():
-            raise HTTPException(409, "Indica el motivo; solo se puede devolver o rechazar antes de la firma.")
+        # The evaluation / reason note is OPTIONAL: only the stage is checked.
+        if item.status not in ("receiving", "evaluation", "approved"):
+            raise HTTPException(409, "Solo se puede devolver o rechazar antes de la firma.")
         item.status = "draft" if action == "return" else "rejected"
         item.terms = {}
         for doc in list(item.documents):
@@ -243,22 +244,11 @@ def transition(application_id: int, payload: TransitionInput,
             validate_complete(item)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
-        if action == "evaluate":
-            required = {d["key"] for d in DOCUMENTS if d["required"] and (not d.get("secured") or item.modality == "secured")}
-            verified = {d.category for d in item.documents if d.verified}
-            missing = required - verified
-            if missing:
-                labels = [d["label"] for d in DOCUMENTS if d["key"] in missing]
-                raise HTTPException(
-                    422,
-                    "Faltan documentos por adjuntar y verificar: " + ", ".join(labels) + ".",
-                )
+        # Documents are optional: evaluating never waits for them (they can be attached and reviewed at any time).
         if action == "approve":
-            if payload.terms is None or not payload.notes.strip():
-                raise HTTPException(422, "Registra la evaluación y las condiciones aprobadas.")
+            if payload.terms is None:
+                raise HTTPException(422, "Registra las condiciones aprobadas.")
             item.terms = payload.terms.model_dump(mode="json")
-        if action == "sign" and not any(d.category == "contract" and d.verified for d in item.documents):
-            raise HTTPException(422, "Adjunta y verifica el contrato y pagaré firmados.")
         if action == "disburse":
             from app.services.cash_service import enabled, lock_company
             lock_company(db, user.company_id)
