@@ -684,11 +684,11 @@ def test_s03_account_enumeration_mitigated(client, sink, tenant_a):
     assert known == unknown == disabled
     assert len([m for m in sink.messages if m["email"] == "staff@example.com"]) == 1  # only the invitation
     assert len([m for m in sink.messages if m["email"] == "ghost@example.com"]) == 0
-    # the legacy enumerating endpoint is gone
-    assert (
-        client.post("/api/v1/auth/verify-reset-code", json={"email": "ghost@example.com", "code": "123456"}).status_code
-        == 404
-    )
+    # the legacy 6-digit contract (Web/mobile) answers a wrong code and an unknown account identically
+    ghost = client.post("/api/v1/auth/verify-reset-code", json={"email": "ghost@example.com", "code": "123456"})
+    wrong = client.post("/api/v1/auth/verify-reset-code", json={"email": tenant_a["email"], "code": "123456"})
+    assert ghost.status_code == wrong.status_code == 400
+    assert ghost.json()["detail"] == wrong.json()["detail"]
 
 
 def test_s04_secrets_absent_from_audit(client, sink, tenant_a):

@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     recovery_max_requests_account: int = Field(default=3, ge=1)
     recovery_max_requests_ip: int = Field(default=20, ge=1)
     recovery_max_failures_ip: int = Field(default=10, ge=1)
+    # Legacy clients (Web/mobile) use a 6-digit code: after this many wrong codes the live code is revoked.
+    recovery_code_max_attempts: int = Field(default=5, ge=1)
+    # None = decided by the environment: open in development/test, CLOSED in staging/production.
+    public_registration: bool | None = None
 
     # IANA identifier of the platform default business timezone (ADR-006).
     default_timezone: str = "America/Santo_Domingo"
@@ -97,6 +101,13 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def registration_open(self) -> bool:
+        """Self-service ``/auth/register``. Staging/production default to CLOSED; set PUBLIC_REGISTRATION=true to open."""
+        if self.public_registration is not None:
+            return self.public_registration
+        return self.environment not in STRICT_ENVIRONMENTS
 
     @property
     def is_strict(self) -> bool:

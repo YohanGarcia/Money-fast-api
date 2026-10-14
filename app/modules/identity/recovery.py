@@ -7,6 +7,7 @@
 """
 
 import logging
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.db import session_scope
-from app.core.security import hash_token, new_opaque_token, password_policy_violation
+from app.core.security import hash_token, keyed_digest, new_opaque_token, password_policy_violation
 from app.core.time import now_utc
 from app.modules.identity import throttle
 from app.modules.identity.audit import record_event
@@ -27,6 +28,7 @@ from app.modules.identity.auth import (
     set_password,
 )
 from app.modules.identity.errors import (
+    InvalidRecoveryCode,
     InvalidRecoveryToken,
     PasswordPolicyViolation,
     RateLimited,
@@ -200,6 +202,134 @@ def complete_recovery(
     )
     db.commit()
     return user
+
+
+# --- 6-digit code flow for the legacy /api/v1/auth clients (Web and mobile) ------------------------------------
+# request -> a short code is e-mailed; verify (email + code) -> an opaque single-use reset token; reset -> new password.
+# The code is never stored: only a keyed digest (HMAC with the server secret), so a database leak cannot be
+# brute-forced offline. Wrong codes are counted per e-mail (known or unknown alike); at the limit the live code
+# is revoked.
+S_CODE_ACCT = "recovery_code_acct"
+
+
+def _code_digest(user_id: int, code: str) -> str:
+    return keyed_digest("recovery_code", f"{user_id}:{code}")
+
+
+def request_code(
+    db: Session, *, email: str, client_ip: str | None, now: datetime | None = None
+) -> PendingDelivery | None:
+    """Issue a 6-digit code for an ACTIVE legacy account. Same outward result for every input (None = nothing sent)."""
+    now = now or now_utc()
+    ident = normalize_identifier(email)
+    ip = client_ip or "unknown"
+    wait = throttle.retry_after(db, S_REQ_IP, ip, now)
+    if wait:
+        raise RateLimited(wait)
+    throttle.register_failure(db, S_REQ_IP, ip, settings.recovery_max_requests_ip, now)
+    account_blocked = throttle.retry_after(db, S_REQ_ACCT, f"code|{ident}", now) > 0
+    if not account_blocked:
+        throttle.register_failure(db, S_REQ_ACCT, f"code|{ident}", settings.recovery_max_requests_account, now)
+    user = resolve_account(db, ident, None, unscoped=True)
+    if user is None or user.status != "active" or account_blocked:
+        record_event(
+            db,
+            "recovery.requested",
+            client_ip=client_ip,
+            tenant_id=user.company_id if user else None,
+            subject_id=user.id if user else None,
+            details={"issued": False, "flow": "code"},
+        )
+        db.commit()
+        return None
+    db.execute(
+        update(RecoveryToken)
+        .where(RecoveryToken.user_id == user.id, RecoveryToken.used_at.is_(None), RecoveryToken.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    code = f"{secrets.randbelow(10**6):06d}"
+    expires_at = now + timedelta(minutes=settings.recovery_token_ttl_minutes)
+    db.add(
+        RecoveryToken(
+            user_id=user.id, token_hash=_code_digest(user.id, code), purpose="recovery", expires_at=expires_at
+        )
+    )
+    throttle.reset(db, S_CODE_ACCT, ident)
+    record_event(
+        db,
+        "recovery.requested",
+        tenant_id=user.company_id,
+        subject_id=user.id,
+        client_ip=client_ip,
+        details={"issued": True, "purpose": "recovery", "flow": "code"},
+    )
+    db.commit()
+    return PendingDelivery(user.id, user.company_id, user.email, "recovery", expires_at, code)
+
+
+def verify_code(
+    db: Session, *, email: str, code: str, client_ip: str | None, now: datetime | None = None
+) -> str:
+    """Exchange a valid code for an opaque single-use reset token. Every failure is the same ``InvalidRecoveryCode``."""
+    now = now or now_utc()
+    ident = normalize_identifier(email)
+    ip = client_ip or "unknown"
+    for scope, key in ((S_DONE_IP, ip), (S_CODE_ACCT, ident)):
+        wait = throttle.retry_after(db, scope, key, now)
+        if wait:
+            raise RateLimited(wait)
+    user = resolve_account(db, ident, None, unscoped=True)
+    row = None
+    if user is not None and user.status == "active":
+        row = db.execute(
+            update(RecoveryToken)
+            .where(
+                RecoveryToken.user_id == user.id,
+                RecoveryToken.token_hash == _code_digest(user.id, code.strip()),
+                RecoveryToken.purpose == "recovery",
+                RecoveryToken.used_at.is_(None),
+                RecoveryToken.revoked_at.is_(None),
+                RecoveryToken.expires_at > now,
+            )
+            .values(used_at=now)
+            .returning(RecoveryToken.id)
+        ).first()
+    if row is None:
+        failures = throttle.register_failure(db, S_CODE_ACCT, ident, settings.recovery_code_max_attempts, now)
+        throttle.register_failure(db, S_DONE_IP, ip, settings.recovery_max_failures_ip, now)
+        if user is not None and failures >= settings.recovery_code_max_attempts:  # the code dies with its attempts
+            db.execute(
+                update(RecoveryToken)
+                .where(
+                    RecoveryToken.user_id == user.id,
+                    RecoveryToken.used_at.is_(None),
+                    RecoveryToken.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
+        record_event(
+            db,
+            "recovery.failed",
+            outcome="failure",
+            client_ip=client_ip,
+            tenant_id=user.company_id if user else None,
+            subject_id=user.id if user else None,
+            details={"reason": "code_rejected", "flow": "code"},
+        )
+        db.commit()
+        raise InvalidRecoveryCode()
+    throttle.reset(db, S_CODE_ACCT, ident)
+    secret, _ = issue_token(db, user, "recovery", now)
+    record_event(
+        db,
+        "recovery.code_verified",
+        tenant_id=user.company_id,
+        subject_id=user.id,
+        client_ip=client_ip,
+        details={"flow": "code"},
+    )
+    db.commit()
+    return secret
 
 
 def _slug_of(db: Session, user: UserAccount) -> str | None:

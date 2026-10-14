@@ -292,12 +292,17 @@ class MoneyFastApiTests(unittest.TestCase):
         companies_response = self.client.get("/api/v1/companies", headers=headers)
         self.assertEqual(companies_response.status_code, 403, companies_response.text)
 
-    def test_legacy_password_reset_endpoints_and_debug_code_are_retired(self) -> None:
-        """T-002: the code-based reset (debug_code, verify-reset-code) no longer exists; use /api/v2/auth/recovery."""
+    def test_legacy_password_reset_endpoints_never_leak_the_code(self) -> None:
+        """FM-PRODUCTION-BLOCKERS-014: the 6-digit contract used by Web/mobile is back, but the code only travels by
+        e-mail: the response never carries ``debug_code`` and is identical for known and unknown accounts."""
         self.register_owner(email="reset@example.com")
-        for path in ("request-password-reset", "verify-reset-code", "reset-password"):
-            self.assertEqual(self.client.post(f"/api/v1/auth/{path}", json={"email": "reset@example.com"}).status_code, 404)
-
+        known = self.client.post("/api/v1/auth/request-password-reset", json={"email": "reset@example.com"})
+        unknown = self.client.post("/api/v1/auth/request-password-reset", json={"email": "nadie@example.com"})
+        self.assertEqual((known.status_code, unknown.status_code), (200, 200))
+        self.assertNotIn("debug_code", known.json())
+        self.assertEqual(known.json()["message"], unknown.json()["message"])
+        bad = self.client.post("/api/v1/auth/verify-reset-code", json={"email": "reset@example.com", "code": "000000"})
+        self.assertEqual(bad.status_code, 400)
     # ── loan / payment math ────────────────────────────────────────────────
     def test_customer_loan_and_composed_payment_flow(self) -> None:
         headers = self.owner_session()

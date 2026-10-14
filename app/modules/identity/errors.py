@@ -68,6 +68,13 @@ class InvalidRecoveryToken(AppError):
     default_message = "El enlace o codigo de recuperacion no es valido o ya expiro."
 
 
+class InvalidRecoveryCode(AppError):
+    """One answer for unknown email, wrong, expired, used or revoked code: nothing reveals which."""
+
+    status_code, code = 400, "invalid_recovery_code"
+    default_message = "El codigo no es valido o ya expiro. Solicita uno nuevo."
+
+
 class RecoveryTokenReused(AppError):
     status_code, code = 400, "recovery_token_reused"
     default_message = "El enlace o codigo de recuperacion ya fue utilizado."

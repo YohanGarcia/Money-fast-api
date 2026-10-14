@@ -1,67 +1,87 @@
-"""LEGACY /api/v1/auth. Login/refresh/logout now share the v2 authentication service (throttling, session
-revocation, audit). The old code-based password reset (debug_code, verify-reset-code) was removed: use
-/api/v2/auth/recovery/*."""
+"""LEGACY /api/v1/auth. Login/refresh/logout share the v2 authentication service (throttling, session revocation,
+audit). Password recovery here is the 6-digit-code contract used by the Web and mobile clients; it is backed by the
+same hardened recovery service as /api/v2/auth/recovery/*."""
 
-from datetime import UTC, datetime
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.core.security import get_password_hash
-from app.models.company import Company
-from app.models.user import User, UserRole
+from app.core.config import settings
+from app.models.user import User
 from app.modules.identity import auth as auth_service
-from app.modules.identity.audit import record_event
-from app.modules.identity.catalog import bootstrap_owner
+from app.modules.identity import recovery
 from app.modules.identity.deps import client_ip
-from app.modules.identity.tenant import is_valid_slug, normalize_slug, unique_slug
+from app.modules.identity.notifications import SecretNotifier, get_notifier
+from app.modules.identity.onboarding import create_tenant_owner
 from app.schemas.auth import LoginInput, RefreshInput, RegisterInput, TokenPair
 from app.schemas.user import UserRead
-from app.services.plan_limits import get_free_plan
 
 router = APIRouter()
 
-
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterInput, request: Request, db: Session = Depends(get_db)) -> User:
-    """Self-service onboarding: a new company (tenant) and its owner, who receives the tenant admin role."""
-    email = payload.email.lower().strip()
-    if db.scalar(select(User).where(User.email == email)):
-        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
-
-    if payload.tenant_slug is not None:
-        slug = normalize_slug(payload.tenant_slug)
-        if not is_valid_slug(slug):
-            raise HTTPException(status_code=422, detail="El identificador de agencia no es valido.")
-        if db.scalar(select(Company.id).where(Company.slug == slug)):
-            raise HTTPException(status_code=409, detail="Ese identificador de agencia ya esta en uso.")
-    else:
-        slug = unique_slug(db, payload.company_name)
-    free_plan = get_free_plan(db)
-    company = Company(name=payload.company_name, slug=slug, plan_id=free_plan.id if free_plan else None)
-    db.add(company)
-    db.flush()
-
-    user = User(
-        full_name=payload.full_name.strip(),
-        email=email,
-        password_hash=get_password_hash(payload.password),
-        role=UserRole.admin,  # LEGACY coarse role; real authorization comes from the assigned tenant role
-        company_id=company.id,
-        activated_at=datetime.now(UTC),
-        password_changed_at=datetime.now(UTC),
+    """Self-service onboarding. CLOSED by default in staging/production (PUBLIC_REGISTRATION): there, users are created
+    by authorised administrators and the first administrator comes from ``scripts/create_first_admin.py``."""
+    if not settings.registration_open:
+        raise HTTPException(
+            status_code=403,
+            detail="El registro publico esta deshabilitado. Solicita tu acceso a un administrador.",
+        )
+    return create_tenant_owner(
+        db,
+        full_name=payload.full_name,
+        email=payload.email,
+        password=payload.password,
+        company_name=payload.company_name,
+        tenant_slug=payload.tenant_slug,
+        client_ip=client_ip(request),
     )
-    db.add(user)
-    db.flush()
-    bootstrap_owner(db, user)
-    record_event(db, "user.created", tenant_id=company.id, subject_id=user.id, client_ip=client_ip(request),
-                 details={"via": "self_registration"})
-    db.commit()
-    db.refresh(user)
-    return user
 
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyResetCode(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+
+
+class ResetPassword(BaseModel):
+    reset_token: str = Field(min_length=20, max_length=200)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+GENERIC_RESET_MESSAGE = "Si el correo esta registrado, te enviaremos un codigo de verificacion."
+
+
+@router.post("/request-password-reset")
+def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    notifier: SecretNotifier = Depends(get_notifier),
+) -> dict:
+    """Always the same answer for known and unknown e-mails; the code travels only by e-mail (never in the response)."""
+    pending = recovery.request_code(db, email=payload.email, client_ip=client_ip(request))
+    if pending is not None:
+        background.add_task(recovery.deliver, pending, notifier)
+    return {"message": GENERIC_RESET_MESSAGE, "email": payload.email.lower().strip()}
+
+
+@router.post("/verify-reset-code")
+def verify_reset_code(payload: VerifyResetCode, request: Request, db: Session = Depends(get_db)) -> dict:
+    token = recovery.verify_code(db, email=payload.email, code=payload.code, client_ip=client_ip(request))
+    return {"reset_token": token, "message": "Codigo verificado."}
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset_password(payload: ResetPassword, request: Request, db: Session = Depends(get_db)) -> None:
+    recovery.complete_recovery(
+        db, token=payload.reset_token, new_password=payload.new_password, client_ip=client_ip(request)
+    )
 
 def _pair(result: auth_service.LoginResult) -> TokenPair:
     return TokenPair(
