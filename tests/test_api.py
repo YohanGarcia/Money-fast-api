@@ -293,14 +293,14 @@ class MoneyFastApiTests(unittest.TestCase):
         self.assertEqual(companies_response.status_code, 403, companies_response.text)
 
     def test_legacy_password_reset_endpoints_never_leak_the_code(self) -> None:
-        """FM-PRODUCTION-BLOCKERS-014: the 6-digit contract used by Web/mobile is back, but the code only travels by
-        e-mail: the response never carries ``debug_code`` and is identical for known and unknown accounts."""
+        """The 6-digit contract used by Web/mobile exists; while SMTP is not configured it is honestly unavailable
+        (identical for known and unknown e-mails) and never returns a code (``debug_code``)."""
         self.register_owner(email="reset@example.com")
         known = self.client.post("/api/v1/auth/request-password-reset", json={"email": "reset@example.com"})
         unknown = self.client.post("/api/v1/auth/request-password-reset", json={"email": "nadie@example.com"})
-        self.assertEqual((known.status_code, unknown.status_code), (200, 200))
-        self.assertNotIn("debug_code", known.json())
-        self.assertEqual(known.json()["message"], unknown.json()["message"])
+        self.assertEqual((known.status_code, unknown.status_code), (409, 409))
+        self.assertNotIn("debug_code", known.text)
+        self.assertEqual(known.json()["detail"], unknown.json()["detail"])
         bad = self.client.post("/api/v1/auth/verify-reset-code", json={"email": "reset@example.com", "code": "000000"})
         self.assertEqual(bad.status_code, 400)
     # ── loan / payment math ────────────────────────────────────────────────

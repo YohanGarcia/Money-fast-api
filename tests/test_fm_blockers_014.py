@@ -191,3 +191,16 @@ class RecoveryAndRegistrationTests(legacy.MoneyFastApiTests):
             self.login('admin@nueva.com', 'ClaveInicial-2026!')['access_token'])).json()
         self.assertEqual(me['role'], 'admin')
         self.assertIsNone(re.search(r'password', str(me)))
+
+    def test_recovery_is_honestly_unavailable_while_smtp_is_not_configured(self):
+        from app.modules.identity.notifications import SmtpSecretNotifier
+        app.dependency_overrides[get_notifier] = lambda: SmtpSecretNotifier()
+        with patch.object(settings, 'smtp_host', ''), patch.object(settings, 'smtp_user', ''), \
+                patch.object(settings, 'smtp_password', ''):
+            known = self.client.post('/api/v1/auth/request-password-reset', json=dict(email='owner@example.com'))
+            unknown = self.client.post('/api/v1/auth/request-password-reset', json=dict(email='nadie@example.com'))
+        self.assertEqual((known.status_code, unknown.status_code), (409, 409))
+        self.assertEqual(known.json()['detail'], unknown.json()['detail'])
+        self.assertIn('no esta disponible', known.json()['detail'])
+        with SessionLocal() as db:  # nothing was issued
+            self.assertEqual(db.scalars(select(RecoveryToken.id)).all(), [])

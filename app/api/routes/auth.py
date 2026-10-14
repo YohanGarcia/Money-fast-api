@@ -14,10 +14,11 @@ from app.modules.identity import auth as auth_service
 from app.modules.identity import recovery, throttle
 from app.modules.identity.deps import client_ip
 from app.modules.identity.errors import RateLimited
-from app.modules.identity.notifications import SecretNotifier, get_notifier
+from app.modules.identity.notifications import SecretNotifier, SmtpSecretNotifier, get_notifier
 from app.modules.identity.onboarding import create_tenant_owner
 from app.schemas.auth import LoginInput, RefreshInput, RegisterInput, TokenPair
 from app.schemas.user import UserRead
+from app.services.email_service import smtp_configured
 
 router = APIRouter()
 S_REGISTER_IP = "register_ip"
@@ -73,7 +74,14 @@ def request_password_reset(
     db: Session = Depends(get_db),
     notifier: SecretNotifier = Depends(get_notifier),
 ) -> dict:
-    """Always the same answer for known and unknown e-mails; the code travels only by e-mail (never in the response)."""
+    """Always the same answer for known and unknown e-mails; the code travels only by e-mail (never in the response).
+    While no SMTP is configured the recovery is honestly UNAVAILABLE (409) for everybody, instead of pretending."""
+    if isinstance(notifier, SmtpSecretNotifier) and not smtp_configured():
+        raise HTTPException(
+            status_code=409,
+            detail="La recuperacion de contrasena por correo no esta disponible por el momento. "
+            "Contacta al administrador de tu empresa para restablecerla.",
+        )
     pending = recovery.request_code(db, email=payload.email, client_ip=client_ip(request))
     if pending is not None:
         background.add_task(recovery.deliver, pending, notifier)
