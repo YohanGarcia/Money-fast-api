@@ -37,7 +37,7 @@ class Route(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
-    assigned_collector = relationship("User", foreign_keys=[assigned_collector_id])
+    assigned_collector = relationship("UserAccount", foreign_keys=[assigned_collector_id])
     branch = relationship("Branch")
     company = relationship("Company")
     areas = relationship(

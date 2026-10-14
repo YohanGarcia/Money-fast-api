@@ -24,4 +24,76 @@ package = false
 [dependency-groups]
 dev = [
   "pytest>=8.3,<9",
+  "ruff>=0.16.9",
 ]
+
+# Lint/format apply to the T-001 foundation code only; legacy modules are not reformatted here.
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+include = [
+  "app/core/config/**/*.py",
+  "app/core/context/**/*.py",
+  "app/core/db/**/*.py",
+  "app/core/errors/**/*.py",
+  "app/core/logging/**/*.py",
+  "app/core/time/**/*.py",
+  "app/core/database.py",
+  "app/core/security/**/*.py",
+  "app/modules/**/*.py",
+  "app/shared/**/*.py",
+  "app/api/system.py",
+  "app/main.py",
+  "tests/pg_env.py",
+  "tests/conftest.py",
+  "tests/test_t001_foundation.py",
+  "tests/test_t002_identity.py",
+  "tests/test_t002_tenant_login.py",
+  "tests/test_t002_google.py",
+  "tests/test_t003_organization.py",
+  "tests/test_t004_customers.py",
+  "tests/test_t005_engine.py",
+  "tests/test_t005_credit_products.py",
+  "tests/test_t005_races.py",
+  "tests/test_t006_origination.py",
+  "tests/test_t007_disbursement.py",
+  "tests/test_t008_payments.py",
+  "tests/test_t009_payment_reversal.py",
+  "tests/test_t010_overdue_projection.py",
+  "tests/test_t011_collection_worklist.py",
+  "tests/test_t012_collection_assignment.py",
+  "tests/test_t021_cashpoint_session_lifecycle.py",
+  "tests/test_t021h_cash_idempotency_hardening.py",
+  "tests/test_t022a_cash_difference_resolution.py",
+  "tests/test_t023a_session_handover_opening.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "app.modules.identity.deps.require_permission"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_t0[0-9][0-9]_*.py" = ["F811"]  # pytest fixture re-use via import
+"tests/test_t005_credit_products.py" = ["E501"]  # long inline SQL literals
+"tests/test_t005_races.py" = ["E501"]  # long inline SQL literals
+"tests/test_t006_origination.py" = ["E501", "E731"]  # inline SQL literals, small test lambdas
+"app/modules/origination/models.py" = ["E501"]  # long inline SQL (immutability trigger functions)
+"app/modules/loans/*.py" = ["E501"]  # long inline SQL and messages
+"app/modules/field_custody/*.py" = ["E501"]  # long inline SQL (guard and consistency trigger functions)
+"app/modules/cash/port.py" = ["E501"]  # long BLOCKED_BY_EVIDENCE message
+"app/modules/cash/ddl.py" = ["E501"]  # long inline SQL (T-021 lifecycle and consistency trigger functions)
+"app/modules/cash/difference_ddl.py" = ["E501"]  # long inline SQL (T-022A resolution guard and consistency functions)
+"app/modules/cash/handover_ddl.py" = ["E501"]  # long inline SQL (T-023A handover guard and consistency functions)
+"app/modules/cash/errors.py" = ["E501"]  # long user-facing messages
+"tests/test_t021_cashpoint_session_lifecycle.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t021h_cash_idempotency_hardening.py" = ["E501", "E731", "F811"]  # inline SQL, small lambdas, fixture re-use via import
+"tests/test_t022a_cash_difference_resolution.py" = ["E501", "E731", "F811"]  # inline SQL, small lambdas, fixture re-use via import
+"tests/test_t023a_session_handover_opening.py" = ["E501", "E731", "F811"]  # inline SQL, small lambdas, fixture re-use via import
+"tests/test_t007_disbursement.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t008_payments.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t009_payment_reversal.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t010_overdue_projection.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t011_collection_worklist.py" = ["E501", "E731"]  # inline SQL literals
+"tests/test_t012_collection_assignment.py" = ["E501", "E731"]  # inline SQL literals

@@ -1,20 +1,5 @@
-from sqlalchemy import create_engine, make_url
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+"""Compatibility alias for legacy imports; the implementation lives in ``app.core.db``."""
 
-from app.core.config import settings
+from app.core.db import Base, SessionLocal, engine
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-engine = create_engine(
-    settings.database_url,
-    connect_args=(
-        {"check_same_thread": False}
-        if make_url(settings.database_url).get_backend_name() == "sqlite"
-        else {}
-    ),
-)
-
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+__all__ = ["Base", "SessionLocal", "engine"]

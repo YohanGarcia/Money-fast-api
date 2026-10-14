@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, delete
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_superadmin
@@ -12,6 +12,7 @@ from app.models.customer import Customer
 from app.models.loan import Loan
 from app.models.plan import Plan
 from app.models.subscription import Subscription, SubscriptionStatus
+from app.modules.identity.tenant import unique_slug
 from app.models.user import User, UserRole
 from app.core.security import get_password_hash
 from app.schemas.subscription import PlatformOverview
@@ -106,8 +107,8 @@ def platform_overview(
     soon_limit = now + timedelta(days=7)
 
     def _as_aware(dt: datetime) -> datetime:
-        # SQLite returns naive datetimes; assume they are UTC so comparisons
-        # against timezone-aware ``now`` don't raise.
+        # Defensive: treat naive datetimes as UTC so comparisons against
+        # timezone-aware ``now`` never raise.
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
     expiring = [
@@ -140,6 +141,7 @@ def create_company(
 
     company = Company(
         name=payload.name.strip(),
+        slug=unique_slug(db, payload.name),
         tax_id=payload.tax_id.strip(),
         address=payload.address.strip(),
         phone=payload.phone.strip(),
@@ -215,9 +217,31 @@ def delete_company(
             detail="La empresa tiene datos. Desactívala en vez de borrarla.",
         )
 
+    from app.modules.customers.models import CustomerProfile
+
+    if db.scalar(select(func.count()).select_from(CustomerProfile).where(CustomerProfile.tenant_id == company_id)):
+        raise HTTPException(status_code=400, detail="La empresa tiene datos. Desactivala en vez de borrarla.")
+
     # Safe to remove: drop its users and subscriptions, then the company.
+    # Identity rows hang off the tenant: assignments/tokens first, then users, roles and persons.
+    from app.modules.identity.models import Person, RecoveryToken, Role, RolePermission, UserRoleAssignment
+    user_ids = [u.id for u in db.scalars(select(User).where(User.company_id == company_id)).all()]
+    if user_ids:
+        db.execute(delete(UserRoleAssignment).where(UserRoleAssignment.user_id.in_(user_ids)))
+        db.execute(delete(RecoveryToken).where(RecoveryToken.user_id.in_(user_ids)))
     for user in db.scalars(select(User).where(User.company_id == company_id)).all():
         db.delete(user)
+    db.flush()
+    role_ids = list(db.scalars(select(Role.id).where(Role.tenant_id == company_id)))
+    if role_ids:
+        db.execute(delete(RolePermission).where(RolePermission.role_id.in_(role_ids)))
+        db.execute(delete(Role).where(Role.id.in_(role_ids)))
+    db.execute(delete(Person).where(Person.tenant_id == company_id))
+    from app.modules.organization.models import CashPoint, CashPointCurrency, TenantCurrency
+
+    db.execute(delete(CashPointCurrency).where(CashPointCurrency.tenant_id == company_id))
+    db.execute(delete(CashPoint).where(CashPoint.tenant_id == company_id))
+    db.execute(delete(TenantCurrency).where(TenantCurrency.tenant_id == company_id))  # base-currency FK is deferred
     for sub in db.scalars(select(Subscription).where(Subscription.company_id == company_id)).all():
         db.delete(sub)
     db.delete(company)

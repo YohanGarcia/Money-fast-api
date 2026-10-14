@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.cash import Proof
+
 
 class CommissionRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -20,7 +22,13 @@ class PayrollConfigUpdate(BaseModel):
 class PayrollPaymentCreate(BaseModel):
     user_id: int
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
-    source: Literal["cash", "capital"]
+    # ``capital`` is accepted by the schema only to answer a clear refusal: new payments never draw from Capital
+    source: Literal["cash", "bank", "capital"]
+    idempotency_key: str | None = Field(default=None, min_length=12, max_length=80)
+    bank_account_id: int | None = Field(default=None, gt=0)
+    session_id: int | None = Field(default=None, gt=0)  # the open cash session to pay from (cash source)
+    reference: str = Field(default="", max_length=160)  # bank operation / receipt number
+    proof: Proof | None = None
     period_start: date | None = None
     period_end: date | None = None
     branch_id: int | None = None

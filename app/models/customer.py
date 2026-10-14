@@ -54,8 +54,8 @@ class Customer(Base):
     cash_branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
-    created_by = relationship("User", foreign_keys=[created_by_id])
-    assigned_collector = relationship("User", foreign_keys=[assigned_collector_id])
+    created_by = relationship("UserAccount", foreign_keys=[created_by_id])
+    assigned_collector = relationship("UserAccount", foreign_keys=[assigned_collector_id])
     route = relationship("Route", foreign_keys=[route_id])
     loans = relationship("Loan", back_populates="customer")
     company = relationship("Company")

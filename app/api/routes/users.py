@@ -17,6 +17,9 @@ from app.core.security import get_password_hash
 from app.models.branch import Branch
 from app.models.location_ping import LocationPing
 from app.models.user import User, UserRole
+from app.modules.identity.audit import record_event
+from app.modules.identity.auth import revoke_user_sessions
+from app.modules.identity.catalog import ensure_person, sync_cashier_assignment
 from app.schemas.user import UserCreate, UserRead, UserUpdate
 from app.services.plan_limits import enforce_can_create
 from app.services.route_service import haversine_km
@@ -214,7 +217,7 @@ def create_user(
     current_user: User = Depends(require_admin),
     company_id: int = Depends(get_company_id),
 ) -> User:
-    existing = db.scalar(select(User).where(User.email == payload.email.lower()))
+    existing = db.scalar(select(User).where(User.email == payload.email.lower(), User.company_id == company_id))
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
@@ -234,6 +237,11 @@ def create_user(
         branch_id=_validate_branch(db, payload.branch_id, company_id),
     )
     db.add(user)
+    db.flush()
+    ensure_person(db, user)
+    sync_cashier_assignment(db, user, current_user.id)
+    record_event(db, "user.created", tenant_id=company_id, actor_id=current_user.id, subject_id=user.id,
+                 details={"via": "legacy_api_v1"})
     db.commit()
     db.refresh(user)
     return user
@@ -251,7 +259,11 @@ def update_user(
     if user is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
 
-    existing = db.scalar(select(User).where(User.email == payload.email.lower(), User.id != user_id))
+    if user.role is None:
+        raise HTTPException(409, "Este usuario se administra con la API v2 (identidad y roles).")
+    existing = db.scalar(
+        select(User).where(User.email == payload.email.lower(), User.id != user_id, User.company_id == company_id)
+    )
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
 
@@ -263,13 +275,34 @@ def update_user(
     if payload.branch_id != user.branch_id or payload.role != user.role or not payload.is_active:
         db.execute(update(User).where(User.id == user.id).values(full_name=User.full_name))
         if user_has_pending(db, user): raise HTTPException(409, 'Resuelve los saldos, transferencias y entregas pendientes antes de cambiar este usuario.')
+        if not payload.is_active and user.is_active:  # T-019: modern field custody (additive to the legacy check)
+            from app.modules.field_custody.errors import OutstandingFieldCustody
+            from app.modules.field_custody.service import has_open_custody
+            if has_open_custody(db, company_id, user.id): raise HTTPException(409, OutstandingFieldCustody.default_message)
+            from app.modules.cash.errors import UserHasCashResponsibility  # T-023A: same guard as v2 disable_user
+            from app.modules.cash.sessions import has_cash_responsibility
+            if has_cash_responsibility(db, company_id, user.id): raise HTTPException(409, UserHasCashResponsibility.default_message)
     user.full_name = payload.full_name.strip()
     user.email = payload.email.lower()
+    previous_status = user.status
+    if payload.role != user.role:
+        record_event(db, "legacy.role_changed", tenant_id=company_id, actor_id=current_user.id, subject_id=user.id,
+                     details={"from": str(user.role.value if user.role else None), "to": payload.role.value})
     user.role = payload.role
     user.is_active = payload.is_active
     user.branch_id = _validate_branch(db, payload.branch_id, company_id)
+    db.flush()
+    sync_cashier_assignment(db, user, current_user.id)
+    if previous_status != user.status:
+        revoked = revoke_user_sessions(db, user.id, "user_disabled" if user.status == "disabled" else "status_changed")
+        record_event(db, "user.disabled" if user.status == "disabled" else "user.enabled", tenant_id=company_id,
+                     actor_id=current_user.id, subject_id=user.id, details={"via": "legacy_api_v1", "sessions_revoked": revoked})
     if payload.password:
         user.password_hash = get_password_hash(payload.password)
+        user.password_changed_at = datetime.now(UTC)
+        revoked = revoke_user_sessions(db, user.id, "password_changed")
+        record_event(db, "password.changed", tenant_id=company_id, actor_id=current_user.id, subject_id=user.id,
+                     details={"via": "legacy_api_v1_admin_reset", "sessions_revoked": revoked})
 
     db.commit()
     db.refresh(user)

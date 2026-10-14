@@ -53,7 +53,7 @@ def subscription_is_current(company: Company) -> bool:
     """True when the company's paid subscription has not expired.
 
     A missing expiry (free tier, or never subscribed) counts as current — the
-    free plan never expires. Naive datetimes from SQLite are treated as UTC.
+    free plan never expires. Naive datetimes are treated as UTC.
     """
     exp = company.subscription_expires_at
     if exp is None:

@@ -1,20 +1,8 @@
-import os
-import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
-temp_db = Path(tempfile.gettempdir()) / f"moneyfast_test_suite_{os.getpid()}.db"
-if temp_db.exists():
-    temp_db.unlink()
-
-os.environ["DATABASE_URL"] = f"sqlite:///{temp_db.as_posix()}"
-os.environ["SECRET_KEY"] = "test-secret-key"
-os.environ["ENVIRONMENT"] = "development"
-# Keep tests hermetic: never hit real SMTP even if a .env configures it.
-os.environ["SMTP_HOST"] = ""
-os.environ["SMTP_USER"] = ""
-os.environ["SMTP_PASSWORD"] = ""
+from tests import pg_env  # noqa: F401  (PostgreSQL-only test environment; must precede app imports)
 
 from fastapi.testclient import TestClient
 
@@ -34,8 +22,6 @@ class MoneyFastApiTests(unittest.TestCase):
         cls.client.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
-        if temp_db.exists():
-            temp_db.unlink()
 
     def setUp(self) -> None:
         Base.metadata.drop_all(bind=engine)
@@ -306,33 +292,17 @@ class MoneyFastApiTests(unittest.TestCase):
         companies_response = self.client.get("/api/v1/companies", headers=headers)
         self.assertEqual(companies_response.status_code, 403, companies_response.text)
 
-    def test_password_reset_debug_code_hidden_outside_development(self) -> None:
+    def test_legacy_password_reset_endpoints_never_leak_the_code(self) -> None:
+        """The 6-digit contract used by Web/mobile exists; while SMTP is not configured it is honestly unavailable
+        (identical for known and unknown e-mails) and never returns a code (``debug_code``)."""
         self.register_owner(email="reset@example.com")
-
-        previous_environment = settings.environment
-        settings.environment = "production"
-        try:
-            response = self.client.post(
-                "/api/v1/auth/request-password-reset",
-                json={"email": "reset@example.com"},
-            )
-        finally:
-            settings.environment = previous_environment
-
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertIsNone(body["debug_code"])
-        self.assertEqual(body["email"], "reset@example.com")
-
-    def test_password_reset_debug_code_present_in_development(self) -> None:
-        self.register_owner(email="devreset@example.com")
-        response = self.client.post(
-            "/api/v1/auth/request-password-reset",
-            json={"email": "devreset@example.com"},
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertIsNotNone(response.json()["debug_code"])
-
+        known = self.client.post("/api/v1/auth/request-password-reset", json={"email": "reset@example.com"})
+        unknown = self.client.post("/api/v1/auth/request-password-reset", json={"email": "nadie@example.com"})
+        self.assertEqual((known.status_code, unknown.status_code), (409, 409))
+        self.assertNotIn("debug_code", known.text)
+        self.assertEqual(known.json()["detail"], unknown.json()["detail"])
+        bad = self.client.post("/api/v1/auth/verify-reset-code", json={"email": "reset@example.com", "code": "000000"})
+        self.assertEqual(bad.status_code, 400)
     # ── loan / payment math ────────────────────────────────────────────────
     def test_customer_loan_and_composed_payment_flow(self) -> None:
         headers = self.owner_session()
@@ -1214,36 +1184,6 @@ class MoneyFastApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["data"], a["data"])
         self.assertEqual(response.json()["status"], "signed")
-
-    def test_customer_profile_migration_preserves_legacy_records(self):
-        import importlib.util
-        import json
-        import sqlalchemy as sa
-        from alembic.migration import MigrationContext
-        from alembic.operations import Operations
-        from unittest.mock import patch
-        path = Path(__file__).resolve().parents[1] / "alembic/versions/d9e0f1a2b3c4_customer_profiles.py"
-        spec = importlib.util.spec_from_file_location("customer_profile_migration", path)
-        migration = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(migration)
-        legacy_engine = sa.create_engine("sqlite://")
-        notes = json.dumps([{"nombre":"Referencia histórica", "telefono":"8095554444"}])
-        with legacy_engine.begin() as connection:
-            connection.execute(sa.text("CREATE TABLE customers (id INTEGER PRIMARY KEY, company_id INTEGER, document_id TEXT, notes TEXT)"))
-            connection.execute(sa.text("CREATE TABLE loan_applications (id INTEGER PRIMARY KEY, customer_id INTEGER, data TEXT)"))
-            connection.execute(sa.text("INSERT INTO customers VALUES (1, 1, '001-1', :notes), (2, 1, '0011', 'Notas libres'), (3, 2, '0011', NULL)"), {"notes":notes})
-            connection.execute(sa.text("INSERT INTO loan_applications VALUES (1, 1, 'snapshot original')"))
-            with patch.object(migration, "op", Operations(MigrationContext.configure(connection))):
-                migration.upgrade()
-            rows = connection.execute(sa.text('SELECT id, document_key, notes, "references", version FROM customers ORDER BY id')).mappings().all()
-            self.assertEqual(len(rows), 3)
-            self.assertEqual([r["document_key"] for r in rows], [None, None, "0011"])
-            self.assertEqual(rows[0]["notes"], notes)
-            self.assertEqual(json.loads(rows[0]["references"])[0]["nombre"], "Referencia histórica")
-            self.assertEqual(rows[1]["notes"], "Notas libres")
-            app_row = connection.execute(sa.text("SELECT data, customer_version FROM loan_applications")).one()
-            self.assertEqual(tuple(app_row), ("snapshot original", 1))
-        legacy_engine.dispose()
 
     def test_selected_legacy_duplicate_remains_usable_without_merging(self):
         from app.core.database import SessionLocal

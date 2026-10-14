@@ -41,8 +41,11 @@ def commit(db, fn):
         db.info.pop('cash_notifications', None)
         db.rollback();raise
 
+PRIVATE_COLUMNS=('proof','payload','open_idempotency_key','open_request_digest','close_idempotency_key','close_request_digest',
+                 'accept_idempotency_key','accept_request_digest')
+
 def public(row):
-    data={c.name:getattr(row,c.name) for c in row.__table__.columns if c.name not in ('proof','payload')}
+    data={c.name:getattr(row,c.name) for c in row.__table__.columns if c.name not in PRIVATE_COLUMNS}
     if hasattr(row,'proof'): data['has_proof']=bool(row.proof)
     return jsonable_encoder(data)
 
@@ -119,7 +122,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values() if u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users]
         candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
         loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
-        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','opening_review','closing_review','closing_transfer_pending')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
+        data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','closing')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
           expected_opening='0.00',
@@ -135,7 +138,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         branch_rows=[]
         consolidated=svc.ZERO
         for candidate in boxes:
-            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','opening_review','closing_review','closing_transfer_pending']))).all()),svc.ZERO)
+            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','closing']))).all()),svc.ZERO)
             consolidated += amount
             branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount)})
         data['cash_boxes']=branch_rows
@@ -205,12 +208,23 @@ def receipt(delivery_id:int,branch_id:int|None=None,db:Session=Depends(get_db),u
     return {'html':'<html><head><meta charset="utf-8"><title>Comprobante de entrega</title></head><body><h1>Comprobante ENT-'+str(d.id)+'</h1>'+''.join('<p><b>'+escape(k)+': </b>'+escape(str(v))+'</p>' for k,v in fields.items())+'</body></html>'}
 
 
+def custody_receipt_visible(user, transfer):
+    """Who may read the receipt of a closing hand-over to capital (F17).
+
+    Supervision (admin/manager; ``svc.scope`` already confines them to the box's company/branch) and the PARTIES of
+    the hand-over (the closing cashier and the named receiver), whatever their legacy role. Any other cashier or
+    collector of the branch is denied exactly like a missing receipt (same 404, same body)."""
+    if user.role in ('admin', 'manager'):
+        return True
+    return user.id in (transfer.from_user_id, transfer.to_user_id)
+
+
 @router.get('/custody-receipt/{transfer_id}')
 def custody_receipt(transfer_id:int,branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
     box=svc.scope(db,user,branch_id)
     transfer=db.get(CashCustodyTransfer,transfer_id)
     if not transfer or transfer.box_id!=box.id or transfer.state!='confirmed': svc.fail('Comprobante de custodia no encontrado.',404)
-    if user.role=='cashier' and user.id not in (transfer.from_user_id,transfer.to_user_id): svc.fail('Comprobante de custodia no encontrado.',404)
+    if not custody_receipt_visible(user,transfer): svc.fail('Comprobante de custodia no encontrado.',404)
     names={u.id:u.full_name for u in db.scalars(select(User).where(User.company_id==user.company_id)).all()}
     fields={'Empresa':db.get(Company,user.company_id).name,'Sucursal':db.get(Branch,box.branch_id).name,'Jornada':transfer.session_id,'Tipo':transfer.kind,'Entrega':names.get(transfer.from_user_id,'Usuario histórico'),'Recepción':names.get(transfer.to_user_id,'Usuario histórico'),'Importe RD$':transfer.amount,'Aceptado por':names.get(transfer.accepted_by,'Usuario histórico'),'Fecha de aceptación':transfer.accepted_at,'Identificador de aceptación':transfer.acceptance_id,'Método':transfer.acceptance_method,'Observación':transfer.notes}
     return {'html':'<html><head><meta charset="utf-8"><title>Comprobante de custodia</title></head><body><h1>Comprobante CUST-'+str(transfer.id)+'</h1>'+''.join('<p><b>'+escape(k)+': </b>'+escape(str(v))+'</p>' for k,v in fields.items())+'</body></html>'}
@@ -225,3 +239,32 @@ def proof(kind:str,target_id:int,branch_id:int|None=None,inline:bool=False,db:Se
     if not row.proof:svc.fail('Sin comprobante.',404)
     disposition = 'inline' if inline else 'attachment'
     return Response(base64.b64decode(row.proof['content_base64']),media_type=row.proof['media_type'],headers={'Content-Disposition':f'{disposition}; filename="comprobante"','X-Content-Type-Options':'nosniff'})
+
+
+def _local(value):
+    if value is None: return None
+    return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(svc.TZ).isoformat()
+
+
+@router.get('/sessions/{session_id}/ticket')
+def session_ticket(session_id:int,kind:str='opening',branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+    """FM-SIMPLE-CASH-010: data of the opening / closing ticket, built ONLY from the persisted session (so a reprint is
+    identical and a failed print never needs a second financial write). Cashier: own sessions; admin/manager: their scope."""
+    svc.require_role(user,'admin','cashier','manager')
+    if kind not in ('opening','closing'): svc.fail('Tipo de ticket inválido.')
+    box=svc.scope(db,user,branch_id)
+    s=db.get(CashSession,session_id)
+    if not s or s.box_id!=box.id or (user.role=='cashier' and s.cashier_id!=user.id): svc.fail('Jornada no encontrada.',404)
+    if kind=='closing' and s.state!='closed': svc.fail('La jornada aún no está cerrada.',409)
+    names={u.id:u.full_name for u in db.scalars(select(User).where(User.company_id==user.company_id)).all()}
+    snap=s.snapshot or {}
+    data=dict(title='APERTURA DE CAJA' if kind=='opening' else 'CIERRE DE CAJA',kind=kind,brand='FACT MONEY',
+        ticket_number=f'J-{s.id:06d}',session_id=s.id,company=db.get(Company,user.company_id).name,branch=db.get(Branch,box.branch_id).name,
+        cashier=names.get(s.cashier_id,'Usuario histórico'),opening_source=s.opening_source,simple=s.opening_source=='initial',
+        opened_at=_local(s.opened_at),initial_amount=str(s.opening_expected))
+    if kind=='closing':
+        diff=s.difference or svc.ZERO
+        data.update(closed_at=_local(s.closed_at),closed_by=names.get(s.closed_by,'Usuario histórico'),
+            incoming=snap.get('incoming'),outgoing=snap.get('outgoing'),additions=snap.get('additions'),expected=str(s.closing_expected),counted=str(s.counted),
+            difference=str(diff),result='EXACTO' if diff==0 else ('SOBRANTE' if diff>0 else 'FALTANTE'))
+    return data

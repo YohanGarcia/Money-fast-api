@@ -14,6 +14,8 @@ class RegisterInput(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     company_name: str = Field(min_length=1, max_length=160)
+    # Optional public tenant identifier (login context); generated from the company name when omitted.
+    tenant_slug: str | None = Field(default=None, min_length=1, max_length=63)
 
     @field_validator("company_name", mode="before")
     @classmethod
@@ -40,30 +42,3 @@ class TokenPair(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: UserRead
-
-
-class PasswordResetRequestInput(BaseModel):
-    email: EmailStr
-
-
-class PasswordResetRequestOutput(BaseModel):
-    message: str
-    email: str
-    # Only populated in development (when SMTP is not configured) to ease testing.
-    # Always null in production.
-    debug_code: str | None = None
-
-
-class VerifyResetCodeInput(BaseModel):
-    email: EmailStr
-    code: str = Field(min_length=6, max_length=6)
-
-
-class VerifyResetCodeOutput(BaseModel):
-    reset_token: str
-    message: str
-
-
-class ResetPasswordInput(BaseModel):
-    reset_token: str
-    new_password: str = Field(min_length=8, max_length=128)

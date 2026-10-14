@@ -22,9 +22,10 @@ class Proof(BaseModel):
 
 class CashCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['open','movement','declare','receive','receive_collector','reject_delivery','close','resolve','confirm_closing_transfer','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','confirm_surplus','reject_surplus']
+    action: Literal['open','movement','declare','receive','receive_collector','reject_delivery','close','resolve','confirm_closing_transfer','reverse','confirm_transfer','reject_transfer','disburse','report_surplus','cash_addition','confirm_surplus','reject_surplus']
     branch_id: int | None = None
     session_id: int | None = Field(default=None, gt=0)
+    cash_point_id: int | None = Field(default=None, gt=0)  # T-021: the cash position to open (default: the box's base one)
     receiver_id: int | None = Field(default=None, gt=0)
     idempotency_key: str = Field(min_length=12, max_length=80)
     version: int | None = None
@@ -35,6 +36,9 @@ class CashCommand(BaseModel):
     reference: str = Field(default='', max_length=160)
     kind: Literal['contribution','expense','withdrawal','bank_deposit'] | None = None
     capital: bool = False
+    # FM-SIMPLE-CASH-010: 'initial' opens with a declared amount (no capital); `counted` is the money counted at a simple close
+    opening_mode: Literal['initial','capital'] | None = None
+    counted: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
     resolution: Literal['approve','return'] | None = None
     denominations: dict[str,StrictInt] = Field(default_factory=dict)
     method: Literal['cash','transfer','check'] = 'cash'

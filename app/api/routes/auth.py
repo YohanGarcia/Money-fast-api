@@ -1,274 +1,144 @@
-from datetime import UTC, datetime, timedelta
-import secrets
+"""LEGACY /api/v1/auth. Login/refresh/logout share the v2 authentication service (throttling, session revocation,
+audit). Password recovery here is the 6-digit-code contract used by the Web and mobile clients; it is backed by the
+same hardened recovery service as /api/v2/auth/recovery/*."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from jose import JWTError
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
-from app.core.security import (
-    create_access_token,
-    create_password_reset_token,
-    create_refresh_token,
-    decode_token,
-    get_password_hash,
-    hash_token,
-    verify_password,
-    verify_token_hash,
-)
-from app.models.company import Company
-from app.models.password_reset import PasswordResetCode
-from app.models.session import UserSession
-from app.models.user import User, UserRole
-from app.services.email_service import send_reset_code_email
-from app.services.plan_limits import get_free_plan
-from app.schemas.auth import (
-    LoginInput,
-    PasswordResetRequestInput,
-    PasswordResetRequestOutput,
-    RefreshInput,
-    RegisterInput,
-    ResetPasswordInput,
-    TokenPair,
-    VerifyResetCodeInput,
-    VerifyResetCodeOutput,
-)
+from app.core.time import now_utc
+from app.models.user import User
+from app.modules.identity import auth as auth_service
+from app.modules.identity import recovery, throttle
+from app.modules.identity.deps import client_ip
+from app.modules.identity.errors import RateLimited
+from app.modules.identity.notifications import SecretNotifier, SmtpSecretNotifier, get_notifier
+from app.modules.identity.onboarding import create_tenant_owner
+from app.schemas.auth import LoginInput, RefreshInput, RegisterInput, TokenPair
 from app.schemas.user import UserRead
+from app.services.email_service import smtp_configured
 
 router = APIRouter()
-
-
-def _utc_now_naive() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+S_REGISTER_IP = "register_ip"
 
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterInput, db: Session = Depends(get_db)) -> User:
-    """Self-service onboarding.
-
-    Creates a new company and its owner. The owner is always an ``admin`` of the
-    new company — the role can never be chosen by the client. Additional users
-    (managers, collectors) are created afterwards from the authenticated
-    ``POST /users`` endpoint by that admin.
-    """
-    email = payload.email.lower().strip()
-    existing = db.scalar(select(User).where(User.email == email))
-    if existing:
-        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
-
-    company_name = payload.company_name
-    free_plan = get_free_plan(db)
-    company = Company(name=company_name, plan_id=free_plan.id if free_plan else None)
-    db.add(company)
-    db.flush()
-
-    user = User(
-        full_name=payload.full_name.strip(),
-        email=email,
-        password_hash=get_password_hash(payload.password),
-        role=UserRole.admin,
-        company_id=company.id,
-    )
-    db.add(user)
+def register(payload: RegisterInput, request: Request, db: Session = Depends(get_db)) -> User:
+    """Self-service registration of a NEW company: the caller becomes the administrator of that company. It never
+    joins an existing company and never creates employees (those are created by an administrator in /users).
+    PUBLIC_REGISTRATION=false is a kill-switch; per-IP throttling limits abuse."""
+    if not settings.registration_open:
+        raise HTTPException(status_code=403, detail="El registro de nuevas empresas esta temporalmente deshabilitado.")
+    ip = client_ip(request) or "unknown"
+    now = now_utc()
+    wait = throttle.retry_after(db, S_REGISTER_IP, ip, now)
+    if wait:
+        raise RateLimited(wait)
+    throttle.register_failure(db, S_REGISTER_IP, ip, settings.register_max_per_ip, now)
     db.commit()
-    db.refresh(user)
-    return user
+    return create_tenant_owner(
+        db,
+        full_name=payload.full_name,
+        email=payload.email,
+        password=payload.password,
+        company_name=payload.company_name,
+        tenant_slug=payload.tenant_slug,
+        client_ip=ip,
+    )
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyResetCode(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+
+
+class ResetPassword(BaseModel):
+    reset_token: str = Field(min_length=20, max_length=200)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+GENERIC_RESET_MESSAGE = "Si el correo esta registrado, te enviaremos un codigo de verificacion."
+
+
+@router.post("/request-password-reset")
+def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    notifier: SecretNotifier = Depends(get_notifier),
+) -> dict:
+    """Always the same answer for known and unknown e-mails; the code travels only by e-mail (never in the response).
+    While no SMTP is configured the recovery is honestly UNAVAILABLE (409) for everybody, instead of pretending."""
+    if isinstance(notifier, SmtpSecretNotifier) and not smtp_configured():
+        raise HTTPException(
+            status_code=409,
+            detail="La recuperacion de contrasena por correo no esta disponible por el momento. "
+            "Contacta al administrador de tu empresa para restablecerla.",
+        )
+    pending = recovery.request_code(db, email=payload.email, client_ip=client_ip(request))
+    if pending is not None:
+        background.add_task(recovery.deliver, pending, notifier)
+    return {"message": GENERIC_RESET_MESSAGE, "email": payload.email.lower().strip()}
+
+
+@router.post("/verify-reset-code")
+def verify_reset_code(payload: VerifyResetCode, request: Request, db: Session = Depends(get_db)) -> dict:
+    token = recovery.verify_code(db, email=payload.email, code=payload.code, client_ip=client_ip(request))
+    return {"reset_token": token, "message": "Codigo verificado."}
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset_password(payload: ResetPassword, request: Request, db: Session = Depends(get_db)) -> None:
+    recovery.complete_recovery(
+        db, token=payload.reset_token, new_password=payload.new_password, client_ip=client_ip(request)
+    )
+
+def _pair(result: auth_service.LoginResult) -> TokenPair:
+    return TokenPair(
+        access_token=result.access_token,
+        refresh_token=result.refresh_token,
+        user=UserRead.model_validate(result.user),
+    )
 
 
 @router.post("/login", response_model=TokenPair)
-def login(payload: LoginInput, db: Session = Depends(get_db)) -> TokenPair:
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    if user is None or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Credenciales invalidas.")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="El usuario esta inactivo.")
-
-    session = UserSession(user_id=user.id, device_name=payload.device_name)
-    db.add(session)
-    db.flush()
-
-    access_token = create_access_token(user.id, session.id)
-    refresh_token = create_refresh_token(user.id, session.id)
-
-    session.refresh_token_hash = hash_token(refresh_token)
-    session.last_seen_at = datetime.now(UTC)
-
-    db.commit()
-
-    return TokenPair(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserRead.model_validate(user),
+def login(payload: LoginInput, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    return _pair(
+        auth_service.login(
+            db, email=payload.email, password=payload.password, device_name=payload.device_name,
+            client_ip=client_ip(request), unscoped=True,
+        )
     )
 
 
 @router.post("/refresh", response_model=TokenPair)
-def refresh(payload: RefreshInput, db: Session = Depends(get_db)) -> TokenPair:
-    try:
-        claims = decode_token(payload.refresh_token)
-        user_id = claims.get("sub")
-        session_id = claims.get("sid")
-        token_type = claims.get("type")
-        session_id_int = int(session_id)
-        user_id_int = int(user_id)
-    except (JWTError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="Refresh token invalido.") from exc
-
-    if token_type != "refresh":
-        raise HTTPException(status_code=401, detail="Refresh token invalido.")
-
-    session = db.get(UserSession, session_id_int)
-    user = db.get(User, user_id_int)
-    if (
-        session is None
-        or user is None
-        or not session.is_active
-        or session.user_id != user.id
-        or not verify_token_hash(payload.refresh_token, session.refresh_token_hash)
-    ):
-        raise HTTPException(status_code=401, detail="La sesion no es valida.")
-
-    access_token = create_access_token(user.id, session.id)
-    refresh_token = create_refresh_token(user.id, session.id)
-    session.refresh_token_hash = hash_token(refresh_token)
-    session.last_seen_at = datetime.now(UTC)
-    db.commit()
-
-    return TokenPair(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserRead.model_validate(user),
-    )
+def refresh(payload: RefreshInput, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    return _pair(auth_service.refresh(db, refresh_token=payload.refresh_token, client_ip=client_ip(request)))
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(payload: RefreshInput, db: Session = Depends(get_db)) -> None:
+def logout(payload: RefreshInput, request: Request, db: Session = Depends(get_db)) -> None:
+    """Revokes the session named by the refresh token. Idempotent; an invalid token changes nothing."""
+    from app.models.session import UserSession  # local import: legacy module graph
+
     try:
-        claims = decode_token(payload.refresh_token)
-        session_id = claims.get("sid")
-        session_id_int = int(session_id)
-    except (JWTError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="Refresh token invalido.") from exc
-
-    session = db.get(UserSession, session_id_int)
-    if session is None:
+        user_id, session_id = auth_service._decode(payload.refresh_token, "refresh")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Refresh token invalido.") from None
+    session = db.get(UserSession, session_id)
+    if session is None or session.user_id != user_id:
         raise HTTPException(status_code=401, detail="Sesion no encontrada.")
-
-    session.is_active = False
-    db.commit()
+    user = db.get(User, user_id)
+    auth_service.logout(db, user, session, client_ip(request))
 
 
 @router.get("/me", response_model=UserRead)
 def me(current_user: User = Depends(get_current_user)) -> User:
     return current_user
-
-
-@router.post("/request-password-reset", response_model=PasswordResetRequestOutput)
-def request_password_reset(
-    payload: PasswordResetRequestInput,
-    db: Session = Depends(get_db),
-) -> PasswordResetRequestOutput:
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    generic_message = "Si el correo existe, enviamos un codigo de verificacion."
-
-    if user is None:
-        return PasswordResetRequestOutput(message=generic_message, email=payload.email.lower())
-
-    active_codes = db.scalars(
-        select(PasswordResetCode).where(
-            PasswordResetCode.user_id == user.id,
-            PasswordResetCode.is_used.is_(False),
-        )
-    ).all()
-    for item in active_codes:
-        item.is_used = True
-
-    raw_code = f"{secrets.randbelow(1000000):06d}"
-    reset_code = PasswordResetCode(
-        user_id=user.id,
-        code_hash=hash_token(raw_code),
-        expires_at=_utc_now_naive() + timedelta(minutes=15),
-    )
-    db.add(reset_code)
-    db.commit()
-
-    smtp_configured = bool(settings.smtp_host and settings.smtp_user and settings.smtp_password)
-    try:
-        send_reset_code_email(user.email, raw_code)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"No se pudo enviar el correo: {exc}",
-        ) from exc
-
-    # Expose the code only in development when there is no real email delivery.
-    debug_code = raw_code if (not settings.is_production and not smtp_configured) else None
-    return PasswordResetRequestOutput(message=generic_message, email=user.email, debug_code=debug_code)
-
-
-@router.post("/verify-reset-code", response_model=VerifyResetCodeOutput)
-def verify_reset_code(
-    payload: VerifyResetCodeInput,
-    db: Session = Depends(get_db),
-) -> VerifyResetCodeOutput:
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    if user is None:
-        raise HTTPException(status_code=404, detail="No existe una cuenta con ese correo.")
-
-    reset_code = db.scalar(
-        select(PasswordResetCode)
-        .where(
-            PasswordResetCode.user_id == user.id,
-            PasswordResetCode.is_used.is_(False),
-        )
-        .order_by(PasswordResetCode.created_at.desc())
-    )
-    if reset_code is None:
-        raise HTTPException(status_code=400, detail="No hay un codigo activo para este usuario.")
-    if reset_code.expires_at < _utc_now_naive():
-        raise HTTPException(status_code=400, detail="El codigo ha expirado.")
-    if not verify_token_hash(payload.code, reset_code.code_hash):
-        raise HTTPException(status_code=400, detail="El codigo es invalido.")
-
-    reset_token = create_password_reset_token(user.id, reset_code.id)
-    return VerifyResetCodeOutput(
-        reset_token=reset_token,
-        message="Codigo verificado correctamente.",
-    )
-
-
-@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
-def reset_password(
-    payload: ResetPasswordInput,
-    db: Session = Depends(get_db),
-) -> None:
-    try:
-        claims = decode_token(payload.reset_token)
-        user_id = claims.get("sub")
-        reset_code_id = claims.get("sid")
-        token_type = claims.get("type")
-        user_id_int = int(user_id)
-        reset_code_id_int = int(reset_code_id)
-    except (JWTError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="El token de recuperacion es invalido.") from exc
-
-    if token_type != "password_reset":
-        raise HTTPException(status_code=401, detail="El token de recuperacion es invalido.")
-
-    user = db.get(User, user_id_int)
-    reset_code = db.get(PasswordResetCode, reset_code_id_int)
-    if user is None or reset_code is None or reset_code.user_id != user.id:
-        raise HTTPException(status_code=404, detail="No se encontro la solicitud de recuperacion.")
-    if reset_code.is_used or reset_code.expires_at < _utc_now_naive():
-        raise HTTPException(status_code=400, detail="La solicitud de recuperacion ya no es valida.")
-
-    user.password_hash = get_password_hash(payload.new_password)
-    reset_code.is_used = True
-
-    sessions = db.scalars(select(UserSession).where(UserSession.user_id == user.id)).all()
-    for session in sessions:
-        session.is_active = False
-
-    db.commit()
