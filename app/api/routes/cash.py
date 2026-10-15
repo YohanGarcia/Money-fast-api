@@ -4,9 +4,9 @@ from html import escape
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 from xml.sax.saxutils import escape as xml_escape
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
@@ -77,8 +77,22 @@ def command(p:CashCommand,db:Session=Depends(get_db),user:User=Depends(get_curre
     return commit(db,lambda:svc.command(db,user,p))
 
 @router.get('/workspace')
-def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+def workspace(branch_id:int|None=None,history_limit:int=Query(200,ge=20,le=1000),db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+    """Branch cash workspace. The historical lists (payments, deliveries, transfers, sessions, movements, custody, audit)
+    carry the ``history_limit`` most recent rows PLUS everything still active (pending, open or closing), so the day-to-day
+    screens are complete while the payload stays bounded. ``truncated`` tells the web how many rows each list holds in all;
+    older history is read through the paged ``/cash/report``."""
     box=svc.scope(db,user,branch_id)
+    truncated={}
+    def bounded(name,model,where,active=None):
+        base=select(model).where(*where)
+        rows=list(db.scalars(base.order_by(model.id.desc()).limit(history_limit)).all())
+        if active is not None:
+            have={r.id for r in rows}
+            rows=sorted(rows+[r for r in db.scalars(base.where(active)).all() if r.id not in have],key=lambda r:-r.id)
+        total=db.scalar(select(func.count()).select_from(model).where(*where)) or 0
+        truncated[name]=dict(total=total,shown=len(rows))
+        return rows
     users={u.id:u for u in db.scalars(select(User).where(User.company_id==user.company_id)).all()}
     def enrich(row):
         result=public(row)
@@ -89,15 +103,19 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
             if uid: result[k+'_name']=users[uid].full_name if uid in users else 'Usuario histórico'
         return result
     mine=user.id if user.role=='collector' else None
-    payments=db.scalars(select(Payment).where(Payment.branch_id==box.branch_id).order_by(Payment.id.desc())).all()
-    if mine: payments=[p for p in payments if p.collected_by_id==mine]
-    deliveries=db.scalars(select(CashDelivery).where(CashDelivery.box_id==box.id).order_by(CashDelivery.id.desc())).all()
-    transfers=db.scalars(select(CashTransfer).where(CashTransfer.box_id==box.id).order_by(CashTransfer.id.desc())).all()
-    if mine:
-        deliveries=[d for d in deliveries if d.collector_id==mine]
-        transfers=[t for t in transfers if t.collector_id==mine]
-    bank_accounts=db.scalars(select(BankAccount).where(BankAccount.company_id==user.company_id,BankAccount.is_active==True).order_by(BankAccount.bank_name)).all()
     outstanding=svc.outstanding_rows(db,box,mine)
+    pay_where=[Payment.branch_id==box.branch_id]
+    del_where=[CashDelivery.box_id==box.id]
+    tr_where=[CashTransfer.box_id==box.id]
+    if mine:
+        pay_where.append(Payment.collected_by_id==mine)
+        del_where.append(CashDelivery.collector_id==mine)
+        tr_where.append(CashTransfer.collector_id==mine)
+    owed_ids=[p.id for p,_ in outstanding]
+    payments=bounded('payments',Payment,pay_where,Payment.id.in_(owed_ids) if owed_ids else None)
+    deliveries=bounded('deliveries',CashDelivery,del_where,CashDelivery.state.in_(['pending','surplus_review']))
+    transfers=bounded('transfers',CashTransfer,tr_where,CashTransfer.state=='pending')
+    bank_accounts=db.scalars(select(BankAccount).where(BankAccount.company_id==user.company_id,BankAccount.is_active==True).order_by(BankAccount.bank_name)).all()
     totals={}
     for p,amount in outstanding: totals[p.collected_by_id]=totals.get(p.collected_by_id,svc.ZERO)+amount
     data=dict(branch_id=box.branch_id,branch_name=db.get(Branch,box.branch_id).name,
@@ -109,14 +127,17 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
         outstanding=[dict(payment_id=p.id,collector_id=p.collected_by_id,loan_id=p.loan_id,paid_at=p.paid_at,amount=str(p.amount),pending=str(amount)) for p,amount in outstanding])
     if not mine:
         session=svc.active_session(db,box,False,user.id) if user.role=='cashier' else None
-        sessions=db.scalars(select(CashSession).where(CashSession.box_id==box.id).order_by(CashSession.id.desc())).all()
-        movements=db.scalars(select(CashMovement).where(CashMovement.box_id==box.id).order_by(CashMovement.id.desc())).all()
-        custody_transfers=db.scalars(select(CashCustodyTransfer).where(CashCustodyTransfer.box_id==box.id).order_by(CashCustodyTransfer.id.desc())).all()
+        ses_where=[CashSession.box_id==box.id]
+        mov_where=[CashMovement.box_id==box.id]
+        cus_where=[CashCustodyTransfer.box_id==box.id]
         if user.role == 'cashier':
-            sessions=[s for s in sessions if s.cashier_id==user.id]
-            session_ids={s.id for s in sessions}
-            movements=[m for m in movements if m.session_id in session_ids]
-            custody_transfers=[t for t in custody_transfers if t.to_user_id==user.id or t.from_user_id==user.id]
+            ses_where.append(CashSession.cashier_id==user.id)
+            mov_where.append(CashMovement.session_id.in_(select(CashSession.id).where(*ses_where)))
+            cus_where.append(or_(CashCustodyTransfer.to_user_id==user.id,CashCustodyTransfer.from_user_id==user.id))
+        live=select(CashSession.id).where(*ses_where,CashSession.state.in_(['open','closing']))
+        sessions=bounded('sessions',CashSession,ses_where,CashSession.state.in_(['open','closing']))
+        movements=bounded('movements',CashMovement,mov_where,CashMovement.session_id.in_(live))
+        custody_transfers=bounded('custody_transfers',CashCustodyTransfer,cus_where)
         last=sessions[0] if sessions else None
         historical_users={m.actor_id for m in movements}|{d.collector_id for d in deliveries}|{d.cashier_id for d in deliveries}
         # A user holding the "Notario" role is a legacy `collector` but never collects: keep it out of the cash lists.
@@ -129,7 +150,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
           expected_opening='0.00',
-          audit=[enrich(a) for a in db.scalars(select(CashAudit).where(CashAudit.box_id==box.id).order_by(CashAudit.id.desc())).all()])
+          audit=[enrich(a) for a in bounded('audit',CashAudit,[CashAudit.box_id==box.id])])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
         data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
     if not mine:
@@ -155,6 +176,7 @@ def workspace(branch_id:int|None=None,db:Session=Depends(get_db),user:User=Depen
             branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount)})
         data['cash_boxes']=branch_rows
         data['consolidated_balance']=str(consolidated)
+    data['truncated']=truncated
     return jsonable_encoder(data)
 
 def filtered_report(db,user,branch_id,start,end,collector_id,actor_id,kind,state):
