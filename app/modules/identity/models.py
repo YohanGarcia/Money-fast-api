@@ -379,6 +379,13 @@ class SecurityEvent(Base):
     correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # Activity log (migration 0030): what the company searches and filters by.
+    category: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    actor_role: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    branch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    entity_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    entity_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    summary: Mapped[str | None] = mapped_column(String(240), nullable=True)
 
 
 class ExternalIdentity(Base):

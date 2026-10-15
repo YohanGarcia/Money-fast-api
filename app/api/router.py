@@ -1,9 +1,10 @@
 from fastapi import APIRouter
 from app.api.routes import loan_applications, cash, credit_bureau
 
-from app.api.routes import auth, bank_accounts, billing, branches, companies, company_settings, customers, health, loan_settings, loans, payments, payroll, plans, platform, print_settings, reports, routes, subscriptions, tour_progress, users
+from app.api.routes import activity, auth, bank_accounts, billing, branches, companies, company_settings, customers, health, loan_settings, loans, payments, payroll, plans, platform, print_settings, reports, routes, subscriptions, tour_progress, users
 
 api_router = APIRouter()
+api_router.include_router(activity.router, prefix="/activity", tags=["activity"])
 api_router.include_router(cash.router, prefix="/cash", tags=["cash"])
 api_router.include_router(credit_bureau.router, prefix="/credit-bureau", tags=["credit-bureau"])
 api_router.include_router(loan_applications.router, prefix="/loan-applications", tags=["loan-applications"])

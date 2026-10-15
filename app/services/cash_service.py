@@ -233,11 +233,31 @@ def activate(db,user):
     for box in boxes: audit(db,box,user,'activated',historical_payments_excluded=True)
     return dict(enabled=True)
 
+_ACTION_LABELS={
+    'counter':'Cobró en ventanilla','receive_collector':'Recibió efectivo de un cobrador','reject_delivery':'Rechazó una entrega de cobrador',
+    'reject_addition':'Rechazó una solicitud de dinero','cash_addition':'Confirmó dinero que entra a la caja','cash_withdrawal':'Confirmó dinero que sale de la caja',
+    'open':'Abrió la caja','close':'Cerró la caja','declare':'Declaró una entrega a caja','receive':'Recibió efectivo de un cobrador',
+    'reverse':'Revirtió un movimiento de caja','confirm_surplus':'Confirmó un sobrante','reject_surplus':'Rechazó un sobrante',
+    'report_surplus':'Reportó un sobrante','confirm_transfer':'Confirmó una transferencia','reject_transfer':'Rechazó una transferencia',
+    'request_addition':'Solicitó dinero para una caja','cancel_addition':'Canceló una solicitud de dinero','disburse':'Desembolsó un préstamo',
+    'movement':'Registró un movimiento de caja','withdrawal':'Retiró dinero de la caja','contribution':'Registró un aporte a la caja','expense':'Registró un gasto','bank_deposit':'Registró un depósito bancario',
+    'confirm_addition':'Confirmó dinero que entra a la caja','confirm_withdrawal':'Confirmó dinero que sale de la caja',
+}
+
+
+def _audit_hint(action, kind=None):
+    from app.core import audit_changes
+
+    label=_ACTION_LABELS.get(str(kind)) if action=='movement' and kind else None
+    audit_changes.hint(label or _ACTION_LABELS.get(str(action)) or f'Operación de caja ({action})', entity_type='cash')
+
+
 def command(db,user,p):
     box=scope(db,user,p.branch_id,lock=True)
     old,digest=replay(db,user,p.idempotency_key,p.model_dump(mode='json',exclude_none=False,exclude={'opening_mode','counted'} if p.opening_mode is None and p.counted is None else set()))
     if old: return old
     action=p.action
+    _audit_hint(action, getattr(p, 'kind', None))
     if action=='resolve':
         # T-021 (DR-007): the difference is a separate record; a closed session is never reopened nor adjusted here.
         raise DifferenceReviewNotAvailable()

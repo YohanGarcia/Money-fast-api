@@ -7,6 +7,7 @@ from app.api import system
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.context.middleware import RequestContextMiddleware
+from app.core.audit_middleware import AuditMiddleware
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.modules.cash.api import router as cash_router
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["X-Total-Count", "X-Total-Amount"],
     )
+    application.add_middleware(AuditMiddleware)
     application.add_middleware(RequestContextMiddleware)
 
     @application.on_event("startup")
