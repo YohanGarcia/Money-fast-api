@@ -188,12 +188,21 @@ def build_workspace(db,user,branch_id,history_limit):
         branches={b.id:b.name for b in db.scalars(select(Branch).where(Branch.company_id==user.company_id)).all()}
         branch_rows=[]
         consolidated=svc.ZERO
+        closed_cash=svc.ZERO
         for candidate in boxes:
-            amount=sum((s.balance for s in db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','closing']))).all()),svc.ZERO)
+            live=db.scalars(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state.in_(['open','closing']))).all()
+            amount=sum((s.balance for s in live),svc.ZERO)
             consolidated += amount
-            branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount)})
+            # What the cashier counted at the box's last closed shift: it is still the money of a box with no open shift.
+            last=db.scalar(select(CashSession).where(CashSession.box_id==candidate.id,CashSession.state=='closed',CashSession.counted.is_not(None)).order_by(CashSession.closed_at.desc(),CashSession.id.desc()).limit(1))
+            counted=last.counted if (last is not None and not live) else None
+            if counted is not None: closed_cash += counted
+            branch_rows.append({'branch_id':candidate.branch_id,'branch_name':branches.get(candidate.branch_id,'Sucursal histórica'),'balance':str(amount),
+                'last_closed_counted':str(last.counted) if last is not None else None,'last_closed_at':last.closed_at if last is not None else None,
+                'last_closed_session_id':last.id if last is not None else None,'has_open_shift':bool(live)})
         data['cash_boxes']=branch_rows
         data['consolidated_balance']=str(consolidated)
+        data['closed_cash_total']=str(closed_cash)
     data['truncated']=truncated
     return jsonable_encoder(data)
 

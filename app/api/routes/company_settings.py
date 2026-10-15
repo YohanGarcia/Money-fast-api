@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_company_id, get_db, require_admin_manager
+from app.api.deps import get_company_id, get_db, require_admin
 from app.models.company import Company
 from app.models.company_settings import CompanySettings
 from app.schemas.company_settings import CompanySettingsRead, CompanySettingsUpdate
@@ -35,7 +35,7 @@ def update_company_settings(
     payload: CompanySettingsUpdate,
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
-    _=Depends(require_admin_manager),
+    _=Depends(require_admin),
 ) -> CompanySettings:
     s = get_or_create(db, company_id)
     for key, value in payload.model_dump().items():

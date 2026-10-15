@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_company_id, get_db, require_admin_manager
+from app.api.deps import get_company_id, get_db, require_admin
 from app.models.print_settings import PrintSettings
 from app.schemas.print_settings import PrintSettingsRead, PrintSettingsUpdate
 
@@ -32,7 +32,7 @@ def update_print_settings(
     payload: PrintSettingsUpdate,
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
-    _=Depends(require_admin_manager),
+    _=Depends(require_admin),
 ) -> PrintSettings:
     s = get_or_create(db, company_id)
     for key, value in payload.model_dump().items():

@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.db import get_session
@@ -27,6 +27,12 @@ Db = Depends(get_session)
 
 @router.post("/sessions/open")
 def open_session(body: OpenIn, request: Request, actor: Principal = Actor, db: Session = Db):
+    # The administration supervises the cash boxes: the shift is opened by the cashier of the box.
+    from app.models.user import User as AccountUser
+
+    account = db.get(AccountUser, actor.user_id)
+    if account is not None and str(getattr(account.role, "value", account.role)) in {"admin", "superadmin", "manager"}:
+        raise HTTPException(status_code=403, detail="La administración y la gerencia consultan la caja; la jornada la abre el cajero.")
     out = service.open_session(
         db,
         actor,
