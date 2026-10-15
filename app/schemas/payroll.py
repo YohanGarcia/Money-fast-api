@@ -35,3 +35,4 @@ class PayrollPaymentCreate(BaseModel):
     salary_part: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
     commission_part: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
     notes: str = Field(default="", max_length=2000)
+    allow_duplicate_period: bool = False  # confirm paying again a period already paid to this employee

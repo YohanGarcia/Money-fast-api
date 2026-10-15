@@ -27,6 +27,7 @@ from app.models.payroll import PayrollPayment
 from app.models.route import Route
 from app.models.user import User
 from app.services import cash_service as svc
+from app.services import payroll_service
 from app.services.xlsx import build_xlsx
 
 router = APIRouter()
@@ -135,7 +136,8 @@ def compute(db: Session, company_id: int, start: date, end: date, branch_id: int
 
     # ---- payroll (an employee belongs to a branch)
     payroll = select(func.coalesce(func.sum(PayrollPayment.amount), 0)).where(
-        PayrollPayment.company_id == company_id, PayrollPayment.created_at >= low, PayrollPayment.created_at < high
+        PayrollPayment.company_id == company_id, PayrollPayment.created_at >= low, PayrollPayment.created_at < high,
+        PayrollPayment.id.not_in(payroll_service.reversed_payroll_ids()),
     )
     if branch_id is not None:
         payroll = payroll.where(PayrollPayment.user_id.in_(select(User.id).where(User.branch_id == branch_id)))

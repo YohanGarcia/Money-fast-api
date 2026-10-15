@@ -41,7 +41,9 @@ def list_payroll(db: Session = Depends(get_db), company_id: int = Depends(get_co
     users = db.scalars(select(User).where(User.company_id == company_id, User.role.in_(EMPLOYEE_ROLES),
                                           User.is_active == True).order_by(User.full_name)).all()
     configs = {c.user_id: c for c in db.scalars(select(PayrollConfig).where(PayrollConfig.company_id == company_id)).all()}
-    return dict(employees=[dict(user_id=u.id, name=u.full_name, role=u.role, email=u.email,
+    # a "Notario" is a legacy collector that never collects: label it by its real role
+    return dict(employees=[dict(user_id=u.id, name=u.full_name,
+                                role="notary" if "Notario" in u.branch_roles else u.role, email=u.email,
                                 config=_config_dict(configs.get(u.id))) for u in users])
 
 
@@ -83,6 +85,7 @@ def list_payments(db: Session = Depends(get_db), company_id: int = Depends(get_c
                       .order_by(PayrollPayment.id.desc())).all()
     banks = {m.payroll_payment_id: m.account_label for m in db.scalars(
         select(BankAccountMovement).where(BankAccountMovement.company_id == company_id)).all()}
+    reversed_ids = set(db.scalars(select(payroll_service.reversed_payroll_ids().subquery().c.id)).all())
     return dict(payments=[dict(id=p.id, user_id=p.user_id, user_name=users.get(p.user_id, "—"),
                                amount=str(p.amount), source=p.source, salary_part=str(p.salary_part),
                                commission_part=str(p.commission_part), period_start=p.period_start,
@@ -90,7 +93,8 @@ def list_payments(db: Session = Depends(get_db), company_id: int = Depends(get_c
                                actor_name=users.get(p.actor_id, "—"), reference=p.reference or "",
                                has_proof=bool(p.proof), bank_account_id=p.bank_account_id,
                                bank_label=banks.get(p.id), cash_movement_id=p.cash_movement_id,
-                               historical_capital=p.source == "capital") for p in rows])
+                               historical_capital=p.source == "capital", reversed=p.id in reversed_ids)
+                         for p in rows])
 
 
 def _digest(payload: PayrollPaymentCreate, employee_branch_id) -> str:
@@ -140,6 +144,15 @@ def pay(payload: PayrollPaymentCreate, db: Session = Depends(get_db), company_id
     prior = existing()
     if prior is not None:
         return answer_existing(prior)
+    if payload.period_start and payload.period_end and not payload.allow_duplicate_period:
+        overlap = db.scalar(select(PayrollPayment.id).where(
+            PayrollPayment.company_id == company_id, PayrollPayment.user_id == employee.id,
+            PayrollPayment.period_start <= payload.period_end, PayrollPayment.period_end >= payload.period_start,
+            PayrollPayment.id.not_in(payroll_service.reversed_payroll_ids()),
+        ).limit(1))
+        if overlap is not None:
+            raise HTTPException(409, "Ya existe un pago de nómina para este empleado en ese periodo. "
+                                     "Confirma si de verdad quieres pagarlo otra vez.")
 
     note = f"Nómina: {employee.full_name}" + (f" — {payload.notes}" if payload.notes else "")
     row = PayrollPayment(company_id=company_id, user_id=employee.id, amount=payload.amount, source=payload.source,

@@ -3,8 +3,10 @@ configured commissions over the real data they generated."""
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
+from sqlalchemy.orm import aliased
 
+from app.models.cash import CashMovement
 from app.models.loan import Loan
 from app.models.payment import Payment
 from app.services import cash_service as svc
@@ -18,6 +20,24 @@ BASE_LABELS = {
 }
 
 
+def reversed_payment_ids():
+    """Subquery: loan payments whose cash movement was reversed (they no longer count as collected)."""
+    reversal = aliased(CashMovement)
+    return (select(CashMovement.payment_id)
+            .join(reversal, and_(reversal.reverses_id == CashMovement.id, reversal.kind == "reversal"))
+            .where(CashMovement.payment_id.is_not(None)))
+
+
+def reversed_payroll_ids():
+    """Subquery: payroll payments (cash) whose expense movement was reversed from Caja."""
+    from app.models.payroll import PayrollPayment
+
+    reversal = aliased(CashMovement)
+    return (select(PayrollPayment.id)
+            .join(CashMovement, CashMovement.id == PayrollPayment.cash_movement_id)
+            .join(reversal, and_(reversal.reverses_id == CashMovement.id, reversal.kind == "reversal")))
+
+
 def _window(start: date, end: date):
     low = datetime.combine(start, time.min, svc.TZ).astimezone(UTC)
     high = datetime.combine(end + timedelta(days=1), time.min, svc.TZ).astimezone(UTC)
@@ -28,10 +48,12 @@ def base_amount(db, user_id: int, base: str, start: date, end: date) -> Decimal:
     low, high = _window(start, end)
     if base == "collections":
         q = select(func.coalesce(func.sum(Payment.amount), 0)).where(
-            Payment.collected_by_id == user_id, Payment.paid_at >= low, Payment.paid_at < high)
+            Payment.collected_by_id == user_id, Payment.paid_at >= low, Payment.paid_at < high,
+            Payment.id.not_in(reversed_payment_ids()))
     elif base == "interest":
         q = select(func.coalesce(func.sum(Payment.interest_applied + Payment.late_fee_applied), 0)).where(
-            Payment.collected_by_id == user_id, Payment.paid_at >= low, Payment.paid_at < high)
+            Payment.collected_by_id == user_id, Payment.paid_at >= low, Payment.paid_at < high,
+            Payment.id.not_in(reversed_payment_ids()))
     elif base == "disbursements":
         q = select(func.coalesce(func.sum(Loan.principal_amount), 0)).where(
             Loan.created_by_id == user_id, Loan.created_at >= low, Loan.created_at < high)
