@@ -2,12 +2,14 @@ import hashlib
 import json
 from datetime import date
 from decimal import Decimal
+from html import escape as html_escape
+from typing import Literal
 
 import base64
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,7 @@ from app.models.user import User
 from app.schemas.payroll import PayrollConfigUpdate, PayrollPaymentCreate
 from app.services import cash_service as svc, payroll_service
 from app.services.cash_live import publish
+from app.services.xlsx import build_xlsx
 
 router = APIRouter()
 EMPLOYEE_ROLES = ("admin", "manager", "cashier", "collector")
@@ -77,24 +80,81 @@ def suggest(user_id: int, start: date, end: date, db: Session = Depends(get_db),
     return payroll_service.compute(db, c, start, end)
 
 
+MAX_EXPORT_ROWS = 10_000
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+SOURCE_LABEL = {"cash": "Caja", "bank": "Banco", "capital": "Capital (histórico)"}
+
+
+def _payment_dict(p: PayrollPayment, users: dict, banks: dict, reversed_ids: set) -> dict:
+    return dict(id=p.id, user_id=p.user_id, user_name=users.get(p.user_id, "—"),
+                amount=str(p.amount), source=p.source, salary_part=str(p.salary_part),
+                commission_part=str(p.commission_part), period_start=p.period_start,
+                period_end=p.period_end, notes=p.notes, created_at=p.created_at,
+                actor_name=users.get(p.actor_id, "—"), reference=p.reference or "",
+                has_proof=bool(p.proof), bank_account_id=p.bank_account_id,
+                bank_label=banks.get(p.id), cash_movement_id=p.cash_movement_id,
+                historical_capital=p.source == "capital", reversed=p.id in reversed_ids)
+
+
 @router.get("/payments")
-def list_payments(db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
+def list_payments(start: date | None = None, end: date | None = None, user_id: int | None = None,
+                  page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
+                  format: Literal["json", "xlsx", "print"] = "json",
+                  db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
                   _=Depends(require_admin_manager)):
+    """Payment history, newest first. Filter by date range (company calendar day of the payment) and employee; paged
+    (``page``/``page_size``) as JSON, or the WHOLE filtered list (up to 10,000 rows) as ``xlsx`` / ``print``."""
+    if start and end and start > end:
+        raise HTTPException(422, "Rango de fechas inválido.")
+    where = [PayrollPayment.company_id == company_id]
+    if start:
+        where.append(PayrollPayment.created_at >= payroll_service._window(start, start)[0])
+    if end:
+        where.append(PayrollPayment.created_at < payroll_service._window(end, end)[1])
+    if user_id:
+        where.append(PayrollPayment.user_id == user_id)
+    reversed_sub = payroll_service.reversed_payroll_ids()
+    total_rows = db.scalar(select(func.count()).select_from(PayrollPayment).where(*where)) or 0
+    total_amount = db.scalar(select(func.coalesce(func.sum(PayrollPayment.amount), 0))
+                             .where(*where, PayrollPayment.id.not_in(reversed_sub))) or 0
+    query = select(PayrollPayment).where(*where).order_by(PayrollPayment.id.desc())
+    if format == "json":
+        query = query.limit(page_size).offset((page - 1) * page_size)
+    else:
+        query = query.limit(MAX_EXPORT_ROWS)
+    rows = db.scalars(query).all()
     users = {u.id: u.full_name for u in db.scalars(select(User).where(User.company_id == company_id)).all()}
-    rows = db.scalars(select(PayrollPayment).where(PayrollPayment.company_id == company_id)
-                      .order_by(PayrollPayment.id.desc())).all()
     banks = {m.payroll_payment_id: m.account_label for m in db.scalars(
         select(BankAccountMovement).where(BankAccountMovement.company_id == company_id)).all()}
-    reversed_ids = set(db.scalars(select(payroll_service.reversed_payroll_ids().subquery().c.id)).all())
-    return dict(payments=[dict(id=p.id, user_id=p.user_id, user_name=users.get(p.user_id, "—"),
-                               amount=str(p.amount), source=p.source, salary_part=str(p.salary_part),
-                               commission_part=str(p.commission_part), period_start=p.period_start,
-                               period_end=p.period_end, notes=p.notes, created_at=p.created_at,
-                               actor_name=users.get(p.actor_id, "—"), reference=p.reference or "",
-                               has_proof=bool(p.proof), bank_account_id=p.bank_account_id,
-                               bank_label=banks.get(p.id), cash_movement_id=p.cash_movement_id,
-                               historical_capital=p.source == "capital", reversed=p.id in reversed_ids)
-                         for p in rows])
+    reversed_ids = set(db.scalars(select(reversed_sub.subquery().c.id)).all())
+    items = [_payment_dict(p, users, banks, reversed_ids) for p in rows]
+    if format == "json":
+        return dict(payments=items, total=total_rows, page=page, page_size=page_size,
+                    pages=max(1, -(-total_rows // page_size)), total_amount=str(total_amount))
+
+    def _row(i: dict) -> list:
+        return [i["created_at"].astimezone(svc.TZ).strftime("%d/%m/%Y"), i["user_name"], str(i["amount"]),
+                SOURCE_LABEL.get(i["source"], i["source"]), i["bank_label"] or "", i["reference"],
+                f"{i['period_start']} a {i['period_end']}" if i["period_start"] and i["period_end"] else "",
+                "Revertido" if i["reversed"] else "Vigente", i["actor_name"], i["notes"]]
+
+    head = ["Fecha", "Empleado", "Importe (RD$)", "Origen", "Cuenta", "Referencia", "Período", "Estado", "Registró", "Nota"]
+    rango = f"{start or 'inicio'} a {end or 'hoy'}"
+    table = [head] + [_row(i) for i in items]
+    if format == "xlsx":
+        table += [[], ["Total vigente (sin revertidos)", "", str(Decimal(total_amount).quantize(Decimal('0.01')))]]
+        return Response(build_xlsx("Nómina", table), media_type=XLSX_TYPE,
+                        headers={"Content-Disposition": 'attachment; filename="historial-nomina.xlsx"'})
+    cell = lambda c: "<td>" + html_escape(str(c)) + "</td>"  # noqa: E731
+    body = "".join("<tr>" + "".join(cell(c) for c in r) + "</tr>" for r in table[1:])
+    html = ('<html><head><meta charset="utf-8"><title>Historial de nómina</title>'
+            '<style>@page{size:A4 landscape}body{font:12px Arial;color:#17334f;padding:20px}h1{font-size:19px}'
+            'table{border-collapse:collapse;width:100%;margin-top:10px}td,th{border:1px solid #ccc;padding:6px;'
+            'text-align:left}th{background:#edf3fa}</style></head><body>'
+            f"<h1>Historial de nómina</h1><p>Periodo: {html_escape(rango)} · Pagos: {total_rows} · "
+            f"Total vigente: RD$ {Decimal(total_amount).quantize(Decimal('0.01'))}</p><table><tr>"
+            + "".join(f"<th>{html_escape(h)}</th>" for h in head) + "</tr>" + body + "</table></body></html>")
+    return {"html": html}
 
 
 def _digest(payload: PayrollPaymentCreate, employee_branch_id) -> str:
