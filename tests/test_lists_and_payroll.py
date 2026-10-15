@@ -111,7 +111,7 @@ class ListsAndPayrollTests(base.CashRefactorTests):
         self.assertEqual([p['notes'] for p in by_text['payments']], ['LOTE-03'])
         by_name = self.req('/payroll/payments?q=manager&page_size=100')
         self.assertEqual(by_name['total'], 4)
-        future = self.req('/payroll/payments?start=2999-01-01&end=2999-01-02')
+        future = self.req('/payroll/payments?start=2100-01-01&end=2100-01-02')
         self.assertEqual((future['total'], future['payments']), (0, []))
         self.req('/payroll/payments?start=2026-02-02&end=2026-01-01', code=422)
         sheet = self.client.get('/api/v1/payroll/payments', headers=self.admin, params={'format': 'xlsx'})

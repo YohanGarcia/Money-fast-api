@@ -5,7 +5,6 @@ from decimal import Decimal
 
 from tests import test_api as legacy
 from tests import test_cash as cash_tests
-from tests.cash_fixtures import denominations_for
 
 
 class OptionATests(unittest.TestCase):
@@ -29,7 +28,7 @@ class OptionATests(unittest.TestCase):
         s = self.workspace()["session"]
         return self.client.post(
             f"/api/v2/cash/sessions/{s['id']}/close",
-            json=dict(idempotency_key=str(uuid.uuid4()), denominations=denominations_for(str(counted)), receiver_user_id=self.admin_id),
+            json=dict(idempotency_key=str(uuid.uuid4()), counted=str(counted)),  # simple close: the cash opened as "initial" closes directly
             headers=self.roles["cashier"],
         )
 
