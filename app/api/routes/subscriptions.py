@@ -213,25 +213,41 @@ async def confirm_order(
 def checkout_page(
     plan_id: int = Query(...),
     mode: str = Query(default="once"),
+    cycle: str = Query(default="monthly"),
+    coupon_code: str | None = Query(default=None, max_length=40),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     """Self-hosted PayPal checkout page for the mobile WebView.
 
-    ``mode=once`` → one-time order (PayPal or card). ``mode=sub`` → recurring
-    monthly subscription (requires the plan's PayPal billing plan id). Served
+    ``mode=once`` → one-time order (PayPal or card), for the ``cycle`` (monthly | annual) and an optional
+    coupon. ``mode=sub`` → recurring subscription of that cycle (requires the plan's PayPal billing plan id for
+    it; coupons do not apply to recurring charges). Account / card follow the owner's payment-method settings. Served
     from the API origin so the fetch calls below are same-origin (no CORS). The
     auth token is injected by the mobile app into ``window.__TOKEN__`` before
     the page loads; it is never placed in the URL.
     """
+    import json
+    import re
+
+    from app.models.platform import PaymentMethod
+
     client_id = settings.paypal_client_id or "sb"
+    cycle = cycle if cycle in ("monthly", "annual") else "monthly"
+    coupon = coupon_code.strip().upper() if coupon_code and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", coupon_code.strip()) else ""
     plan = db.get(Plan, plan_id)
-    paypal_plan_id = plan.paypal_plan_id if plan else None
-    recurring = mode == "sub" and bool(paypal_plan_id)
+    paypal_plan_id = (plan.paypal_annual_plan_id if cycle == "annual" else plan.paypal_plan_id) if plan else None
+    recurring = mode == "sub" and bool(paypal_plan_id) and not coupon
+
+    method = db.scalar(select(PaymentMethod).where(PaymentMethod.kind == "paypal"))
+    details = (method.details or {}) if method is not None else {}
+    funding = "&enable-funding=card" if details.get("accept_card", True) else "&disable-funding=card"
+    if not details.get("accept_account", True):
+        funding += "&disable-funding=paypal"
 
     sdk_query = (
         f"client-id={client_id}&vault=true&intent=subscription"
         if recurring
-        else f"client-id={client_id}&currency=USD&enable-funding=card&intent=capture"
+        else f"client-id={client_id}&currency=USD{funding}&intent=capture"
     )
     html = """<!DOCTYPE html>
 <html lang="es">
@@ -253,6 +269,8 @@ def checkout_page(
     var PLAN_ID = __PLAN_ID__;
     var PAYPAL_PLAN_ID = "__PAYPAL_PLAN_ID__";
     var RECURRING = __RECURRING__;
+    var CYCLE = __CYCLE__;
+    var COUPON = __COUPON__;
     var TOKEN = window.__TOKEN__ || '';
     var statusEl = document.getElementById('status');
     function notify(msg) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(msg)); }
@@ -276,14 +294,14 @@ def checkout_page(
           statusEl.textContent = 'Activando suscripción…';
           return fetch('/api/v1/subscriptions/activate-recurring', {
             method: 'POST', headers: authHeaders(),
-            body: JSON.stringify({ subscription_id: data.subscriptionID, plan_id: PLAN_ID })
+            body: JSON.stringify({ subscription_id: data.subscriptionID, plan_id: PLAN_ID, cycle: CYCLE })
           }).then(function (r) { if (!r.ok) throw new Error('activate_failed'); return r.json(); })
             .then(function () { notify({ type: 'success' }); });
         };
       } else {
         cfg.createOrder = function () {
           return fetch('/api/v1/subscriptions/create-order', {
-            method: 'POST', headers: authHeaders(), body: JSON.stringify({ plan_id: PLAN_ID })
+            method: 'POST', headers: authHeaders(), body: JSON.stringify({ plan_id: PLAN_ID, cycle: CYCLE, coupon_code: COUPON || null })
           }).then(function (r) { return r.json(); }).then(function (d) {
             if (!d.order_id) throw new Error('no_order');
             return d.order_id;
@@ -293,7 +311,7 @@ def checkout_page(
           statusEl.textContent = 'Confirmando pago…';
           return fetch('/api/v1/subscriptions/confirm', {
             method: 'POST', headers: authHeaders(),
-            body: JSON.stringify({ order_id: data.orderID, plan_id: PLAN_ID })
+            body: JSON.stringify({ order_id: data.orderID, plan_id: PLAN_ID, cycle: CYCLE, coupon_code: COUPON || null })
           }).then(function (r) { if (!r.ok) throw new Error('confirm_failed'); return r.json(); })
             .then(function () { notify({ type: 'success' }); });
         };
@@ -305,7 +323,9 @@ def checkout_page(
 </html>"""
     html = (
         html.replace("__SDK_QUERY__", sdk_query)
-        .replace("__TITLE__", "Suscripción mensual" if recurring else "Pago de suscripción")
+        .replace("__TITLE__", ("Suscripción anual" if cycle == "annual" else "Suscripción mensual") if recurring else "Pago de suscripción")
+        .replace("__CYCLE__", json.dumps(cycle))
+        .replace("__COUPON__", json.dumps(coupon))
         .replace("__PAYPAL_PLAN_ID__", paypal_plan_id or "")
         .replace("__RECURRING__", "true" if recurring else "false")
         .replace("__PLAN_ID__", str(plan_id))

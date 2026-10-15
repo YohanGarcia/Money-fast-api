@@ -29,7 +29,7 @@ def get_current_user(
     if user.role == 'cashier':
         path = request.url.path.removeprefix('/api/v1')
         allowed = path.startswith('/cash/') or path in ('/auth/me','/auth/logout','/auth/refresh')
-        allowed = allowed or (request.method == 'GET' and (path == '/customers' or path.startswith('/customers/') or path == '/loans' or path.startswith('/loans/') or path == '/payments'))
+        allowed = allowed or (request.method == 'GET' and (path == '/customers' or path.startswith('/customers/') or path == '/loans' or path.startswith('/loans/') or path == '/payments' or path == '/company-settings'))
         allowed = allowed or (request.method == 'POST' and path == '/payments')
         if not allowed: raise HTTPException(403, 'Esta operación no está disponible para el cajero.')
     return user
