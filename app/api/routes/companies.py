@@ -234,6 +234,12 @@ def delete_company(
     if user_ids:
         db.execute(delete(UserRoleAssignment).where(UserRoleAssignment.user_id.in_(user_ids)))
         db.execute(delete(RecoveryToken).where(RecoveryToken.user_id.in_(user_ids)))
+        # a user who has signed in owns sessions and onboarding progress; neither is operational data
+        from app.models.session import UserSession
+        from app.models.tour_progress import TourProgress
+
+        db.execute(delete(UserSession).where(UserSession.user_id.in_(user_ids)))
+        db.execute(delete(TourProgress).where(TourProgress.user_id.in_(user_ids)))
     for user in db.scalars(select(User).where(User.company_id == company_id)).all():
         db.delete(user)
     db.flush()
@@ -247,6 +253,16 @@ def delete_company(
     db.execute(delete(CashPointCurrency).where(CashPointCurrency.tenant_id == company_id))
     db.execute(delete(CashPoint).where(CashPoint.tenant_id == company_id))
     db.execute(delete(TenantCurrency).where(TenantCurrency.tenant_id == company_id))  # base-currency FK is deferred
+    # Per-company configuration rows are created the first time the admin opens Configuración.
+    from app.models.bank_account import BankAccount
+    from app.models.company_settings import CompanySettings
+    from app.models.loan_settings import LoanSettings
+    from app.models.print_settings import PrintSettings
+
+    if db.scalar(select(func.count()).select_from(BankAccount).where(BankAccount.company_id == company_id)):
+        raise HTTPException(status_code=400, detail="La empresa tiene cuentas bancarias. Desactivala en vez de borrarla.")
+    for model in (CompanySettings, LoanSettings, PrintSettings):
+        db.execute(delete(model).where(model.company_id == company_id))
     for sub in db.scalars(select(Subscription).where(Subscription.company_id == company_id)).all():
         db.delete(sub)
     db.delete(company)
