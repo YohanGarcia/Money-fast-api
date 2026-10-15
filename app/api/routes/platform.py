@@ -31,7 +31,7 @@ from app.modules.identity.audit import record_event
 from app.modules.identity.auth import revoke_user_sessions
 from app.modules.identity.models import SecurityEvent
 from app.services import platform_config
-from app.services.billing import activate_subscription, plan_price
+from app.services.billing import CYCLES, activate_subscription, plan_price
 from app.services.email_service import EmailNotConfigured, send_html_email, smtp_configured
 from app.services.plan_limits import effective_plan, get_free_plan, subscription_is_current
 from app.services.xlsx import build_xlsx
@@ -599,6 +599,9 @@ def change_plan(company_id: int, body: ChangePlanIn, user: User = Depends(requir
         company.subscription_expires_at = _tz(body.expires_at)
     elif plan.monthly_price_usd == 0:
         company.subscription_expires_at = None
+    elif company.subscription_expires_at is None or not subscription_is_current(company):
+        # a paid plan always gets a real period: never open-ended, never already expired
+        company.subscription_expires_at = datetime.now(UTC) + timedelta(days=CYCLES[body.cycle])
     company.renewal_notice_for = None
     record_event(db, "platform.company.plan_changed", actor_id=user.id, tenant_id=company.id,
                  details={"plan": plan.name, "cycle": body.cycle, "note": body.note})
