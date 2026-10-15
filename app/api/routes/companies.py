@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_db, require_superadmin
+from app.api.routes.platform import require_owner
 from app.models.company import Company
 from app.models.customer import Customer
 from app.models.loan import Loan
@@ -140,7 +141,7 @@ def platform_overview(
 def create_company(
     payload: CompanyCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> dict:
     # The same path as a self-registration (password policy, e-mail uniqueness, Free plan, administrator role and
     # person): an administrator created here can operate every module, exactly like one who registered.
@@ -167,7 +168,7 @@ def update_company(
     company_id: int,
     payload: CompanyUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> dict:
     company = db.get(Company, company_id)
     if company is None:
@@ -193,7 +194,7 @@ def update_company(
 def delete_company(
     company_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> None:
     """Permanently delete a company only if it has no customers or loans.
 

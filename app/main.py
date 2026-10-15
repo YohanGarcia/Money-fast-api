@@ -39,6 +39,17 @@ def create_app() -> FastAPI:
     )
     application.add_middleware(RequestContextMiddleware)
 
+    @application.on_event("startup")
+    def _load_platform_config() -> None:  # the owner's saved settings override the environment defaults
+        try:
+            from app.core.database import SessionLocal
+            from app.services import platform_config
+
+            with SessionLocal() as db:
+                platform_config.apply_runtime(platform_config.load(db))
+        except Exception:  # a missing table (before the migration) must never stop the API from starting
+            pass
+
     application.include_router(system.router)
     application.include_router(api_router, prefix="/api/v1")
     application.include_router(identity_router)

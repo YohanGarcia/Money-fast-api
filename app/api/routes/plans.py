@@ -3,6 +3,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.pagination import Page, page_params, paginate
+from app.api.routes.platform import require_owner
 from app.api.deps import get_current_user, get_db, require_superadmin
 from app.models.company import Company
 from app.models.plan import Plan
@@ -40,7 +41,7 @@ def list_plans(
 def create_plan(
     payload: PlanCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> Plan:
     existing = db.scalar(select(Plan).where(Plan.name == payload.name.strip()))
     if existing is not None:
@@ -59,7 +60,7 @@ def update_plan(
     plan_id: int,
     payload: PlanCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> Plan:
     plan = db.get(Plan, plan_id)
     if plan is None:
@@ -69,9 +70,14 @@ def update_plan(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un plan con ese nombre.")
 
+    prices_changed = (plan.monthly_price_usd != payload.monthly_price_usd
+                      or plan.annual_price_usd != payload.annual_price_usd)
     for key, value in payload.model_dump().items():
         setattr(plan, key, value)
     plan.name = payload.name.strip()
+    if prices_changed:  # a PayPal billing plan has a fixed price: new subscriptions need new ones
+        plan.paypal_plan_id = None
+        plan.paypal_annual_plan_id = None
     db.commit()
     db.refresh(plan)
     return plan
@@ -81,7 +87,7 @@ def update_plan(
 def delete_plan(
     plan_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    _: User = Depends(require_owner),
 ) -> None:
     """Delete a plan only if no company is using it (otherwise deactivate it)."""
     plan = db.get(Plan, plan_id)

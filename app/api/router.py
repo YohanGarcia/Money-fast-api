@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from app.api.routes import loan_applications, cash, credit_bureau
 
-from app.api.routes import auth, bank_accounts, branches, companies, company_settings, customers, health, loan_settings, loans, payments, payroll, plans, print_settings, reports, routes, subscriptions, tour_progress, users
+from app.api.routes import auth, bank_accounts, billing, branches, companies, company_settings, customers, health, loan_settings, loans, payments, payroll, plans, platform, print_settings, reports, routes, subscriptions, tour_progress, users
 
 api_router = APIRouter()
 api_router.include_router(cash.router, prefix="/cash", tags=["cash"])
@@ -19,6 +19,9 @@ api_router.include_router(loan_settings.router, prefix="/loan-settings", tags=["
 api_router.include_router(payments.router, prefix="/payments", tags=["payments"])
 api_router.include_router(payroll.router, prefix="/payroll", tags=["payroll"])
 api_router.include_router(plans.router, prefix="/plans", tags=["plans"])
+api_router.include_router(platform.router, prefix="/platform", tags=["platform"])
+api_router.include_router(platform.public_router, prefix="/platform", tags=["platform-public"])
+api_router.include_router(billing.router, prefix="/billing", tags=["billing"])
 api_router.include_router(print_settings.router, prefix="/print-settings", tags=["print-settings"])
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(routes.router, prefix="/routes", tags=["routes"])

@@ -31,22 +31,24 @@ async def _create_product(token: str) -> str:
         return r.json()["id"]
 
 
-async def _create_plan(token: str, product_id: str, plan: Plan) -> str:
+async def _create_plan(token: str, product_id: str, plan: Plan, cycle: str = "monthly", price=None) -> str:
+    unit = "YEAR" if cycle == "annual" else "MONTH"
+    amount = price if price is not None else plan.monthly_price_usd
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{base_url()}/v1/billing/plans",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={
                 "product_id": product_id,
-                "name": f"MoneyFast — Plan {plan.name}",
+                "name": f"MoneyFast — Plan {plan.name}" + (" (anual)" if cycle == "annual" else ""),
                 "status": "ACTIVE",
                 "billing_cycles": [{
-                    "frequency": {"interval_unit": "MONTH", "interval_count": 1},
+                    "frequency": {"interval_unit": unit, "interval_count": 1},
                     "tenure_type": "REGULAR",
                     "sequence": 1,
                     "total_cycles": 0,  # 0 = until cancelled
                     "pricing_scheme": {
-                        "fixed_price": {"value": str(plan.monthly_price_usd), "currency_code": "USD"}
+                        "fixed_price": {"value": str(amount), "currency_code": "USD"}
                     },
                 }],
                 "payment_preferences": {
@@ -92,6 +94,15 @@ async def ensure_billing(db: Session) -> dict:
             plan.paypal_plan_id = await _create_plan(token, product_id, plan)
             db.commit()
         result[plan.name] = plan.paypal_plan_id
+        from app.services import platform_config
+        from app.services.billing import plan_price
+
+        annual = plan_price(plan, "annual", platform_config.current(db))
+        if annual > 0 and not plan.paypal_annual_plan_id:
+            plan.paypal_annual_plan_id = await _create_plan(token, product_id, plan, "annual", annual)
+            db.commit()
+        if plan.paypal_annual_plan_id:
+            result[plan.name + " (anual)"] = plan.paypal_annual_plan_id
     return result
 
 

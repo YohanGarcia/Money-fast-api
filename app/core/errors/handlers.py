@@ -51,7 +51,7 @@ def internal_error_response() -> JSONResponse:
 
 
 async def _app_error(_: Request, exc: AppError) -> JSONResponse:
-    if exc.status_code >= 500:
+    if exc.status_code >= 500 and not getattr(exc, "expose_message", False):
         log.error("app_error", extra={"code": exc.code})
         return JSONResponse(error_body(exc.code, exc.default_message), status_code=exc.status_code)
     return JSONResponse(

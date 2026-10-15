@@ -1,6 +1,6 @@
 """Tenant + owner creation, shared by self-service registration (when open) and the first-administrator CLI."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -9,10 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.core.security import get_password_hash, password_policy_violation
 from app.models.company import Company
+from app.models.plan import Plan
 from app.models.user import User, UserRole
 from app.modules.identity.audit import record_event
 from app.modules.identity.catalog import bootstrap_owner
 from app.modules.identity.tenant import is_valid_slug, normalize_slug, unique_slug
+from app.services import platform_config
 from app.services.plan_limits import get_free_plan
 
 
@@ -43,9 +45,18 @@ def create_tenant_owner(
     else:
         slug = unique_slug(db, company_name)
     free_plan = get_free_plan(db)
+    start_plan, trial_ends = free_plan, None
+    cfg = platform_config.current(db)
+    default_plan = db.get(Plan, cfg.get("default_plan_id")) if cfg.get("default_plan_id") else None
+    if default_plan is not None and default_plan.is_active:
+        start_plan = default_plan
+        days = int(cfg.get("trial_days") or 0)
+        if default_plan.monthly_price_usd > 0 and days > 0:
+            trial_ends = datetime.now(UTC) + timedelta(days=days)
     try:
         # ALWAYS a brand-new company: there is no way to attach the new administrator to an existing one.
-        company = Company(name=company_name, slug=slug, plan_id=free_plan.id if free_plan else None)
+        company = Company(name=company_name, slug=slug, plan_id=start_plan.id if start_plan else None,
+                          subscription_expires_at=trial_ends)
         db.add(company)
         db.flush()
         user = User(

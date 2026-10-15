@@ -496,7 +496,7 @@ def test_the_alembic_schema_is_unchanged_by_t016(scratch_db):
 
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
     assert _alembic(scratch_db, "check").returncode == 0
-    assert "0026" in _alembic(scratch_db, "heads").stdout  # T-019 / T-020 / T-021 / T-022A / T-023A added 0018 / 0019 / 0020 / 0021 / 0022
+    assert "0027" in _alembic(scratch_db, "heads").stdout  # T-019 / T-020 / T-021 / T-022A / T-023A added 0018 / 0019 / 0020 / 0021 / 0022
 
 
 @pytest.fixture(autouse=True)

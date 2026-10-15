@@ -101,6 +101,12 @@ class ExternalIdentityConflict(AppError):
     default_message = "La identidad externa ya esta vinculada a otra cuenta."
 
 
+class MaintenanceMode(AppError):
+    status_code, code = 503, "maintenance"
+    expose_message = True  # the owner's own maintenance notice is meant to be read by the user
+    default_message = "La plataforma está en mantenimiento. Intenta de nuevo en unos minutos."
+
+
 class TenantInactive(AppError):
     status_code, code = 403, "tenant_inactive"
     default_message = "La agencia esta inactiva."

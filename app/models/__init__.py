@@ -11,6 +11,7 @@ from app.models.customer import Customer
 from app.models.loan import Loan, LoanInstallment, LoanStatus, PaymentFrequency
 from app.models.location_ping import LocationPing
 from app.models.plan import Plan
+from app.models.platform import Coupon, PaymentMethod, PlatformSetting, PlatformStaff  # noqa: F401
 from app.models.print_settings import PrintSettings
 from app.models.loan_settings import LoanSettings
 from app.models.payment import Payment, PaymentType

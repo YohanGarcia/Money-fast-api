@@ -29,6 +29,7 @@ from app.core.security import (
 from app.core.time import now_utc
 from app.models.company import Company
 from app.models.session import UserSession
+from app.services import platform_config
 from app.modules.identity import throttle
 from app.modules.identity.audit import record_event
 from app.modules.identity.errors import (
@@ -40,6 +41,7 @@ from app.modules.identity.errors import (
     RateLimited,
     SessionExpired,
     SessionInvalid,
+    MaintenanceMode,
     TenantInactive,
 )
 from app.modules.identity.models import UserAccount
@@ -238,6 +240,9 @@ def login(
     if user.status != "active":  # pending: the activation flow must set the password first
         db.commit()
         raise InvalidCredentials()
+    cfg = platform_config.current(db)
+    if cfg.get("maintenance_mode") and str(getattr(user.role, "value", user.role)) != "superadmin":
+        raise MaintenanceMode(cfg.get("maintenance_message") or None)
     if user.company_id is not None:
         tenant = db.get(Company, user.company_id)
         if tenant is None or tenant.status != "active":
@@ -295,6 +300,9 @@ def authenticate_access_token(db: Session, token: str, now: datetime | None = No
         raise SessionExpired()
     if user.status != "active":
         raise SessionInvalid()
+    cfg = platform_config.current(db)
+    if cfg.get("maintenance_mode") and str(getattr(user.role, "value", user.role)) != "superadmin":
+        raise MaintenanceMode(cfg.get("maintenance_message") or None)
     timezone = base_currency = None
     if user.company_id is not None:
         tenant = db.get(Company, user.company_id)

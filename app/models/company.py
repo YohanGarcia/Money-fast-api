@@ -44,6 +44,9 @@ class Company(Base):
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Active PayPal recurring subscription id (I-XXXX); None for one-time or free.
     paypal_subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Current billing cycle (monthly | annual) and the expiry a renewal reminder was already sent for.
+    billing_cycle: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    renewal_notice_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)

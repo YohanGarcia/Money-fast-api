@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
+from app.services import platform_config
 from app.core.time import now_utc
 from app.models.user import User
 from app.modules.identity import auth as auth_service
@@ -29,6 +30,7 @@ def register(payload: RegisterInput, request: Request, db: Session = Depends(get
     """Self-service registration of a NEW company: the caller becomes the administrator of that company. It never
     joins an existing company and never creates employees (those are created by an administrator in /users).
     PUBLIC_REGISTRATION=false is a kill-switch; per-IP throttling limits abuse."""
+    platform_config.current(db)  # the owner may close registration at runtime
     if not settings.registration_open:
         raise HTTPException(status_code=403, detail="El registro de nuevas empresas esta temporalmente deshabilitado.")
     ip = client_ip(request) or "unknown"

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -15,7 +16,8 @@ from app.models.plan import Plan
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.subscription import SubscriptionRead
-from app.services import paypal_billing
+from app.services import paypal_billing, platform_config
+from app.services.billing import check_cycle, quote
 from app.services.paypal_client import base_url, get_access_token, is_configured
 from app.services.subscription_service import record_subscription
 
@@ -116,11 +118,15 @@ async def _paypal_token() -> str:
 
 class CreateOrderInput(BaseModel):
     plan_id: int
+    cycle: str = "monthly"
+    coupon_code: str | None = None
 
 
 class ConfirmOrderInput(BaseModel):
     order_id: str
     plan_id: int
+    cycle: str = "monthly"
+    coupon_code: str | None = None
 
 
 @router.post("/create-order")
@@ -132,6 +138,10 @@ async def create_order(
     plan = db.get(Plan, payload.plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    cfg = platform_config.current(db)
+    priced = quote(db, plan, check_cycle(payload.cycle, cfg), cfg, payload.coupon_code)
+    if Decimal(priced["total"]) <= 0:
+        raise HTTPException(status_code=409, detail="Este plan no requiere pago con PayPal.")
 
     base  = PAYPAL_BASE.get(settings.paypal_mode, PAYPAL_BASE["sandbox"])
     token = await _paypal_token()
@@ -142,8 +152,8 @@ async def create_order(
             json={
                 "intent": "CAPTURE",
                 "purchase_units": [{
-                    "amount": {"currency_code": "USD", "value": str(plan.monthly_price_usd)},
-                    "description": f"MoneyFast — Plan {plan.name}",
+                    "amount": {"currency_code": "USD", "value": priced["total"]},
+                    "description": f"MoneyFast — Plan {plan.name} ({'anual' if payload.cycle == 'annual' else 'mensual'})",
                 }],
             },
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -186,7 +196,13 @@ async def confirm_order(
     if status != "COMPLETED":
         raise HTTPException(status_code=400, detail=f"Pago no completado: {status}")
 
-    subscription = record_subscription(db, company=company, plan=plan, order_id=payload.order_id)
+    cfg = platform_config.current(db)
+    priced = quote(db, plan, check_cycle(payload.cycle, cfg), cfg, payload.coupon_code)
+    subscription = record_subscription(
+        db, company=company, plan=plan, order_id=payload.order_id, cycle=payload.cycle, method="paypal",
+        amount=Decimal(priced["total"]), discount=Decimal(priced["discount"]),
+        coupon_code=(priced["coupon"] or {}).get("code"), extra_days=priced["extra_days"],
+    )
     db.commit()
     db.refresh(subscription)
 
@@ -303,6 +319,7 @@ def checkout_page(
 class ActivateRecurringInput(BaseModel):
     subscription_id: str
     plan_id: int
+    cycle: str = "monthly"
 
 
 @router.post("/setup-billing")
@@ -343,8 +360,15 @@ async def activate_recurring(
     if sub.get("status") not in {"ACTIVE", "APPROVED"}:
         raise HTTPException(status_code=400, detail=f"Suscripción no activa: {sub.get('status')}")
 
+    cfg = platform_config.current(db)
+    check_cycle(payload.cycle, cfg)
     company.paypal_subscription_id = payload.subscription_id
-    record_subscription(db, company=company, plan=plan, order_id=payload.subscription_id)
+    from app.services.billing import plan_price
+
+    record_subscription(
+        db, company=company, plan=plan, order_id=payload.subscription_id, cycle=payload.cycle,
+        method="paypal_subscription", amount=plan_price(plan, payload.cycle, cfg),
+    )
     db.commit()
     return {"status": "activated", "plan_id": plan.id, "recurring": True}
 
