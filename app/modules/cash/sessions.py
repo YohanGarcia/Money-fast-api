@@ -60,7 +60,6 @@ from app.modules.cash.errors import (
     InvalidHandoverDestination,
     InvalidOpening,
     InvalidReceiver,
-    NextSessionRequiresCash,
     NotSessionOwner,
     ObservationRequired,
     ReceiverRequired,
@@ -602,8 +601,6 @@ def close_session(
     counted_map, counted = count_denominations(denominations)
     if destination not in DESTINATIONS:
         raise InvalidHandoverDestination()
-    if destination == "next_session" and counted <= 0:
-        raise NextSessionRequiresCash()
     payload = {
         "operation": "close_cash_session",
         "session_id": session_id,

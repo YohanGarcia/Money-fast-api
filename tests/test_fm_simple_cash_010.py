@@ -246,14 +246,12 @@ class SimpleCashTests(_cash.CashTests):
         self.assertEqual((self.movements(sid),self.capital_state(),self.workspace()['session']['version']),before)
 
     # -- legacy compatibility -----------------------------------------------------------------------------------------
-    def test_legacy_capital_open_and_denomination_close_still_work(self):
-        out=self.open('1000')  # legacy helper: injects capital, opens with capital=true and a denomination count
-        self.assertEqual(out['session']['opening_source'],'capital')
-        w=self.workspace()
-        closed=self.cmd('close',version=w['session']['version'],denominations=denominations_for('1000'))
-        self.assertEqual(closed['session']['state'],'closing')  # still hands the cash to a receiver (capital)
-        self._finish_pending_close()
-        self.assertEqual(self.workspace()['session'],None)
+    def test_capital_opening_no_longer_exists(self):
+        # the legacy helper used to inject capital and open with capital=true plus a denomination count
+        self.cmd('open',headers=self.roles['cashier'],amount='1000',capital=True,denominations=denominations_for('1000'),code=422)
+        self.assertEqual(self.workspace()['session'],None)  # nothing opened
+        out=self.simple_open('1000')
+        self.assertEqual(out['session']['opening_source'],'initial')
 
     def test_legacy_open_without_origin_is_still_refused(self):
         self.cmd('open',headers=self.roles['cashier'],amount='300',code=422)
@@ -285,7 +283,7 @@ class SimpleCashTests(_cash.CashTests):
         self.assertEqual((closed['state'],closed['difference'],closed['handover']),('closed','10.00',None))
         self.assertEqual(self.capital_state(),before)
 
-    def test_v2_legacy_denomination_close_is_still_required_for_legacy_sessions(self):
+    def test_v2_zero_session_closes_with_a_zero_count_and_is_not_a_simple_session(self):
         out=self.cmd('open',headers=self.roles['cashier'],amount='0')  # zero opening (legacy command)
         sid=out['session_id']
         self.v2('/cash/sessions/%d/close'%sid,dict(idempotency_key=str(uuid.uuid4()),counted='0'),code=422)  # not an initial session: the simple close is refused

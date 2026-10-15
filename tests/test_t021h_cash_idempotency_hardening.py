@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
 from app.core.errors import IdempotencyConflict
-from app.models.cash import CashCustodyTransfer, CashSession
+from app.models.cash import CashSession, CashSessionHandover
 from app.modules.cash import sessions as cash_core
 from app.modules.identity.authorization import build_principal
 from app.modules.identity.models import UserAccount
@@ -38,9 +38,9 @@ from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared
     tenant_b,
 )
 from tests.test_t006_origination import count
+from tests.test_t003_organization import mk_cp
 from tests.test_t012_collection_assignment import mkuser
 from tests.test_t021_cashpoint_session_lifecycle import (
-    accept_,
     close_,
     code,
     cworld,
@@ -51,7 +51,6 @@ from tests.test_t021_cashpoint_session_lifecycle import (
 COUNTS = {"1000": 1}
 OPEN_KEY = "uq_cash_sessions_open_key"
 CLOSE_KEY = "uq_cash_sessions_close_key"
-ACCEPT_KEY = "uq_cash_custody_transfers_accept_key"
 
 
 # ================================ harness =================================================================
@@ -96,9 +95,9 @@ def opener(cp, k, amount="1000.00"):
         db,
         actor,
         cash_point_id=cp,
-        source="capital",
+        source="initial",  # Capital no longer funds a session: a declared amount, no denomination count
         amount=amount,
-        denominations=COUNTS,
+        denominations=None,
         observation_note=None,
         idempotency_key=k,
     )
@@ -110,24 +109,15 @@ def closer(sid, receiver, k):
     )
 
 
-def accepter(hid, k):
-    return lambda db, actor: cash_core.accept_handover(db, actor, hid, idempotency_key=k)
-
-
 def two_branches(client, sink, tenant):
     return cworld(client, sink, tenant, "a"), cworld(client, sink, tenant, "b")
 
 
-def closing_handover(client, x):
-    """An open capital session of 1000 closed with the exact count: a pending closing handover to ``x.rec``."""
-    s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
-    closed = close_(client, x.cas_h, s["id"], COUNTS, receiver=x.rec).json()
-    assert closed["state"] == "closing"
-    return s["id"], closed["handover"]["id"]
-
-
 def money():
-    return {t: count(t) for t in ("cash_movements", "capital_movements", "cash_sessions", "cash_custody_transfers")}
+    return {
+        t: count(t)
+        for t in ("cash_movements", "capital_movements", "cash_sessions", "cash_custody_transfers", "cash_session_handovers")
+    }
 
 
 def verdict(out):
@@ -141,18 +131,18 @@ def test_open_same_key_from_two_branches_ends_as_idempotency_conflict(client, si
     x1, x2 = two_branches(client, sink, tenant_a)
     shared, before = key("t21h"), money()
     # both pass the replay lookups and the locks of THEIR OWN box, then claim the key together
-    seam(monkeypatch, cash_core.capital_service, "balance")
+    seam(monkeypatch, cash_core, "ensure_cash_point_usable")  # after the locks, before the key claim
     out = race((x1.cas, opener(x1.cp, shared)), (x2.cas, opener(x2.cp, shared)))
     winners, losers = verdict(out)
     assert len(winners) == 1 and winners[0][1] is False
     assert [(o[0], o[1]) for o in losers] == [("IdempotencyConflict", 409)]
     assert count("cash_sessions", "open_idempotency_key = :k", k=shared) == 1
-    after = money()  # the loser left nothing: one session, one fund movement, one capital to_cash
+    after = money()  # the loser left nothing: one session and one initial-fund movement
     assert (after["cash_sessions"] - before["cash_sessions"], after["cash_movements"] - before["cash_movements"]) == (
         1,
         1,
     )
-    assert after["capital_movements"] - before["capital_movements"] == 1
+    assert after["capital_movements"] - before["capital_movements"] == 0  # Capital is never touched
     assert len(events("cash.session.opened")) == 1
 
 
@@ -161,8 +151,8 @@ def test_close_same_key_from_two_branches_ends_as_idempotency_conflict(client, s
     s1 = open_(client, x1.cas_h, x1.cp, amount="1000.00").json()["id"]
     s2 = open_(client, x2.cas_h, x2.cp, amount="1000.00").json()["id"]
     shared, before = key("t21h"), money()
-    seam(monkeypatch, cash_core, "_valid_receiver")  # after the locks, right before the key is claimed
-    out = race((x1.cas, closer(s1, x1.rec, shared)), (x2.cas, closer(s2, x2.rec, shared)))
+    seam(monkeypatch, cash_core, "_valid_direct_receiver")  # after the locks, right before the key is claimed
+    out = race((x1.cas, closer(s1, x1.rcv, shared)), (x2.cas, closer(s2, x2.rcv, shared)))
     winners, losers = verdict(out)
     assert len(winners) == 1 and winners[0][1] is False
     assert [(o[0], o[1]) for o in losers] == [("IdempotencyConflict", 409)]
@@ -172,34 +162,11 @@ def test_close_same_key_from_two_branches_ends_as_idempotency_conflict(client, s
     with SessionLocal() as db:
         loser = db.get(CashSession, lost)
         assert (loser.state, loser.close_idempotency_key, loser.counted, loser.closed_by) == ("open", None, None, None)
-    assert count("cash_custody_transfers", "session_id = :s", s=lost) == 0
+    assert count("cash_session_handovers", "source_session_id = :s", s=lost) == 0
     assert count("cash_session_differences", "session_id = :s", s=lost) == 0
     after = money()
-    assert after["cash_custody_transfers"] - before["cash_custody_transfers"] == 1  # the winner's handover only
+    assert after["cash_session_handovers"] - before["cash_session_handovers"] == 1  # the winner's handover only
     assert len(events("cash.session.closing_counted")) == 1
-
-
-def test_capital_accept_same_key_from_two_branches_ends_as_idempotency_conflict(client, sink, tenant_a, monkeypatch):
-    x1, x2 = two_branches(client, sink, tenant_a)
-    s1, h1 = closing_handover(client, x1)
-    s2, h2 = closing_handover(client, x2)
-    shared, before = key("t21h"), money()
-    seam(monkeypatch, cash_core, "now_utc")  # after validation, before any movement / key claim
-    out = race((x1.rec, accepter(h1, shared)), (x2.rec, accepter(h2, shared)))
-    winners, losers = verdict(out)
-    assert len(winners) == 1 and winners[0][1] is False
-    assert [(o[0], o[1]) for o in losers] == [("IdempotencyConflict", 409)]
-    assert count("cash_custody_transfers", "accept_idempotency_key = :k", k=shared) == 1
-    won_session = winners[0][2]["id"]
-    lost_session, lost_handover = (s2, h2) if won_session == s1 else (s1, h1)
-    with SessionLocal() as db:
-        h, s = db.get(CashCustodyTransfer, lost_handover), db.get(CashSession, lost_session)
-        assert (h.state, h.accepted_by, h.cash_movement_id, h.capital_movement_id) == ("pending", None, None, None)
-        assert (s.state, s.balance) == ("closing", 1000)
-    after = money()  # exactly the winner's closing movement and capital from_cash, nothing from the loser
-    assert after["cash_movements"] - before["cash_movements"] == 1
-    assert after["capital_movements"] - before["capital_movements"] == 1
-    assert len(events("cash.handover.accepted")) == 1
 
 
 # ================================ 2. identical concurrent retries =========================================
@@ -217,7 +184,7 @@ def test_open_identical_concurrent_retry_is_a_replay_not_cash_point_busy(client,
         1,
         1,
     )
-    assert after["capital_movements"] - before["capital_movements"] == 1
+    assert after["capital_movements"] - before["capital_movements"] == 0  # Capital is never touched
     assert len(events("cash.session.opened")) == 1
 
 
@@ -226,31 +193,13 @@ def test_close_identical_concurrent_retry_is_a_replay_not_session_not_open(clien
     sid = open_(client, x.cas_h, x.cp, amount="1000.00").json()["id"]
     k, before = key("t21h"), money()
     seam(monkeypatch, cash_core, "_cash_point", when=lambda a, kw: not kw.get("lock"))
-    out = race((x.cas, closer(sid, x.rec, k)), (x.cas, closer(sid, x.rec, k)))
+    out = race((x.cas, closer(sid, x.rcv, k)), (x.cas, closer(sid, x.rcv, k)))
     winners, losers = verdict(out)
     assert losers == [] and sorted(o[1] for o in winners) == [False, True]
-    assert winners[0][2]["handover"]["id"] == winners[1][2]["handover"]["id"]
-    assert count("cash_custody_transfers", "session_id = :s", s=sid) == 1
-    assert money()["cash_custody_transfers"] - before["cash_custody_transfers"] == 1
+    assert winners[0][2]["session_handover"]["id"] == winners[1][2]["session_handover"]["id"]
+    assert count("cash_session_handovers", "source_session_id = :s", s=sid) == 1
+    assert money()["cash_session_handovers"] - before["cash_session_handovers"] == 1
     assert len(events("cash.session.closing_counted")) == 1
-
-
-def test_capital_accept_identical_concurrent_retry_is_a_replay_not_handover_not_pending(
-    client, sink, tenant_a, monkeypatch
-):
-    x = cworld(client, sink, tenant_a)
-    sid, hid = closing_handover(client, x)
-    k, before = key("t21h"), money()
-    seam(monkeypatch, cash_core, "_session", when=lambda a, kw: not kw.get("lock"))
-    out = race((x.rec, accepter(hid, k)), (x.rec, accepter(hid, k)))
-    winners, losers = verdict(out)
-    assert losers == [] and sorted(o[1] for o in winners) == [False, True]
-    after = money()
-    assert after["cash_movements"] - before["cash_movements"] == 1  # one closing transfer
-    assert after["capital_movements"] - before["capital_movements"] == 1  # one linked capital from_cash
-    assert len(events("cash.handover.accepted")) == 1
-    with SessionLocal() as db:
-        assert db.get(CashSession, sid).state == "closed"
 
 
 # ================================ 3. classification: only the named key constraint ========================
@@ -280,7 +229,7 @@ def blind(monkeypatch, obj, name, calls=2):
 def test_open_real_key_collision_is_classified_and_the_session_stays_usable(client, sink, tenant_a, monkeypatch):
     x1, x2 = two_branches(client, sink, tenant_a)
     taken = key("t21h")
-    won = open_(client, x1.cas_h, x1.cp, amount="1000.00", k=taken).json()
+    won = open_(client, x1.cas_h, x1.cp, source="initial", amount="1000.00", k=taken).json()
     before = money()
     blind(monkeypatch, cash_core, "_open_replay")  # the winner "was not visible" before the INSERT: a REAL collision
     with SessionLocal() as db:
@@ -301,41 +250,19 @@ def test_close_real_key_collision_is_classified_and_the_session_stays_usable(cli
     s1 = open_(client, x1.cas_h, x1.cp, amount="1000.00").json()["id"]
     s2 = open_(client, x2.cas_h, x2.cp, amount="1000.00").json()["id"]
     taken = key("t21h")
-    close_(client, x1.cas_h, s1, COUNTS, receiver=x1.rec, k=taken)
+    close_(client, x1.cas_h, s1, COUNTS, receiver=x1.rcv, k=taken)
     before = money()
     blind(monkeypatch, cash_core, "_close_replay")
     with SessionLocal() as db:
         actor = build_principal(db, db.get(UserAccount, x2.cas), 0)
         with pytest.raises(IdempotencyConflict):
-            closer(s2, x2.rec, taken)(db, actor)
+            closer(s2, x2.rcv, taken)(db, actor)
         loser = db.get(CashSession, s2)  # restored by the savepoint: open, no close record
         assert (loser.state, loser.close_idempotency_key, loser.counted) == ("open", None, None)
-        assert db.scalar(select(func.count()).select_from(CashCustodyTransfer)) == before["cash_custody_transfers"]
-        ok = closer(s2, x2.rec, key("t21h"))(db, actor)
+        assert db.scalar(select(func.count()).select_from(CashSessionHandover)) == before["cash_session_handovers"]
+        ok = closer(s2, x2.rcv, key("t21h"))(db, actor)
         db.commit()
     assert ok["state"] == "closing" and ok["replayed"] is False
-
-
-def test_capital_accept_real_key_collision_is_classified_before_any_economic_row(client, sink, tenant_a, monkeypatch):
-    x1, x2 = two_branches(client, sink, tenant_a)
-    s1, h1 = closing_handover(client, x1)
-    s2, h2 = closing_handover(client, x2)
-    taken = key("t21h")
-    accept_(client, x1.rec_h, h1, k=taken)
-    before = money()
-    blind(monkeypatch, cash_core, "_accept_replay")
-    with SessionLocal() as db:
-        actor = build_principal(db, db.get(UserAccount, x2.rec), 0)
-        with pytest.raises(IdempotencyConflict):
-            accepter(h2, taken)(db, actor)
-        h, s = db.get(CashCustodyTransfer, h2), db.get(CashSession, s2)
-        assert (h.state, h.accept_idempotency_key, h.accepted_by) == ("pending", None, None)
-        assert (s.state, s.balance) == ("closing", 1000)
-        assert not db.new  # no CashMovement and no CapitalMovement ever left the savepoint
-        ok = accepter(h2, key("t21h"))(db, actor)  # the same transaction goes on to accept normally
-        db.commit()
-    assert ok["state"] == "closed" and ok["replayed"] is False
-    assert money()["cash_movements"] == before["cash_movements"] + 1
 
 
 @pytest.mark.parametrize("constraint", [None, "uq_cash_sessions_active_cash_point", "ck_cash_sessions_state_valid"])
@@ -346,27 +273,20 @@ def test_unrelated_integrity_errors_are_never_classified_as_idempotency_conflict
     x1, x2 = two_branches(client, sink, tenant_a)
     xo = cworld(client, sink, tenant_a, "c")  # a free CashPoint to attempt an open on
     taken = key("t21h")
-    # branch 1 owns `taken` as an open key, a close key and an accept key (each lives in its own column)
-    s1 = open_(client, x1.cas_h, x1.cp, amount="1000.00", k=taken).json()["id"]
-    hid1 = close_(client, x1.cas_h, s1, COUNTS, receiver=x1.rec, k=taken).json()["handover"]["id"]
-    accept_(client, x1.rec_h, hid1, k=taken)
+    # branch 1 owns `taken` as an open key and a close key (each lives in its own column)
+    open_(client, x1.cas_h, x1.cp, source="initial", amount="1000.00", k=taken)
+    cpx = mk_cp(client, x1.adm, x1.b, "T21H-X")["id"]
+    sx = open_(client, x1.cas_h, cpx, amount="1000.00").json()["id"]  # a v2 session that closes with a handover
+    close_(client, x1.cas_h, sx, COUNTS, receiver=x1.rcv, k=taken)
     so = open_(client, x2.cas_h, x2.cp, amount="1000.00").json()["id"]  # a session of branch 2 to attempt a close on
-    _sx, hx = closing_handover(client, cworld(client, sink, tenant_a, "d"))  # a handover to attempt an accept on
-    with SessionLocal() as db:
-        receiver = db.get(CashCustodyTransfer, hx).to_user_id
-    for name in ("_open_replay", "_close_replay", "_accept_replay"):
+    for name in ("_open_replay", "_close_replay"):
         blind(monkeypatch, cash_core, name)
     attempts = (
         (xo.cas, lambda s: any(isinstance(o, CashSession) for o in s.new), opener(xo.cp, taken)),
         (
             x2.cas,
             lambda s: any(isinstance(o, CashSession) and o.close_idempotency_key == taken for o in s.dirty),
-            closer(so, x2.rec, taken),
-        ),
-        (
-            receiver,
-            lambda s: any(isinstance(o, CashCustodyTransfer) and o.accept_idempotency_key == taken for o in s.dirty),
-            accepter(hx, taken),
+            closer(so, x2.rcv, taken),
         ),
     )
     for user, trigger, job in attempts:
@@ -378,7 +298,7 @@ def test_unrelated_integrity_errors_are_never_classified_as_idempotency_conflict
             db.rollback()
 
 
-@pytest.mark.parametrize("which", ["open", "close", "accept"])
+@pytest.mark.parametrize("which", ["open", "close"])
 def test_the_key_constraint_without_a_winning_row_is_not_swallowed(client, sink, tenant_a, monkeypatch, which):
     x = cworld(client, sink, tenant_a)
     if which == "open":
@@ -387,14 +307,9 @@ def test_the_key_constraint_without_a_winning_row_is_not_swallowed(client, sink,
         replay = "_open_replay"
     elif which == "close":
         sid = open_(client, x.cas_h, x.cp, amount="1000.00").json()["id"]
-        constraint, job, user = CLOSE_KEY, closer(sid, x.rec, key("t21h")), x.cas
+        constraint, job, user = CLOSE_KEY, closer(sid, x.rcv, key("t21h")), x.cas
         trigger = lambda s: any(isinstance(o, CashSession) and o.close_idempotency_key for o in s.dirty)  # noqa: E731
         replay = "_close_replay"
-    else:
-        _sid, hid = closing_handover(client, x)
-        constraint, job, user = ACCEPT_KEY, accepter(hid, key("t21h")), x.rec
-        trigger = lambda s: any(isinstance(o, CashCustodyTransfer) and o.accept_idempotency_key for o in s.dirty)  # noqa: E731
-        replay = "_accept_replay"
     blind(monkeypatch, cash_core, replay, calls=99)  # nothing is ever found: no winner to classify against
     failing_flush(monkeypatch, constraint, trigger)
     with SessionLocal() as db:
@@ -417,22 +332,20 @@ def test_replay_semantics_are_unchanged_owner_digest_and_actor_still_matter(clie
         scope="branch",
         branch_id=x.b,
     )
-    ko, kc, ka = key("t21h"), key("t21h"), key("t21h")
-    s = open_(client, x.cas_h, x.cp, amount="1000.00", k=ko).json()
+    ko, kc = key("t21h"), key("t21h")
+    s = open_(client, x.cas_h, x.cp, source="initial", amount="1000.00", k=ko).json()
     # OPEN: the same key + payload by ANOTHER cashier is a conflict, never a replay of someone else's session
-    assert open_(client, x.cas_h, x.cp, amount="1000.00", k=ko).json()["replayed"] is True
-    assert code(open_(client, other_h, x.cp, amount="1000.00", k=ko, expect=409)) == "idempotency_conflict"
-    # CLOSE: the same key with another payload is a conflict
-    closed = close_(client, x.cas_h, s["id"], COUNTS, receiver=x.rec, k=kc).json()
-    assert close_(client, x.cas_h, s["id"], COUNTS, receiver=x.rec, k=kc).json()["replayed"] is True
+    assert open_(client, x.cas_h, x.cp, source="initial", amount="1000.00", k=ko).json()["replayed"] is True
+    assert code(open_(client, other_h, x.cp, source="initial", amount="1000.00", k=ko, expect=409)) == "idempotency_conflict"
+    # CLOSE (a v2 session built directly: a declared one closes by itself): the same key with another payload conflicts
+    cp2 = mk_cp(client, x.adm, x.b, "T21H-R")["id"]
+    sc = open_(client, x.cas_h, cp2, amount="1000.00").json()
+    closed = close_(client, x.cas_h, sc["id"], COUNTS, receiver=x.rcv, k=kc).json()
+    assert close_(client, x.cas_h, sc["id"], COUNTS, receiver=x.rcv, k=kc).json()["replayed"] is True
     assert (
-        code(close_(client, x.cas_h, s["id"], {"500": 2}, receiver=x.rec, k=kc, expect=409)) == "idempotency_conflict"
+        code(close_(client, x.cas_h, sc["id"], {"500": 2}, receiver=x.rcv, k=kc, expect=409)) == "idempotency_conflict"
     )
-    # ACCEPT: the same key by another actor is a conflict
-    hid = closed["handover"]["id"]
-    accept_(client, x.rec_h, hid, k=ka)
-    assert accept_(client, x.rec_h, hid, k=ka).json()["replayed"] is True
-    assert code(accept_(client, x.cas_h, hid, k=ka, expect=409)) == "idempotency_conflict"
+    assert closed["session_handover"]["to_user_id"] == x.rcv
 
 
 # ================================ 4. historical digests are frozen ========================================
@@ -444,30 +357,30 @@ def legacy_digest(payload):
 
 def test_persisted_digests_still_follow_the_t021_formulas_byte_for_byte(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
-    s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
-    closed = close_(client, x.cas_h, s["id"], COUNTS, receiver=x.rec).json()
-    hid = closed["handover"]["id"]
-    accept_(client, x.rec_h, hid)
-    zero = open_(client, x.cas_h, x.cp, source="zero", amount="0").json()
+    cp2, cp3 = mk_cp(client, x.adm, x.b, "T21H-D2")["id"], mk_cp(client, x.adm, x.b, "T21H-D3")["id"]
+    init = open_(client, x.cas_h, x.cp, source="initial", amount="1000.00", k=key("t21h")).json()  # through the API
+    s = open_(client, x.cas_h, cp2, amount="1000.00").json()  # a v2 session with a counted close (built directly)
+    close_(client, x.cas_h, s["id"], COUNTS, receiver=x.rcv)
+    zero = open_(client, x.cas_h, cp3, source="zero", amount="0").json()
     shut = close_(
         client, x.cas_h, zero["id"], {"1000": 0}
     ).json()  # counted = 0: the receiver is not part of the payload
     with SessionLocal() as db:
         row = lambda sql, **p: db.execute(text(sql), p).scalar()  # noqa: E731
-        assert row("SELECT open_request_digest FROM cash_sessions WHERE id = :i", i=s["id"]) == legacy_digest(
+        assert row("SELECT open_request_digest FROM cash_sessions WHERE id = :i", i=init["id"]) == legacy_digest(
             {
                 "operation": "open_cash_session",
                 "cash_point_id": x.cp,
-                "source": "capital",
+                "source": "initial",
                 "amount": "1000.00",
-                "denominations": COUNTS,
+                "denominations": {},
                 "observation_note": "",
             }
         )
         assert row("SELECT open_request_digest FROM cash_sessions WHERE id = :i", i=zero["id"]) == legacy_digest(
             {
                 "operation": "open_cash_session",
-                "cash_point_id": x.cp,
+                "cash_point_id": cp3,
                 "source": "zero",
                 "amount": "0",  # the digest keeps the textual form of the amount ("0" != "0.00"), exactly as in T-021
                 "denominations": {},
@@ -480,7 +393,8 @@ def test_persisted_digests_still_follow_the_t021_formulas_byte_for_byte(client, 
                 "session_id": s["id"],
                 "denominations": COUNTS,
                 "observation_note": "",
-                "receiver_user_id": x.rec,
+                "receiver_user_id": x.rcv,
+                "destination": "next_session",
             }
         )
         assert row("SELECT close_request_digest FROM cash_sessions WHERE id = :i", i=shut["id"]) == legacy_digest(
@@ -489,9 +403,7 @@ def test_persisted_digests_still_follow_the_t021_formulas_byte_for_byte(client, 
                 "session_id": shut["id"],
                 "denominations": {},
                 "observation_note": "",
+                "destination": "next_session",
                 # counted = 0: receiver_user_id is None and the canonical form DROPS None values, so the key is absent
             }
-        )
-        assert row("SELECT accept_request_digest FROM cash_custody_transfers WHERE id = :i", i=hid) == legacy_digest(
-            {"operation": "accept_closing_handover", "handover_id": hid}
         )

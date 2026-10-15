@@ -59,6 +59,7 @@ from tests.test_t021_cashpoint_session_lifecycle import (
     _legacy_world,
     _rows,
     accept_,
+    accept_direct,
     capital_balance,
     capital_rows,
     close_,
@@ -90,15 +91,27 @@ def rworld(client, sink, tenant, tag="a"):
     return x
 
 
-def counted_close(client, x, held, denominations, *, note="Conteo distinto del esperado", accept=True):
-    """Open a capital session of ``held``, close it with ``denominations`` and (by default) accept the handover.
+_cps = iter(range(1, 10**6))
 
-    Returns the final session JSON; a closing difference (if any) is ``["differences"][-1]``."""
-    denom = {"1000": int(Decimal(held) // 1000)}
-    s = open_(client, x.cas_h, x.cp, amount=held, denominations=denom).json()
-    closed = close_(client, x.cas_h, s["id"], denominations, receiver=x.rec, note=note).json()
-    assert closed["state"] == "closing"
-    return accept_(client, x.rec_h, closed["handover"]["id"]).json() if accept else closed
+
+def counted_close(client, x, held, denominations, *, note="Conteo distinto del esperado", accept=True):
+    """Open a declared session of ``held`` and close it with the cash actually counted (``denominations``).
+
+    A declared (``initial``) session closes by itself: the difference is a record, never a handover. Returns the final
+    session JSON; a closing difference (if any) is ``["differences"][-1]``."""
+    busy = client.get(f"{CASH}/sessions/current", headers=x.cas_h, params={"cash_point_id": x.cp}).json()["session"]
+    cp = x.cp  # the base CashPoint while it is free (a handover acceptance leaves an open receiving session there)
+    if busy is not None:
+        cp = mk_cp(client, x.adm, x.b, f"T22-{next(_cps)}")["id"]
+    s = open_(client, x.cas_h, cp, source="initial", amount=held).json()
+    counted = sum(Decimal(d) * q for d, q in denominations.items())
+    r = client.post(
+        f"{CASH}/sessions/{s['id']}/close",
+        headers=x.cas_h,
+        json={"idempotency_key": key(), "counted": format(counted, "f"), "observation_note": note},
+    )
+    assert r.status_code == 200, f"close: {r.status_code} {r.text}"
+    return r.json()
 
 
 def shortage(client, x):
@@ -283,13 +296,13 @@ def test_closing_shortage_accepted_loss_moves_no_cash_and_no_capital_and_audits_
     )
     assert "idempotency_key" not in res and "request_digest" not in res and r["next_action"] is None
     assert money_state() == before and capital_balance(x.t) == cap  # no CashMovement, no CapitalMovement
-    assert len(capital_rows("from_cash")) == 1  # only the T-021 handover entry
-    assert [m.kind for m in movements(out["id"])] == ["opening_capital_fund", "closing_capital_transfer"]
+    assert len(capital_rows("from_cash")) == 0  # nothing ever goes to Capital any more
+    assert [m.kind for m in movements(out["id"])] == ["opening_initial_fund"]
     with SessionLocal() as db:  # the session is untouched: closed, same count, same ledger residual
         s = db.get(CashSession, out["id"])
         assert (s.state, str(s.balance), str(s.counted), str(s.closing_expected), str(s.difference)) == (
             session_before[0],
-            "100.00",
+            "1000.00",  # a declared session keeps its ledger: the counted cash is a record, nothing moves
             "900.00",
             "1000.00",
             "-100.00",
@@ -346,13 +359,13 @@ def test_opening_difference_only_resolves_as_no_further_action_and_never_owns_po
     d_open = detail(client, x.res_h, od["id"])
     assert d_open["next_action"] == {"action": "wait_session_closed", "session_state": "open"}
     closing = close_(
-        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, note="Sigue faltando lo mismo"
+        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, note="Sigue faltando lo mismo"
     ).json()
     assert closing["state"] == "closing"
     assert code(resolve(client, x.res_h, od["id"], expect=409)) == "session_not_closed"  # still not closed
     (cd,) = [d for d in closing["differences"] if d["phase"] == "closing"]
     assert code(resolve(client, x.res_h, cd["id"], "accepted_loss", reference=REF, expect=409)) == "session_not_closed"
-    accept_(client, x.rec_h, closing["handover"]["id"])
+    accept_direct(client, x, closing)
     # closed: an opening difference never takes a loss/surplus, whatever the sign
     for rtype in ("accepted_loss", "accepted_surplus"):
         r = resolve(client, x.res_h, od["id"], rtype, reference=REF, expect=422)
@@ -439,17 +452,22 @@ def test_maker_checker_is_strict_and_the_handover_receiver_may_resolve(client, s
         resolve(client, x.res_h, d).json()["difference"]["status"] == "resolved"
     )  # an independent authorised resolver
     # the receiver who accepted the handover is NOT excluded: with permission and scope they may resolve
-    rec2_h, rec2 = mkuser(client, sink, x.adm, tenant_a, "rec2@x.com", [ACCEPT, *perms], scope="branch", branch_id=x.b)
-    s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
+    rec2_h, rec2 = mkuser(
+        client, sink, x.adm, tenant_a, "rec2@x.com", [ACCEPT, OPEN, "cash.handovers.receive", *perms],
+        scope="branch", branch_id=x.b,
+    )
+    cpa = mk_cp(client, x.adm, x.b, "T22-MC-A")["id"]
+    s = open_(client, x.cas_h, cpa, amount="1000.00").json()
     cl = close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=rec2, note="Faltan 100 sin explicar").json()
-    done = accept_(client, rec2_h, cl["handover"]["id"]).json()
-    assert done["handover"]["accepted_by"] == rec2 and done["state"] == "closed"
+    done = accept_direct(client, x, cl, receiver_h=rec2_h)
+    assert done["session_handover"]["accepted_by"] == rec2 and done["state"] == "closed"
     r = resolve(client, rec2_h, done["differences"][0]["id"], "accepted_loss", reference=REF).json()
     assert r["resolution"]["resolved_by"] == rec2
     # the cashier of a native session can never resolve it, even holding the permission (API path)
-    s2 = open_(client, cas2_h, x.cp, amount="1000.00").json()
-    cl2 = close_(client, cas2_h, s2["id"], {"500": 1}, receiver=x.rec, note="Falta mucho mas").json()
-    fin = accept_(client, x.rec_h, cl2["handover"]["id"]).json()
+    cpb = mk_cp(client, x.adm, x.b, "T22-MC-B")["id"]
+    s2 = open_(client, cas2_h, cpb, amount="1000.00").json()
+    cl2 = close_(client, cas2_h, s2["id"], {"500": 1}, receiver=x.rcv, note="Falta mucho mas").json()
+    fin = accept_direct(client, x, cl2)
     assert code(resolve(client, cas2_h, fin["differences"][0]["id"], expect=403)) == "maker_checker_violation"
 
 
@@ -552,11 +570,8 @@ def test_reads_list_filters_detail_and_cash_point_scope_regression(client, sink,
     other = cworld(client, sink, tenant_a, "b")
     assert client.get(f"{CASH}/differences", headers=x.rec_h, params={"branch_id": other.b}).status_code == 403
     assert client.get(f"{CASH}/differences", headers=x.cas_h).status_code == 403
-    hand = client.get(f"{CASH}/handovers", headers=cpr_h, params={"state": "confirmed"})
-    assert hand.status_code == 403  # a cash_point reader without the accept permission still sees no handovers
-    acc_h, _ = cash_point_user(client, sink, x, tenant_a, "cp-acc@x.com", [ACCEPT], x.cp)
-    hov = client.get(f"{CASH}/handovers", headers=acc_h, params={"state": "confirmed"}).json()["items"]
-    assert len(hov) == 2  # the shared fix: a CashPoint-scoped receiver lists its CashPoint's handovers
+    # the handovers to capital are gone: their list route no longer exists
+    assert client.get(f"{CASH}/handovers", headers=cpr_h, params={"state": "confirmed"}).status_code == 404
 
 
 # ================================ idempotency ==============================================================
@@ -760,10 +775,10 @@ def test_database_enforces_resolution_shape_phase_sign_and_disposition(client, s
     ).json()
     (od,) = s["differences"]
     closing = close_(
-        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, note="Sigue faltando lo mismo"
+        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, note="Sigue faltando lo mismo"
     ).json()
     (cd,) = [d for d in closing["differences"] if d["phase"] == "closing"]
-    accept_(client, x.rec_h, closing["handover"]["id"])
+    accept_direct(client, x, closing)
     _o, gain = overage(client, x)
     sid, oid, cid = s["id"], od["id"], cd["id"]
 
@@ -850,10 +865,10 @@ def test_database_requires_a_closed_session_and_keeps_the_original_difference_im
     refused_state = "its differences are resolved only once it is closed"
     with pytest.raises(DBAPIError, match=refused_state):  # session open
         sql(stmt, **params)
-    closing = close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, note="Sigue faltando").json()
+    closing = close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, note="Sigue faltando").json()
     with pytest.raises(DBAPIError, match=refused_state):  # session closing
         sql(stmt, **params)
-    accept_(client, x.rec_h, closing["handover"]["id"])
+    accept_direct(client, x, closing)
     (cd,) = [d for d in closing["differences"] if d["phase"] == "closing"]
     # the original observation is immutable, column by column, resolved or not
     for column, value in (
@@ -930,9 +945,9 @@ def test_database_deferred_consistency_and_one_posting_per_session(client, sink,
         client, x.cas_h, x.cp, amount="1000.00", denominations={"500": 1, "200": 2}, note="Fondo incompleto"
     ).json()
     (od,) = s["differences"]
-    closing = close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, note="Sigue faltando").json()
+    closing = close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, note="Sigue faltando").json()
     (cd,) = [i for i in closing["differences"] if i["phase"] == "closing"]
-    accept_(client, x.rec_h, closing["handover"]["id"])
+    accept_direct(client, x, closing)
     with SessionLocal() as db:
         db.execute(
             text(
@@ -1169,26 +1184,19 @@ def test_migration_0021_legacy_differences_resolve_only_after_the_session_closes
             zero["difference"]["provenance"] == "legacy_migration"
             and zero["accounting_disposition"] == "posting_required"
         )
-        # (15) the migration handover is accepted -> `closed` (terminal) -> the legacy difference may then resolve
-        cl = cash_core.accept_handover(
-            db,
-            receiver,
-            _rows(eng, "SELECT id FROM cash_custody_transfers WHERE session_id = :s", s=w.s_cr)[0].id,
-            idempotency_key=key("lg"),
-        )
-        db.commit()
-        assert cl["state"] == "closed"
-        done = diffs.resolve_difference(
-            db,
-            resolver,
-            rows[w.s_cr].id,
-            idempotency_key=key("lg"),
-            resolution_type="accepted_loss",
-            reason="Faltante historico con entrega aceptada",
-            reference="ACTA-LEGACY-2",
-        )
-        db.commit()
-        assert done["difference"]["status"] == "resolved" and done["resolution"]["resolved_by"] == w.u[2]
+        # (15) the migrated capital handover can no longer be accepted through the API: the session stays `closing`
+        # (read-only history) and its legacy difference keeps waiting for a closed session
+        with pytest.raises(SessionNotClosed):
+            diffs.resolve_difference(
+                db,
+                resolver,
+                rows[w.s_cr].id,
+                idempotency_key=key("lg"),
+                resolution_type="accepted_loss",
+                reason="Faltante historico con entrega pendiente",
+                reference="ACTA-LEGACY-2",
+            )
+        db.rollback()
     # the original evidence is untouched: no observation was synthesised, no figure rewritten
     legacy = _rows(
         eng,

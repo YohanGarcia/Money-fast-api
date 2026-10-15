@@ -56,7 +56,15 @@ def free_cash_point(db, box_id: int) -> int:
 
 
 def open_v2_session(
-    db, *, box_id: int, cashier_id: int, balance="0.00", opened_by: int | None = None, cash_point_id: int | None = None
+    db,
+    *,
+    box_id: int,
+    cashier_id: int,
+    balance="0.00",
+    opened_by: int | None = None,
+    cash_point_id: int | None = None,
+    counted=None,
+    counted_denominations: dict | None = None,
 ) -> CashSession:
     """An OPEN v2 session owned by ``cashier_id``: zero opening, or a capital opening of ``balance`` (capital is injected
     first, so the reserve nets to zero). Flushes; the caller commits."""
@@ -72,8 +80,11 @@ def open_v2_session(
         opening_source="capital" if amount > 0 else "zero",
         opening_contract="v2",
         opening_expected=amount,
-        opening_counted=amount,
-        opening_denominations=denominations_for(amount) if amount > 0 else {},
+        # a counted opening whose count differs from the fund keeps its own figures (the difference record is the caller's)
+        opening_counted=Decimal(counted) if counted is not None else amount,
+        opening_denominations=counted_denominations
+        if counted_denominations is not None
+        else (denominations_for(amount) if amount > 0 else {}),
         balance=Decimal(0),
         balance_base=Decimal(0),
         opened_by=actor,

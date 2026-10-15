@@ -250,7 +250,7 @@ def test_a_direct_declaration_freezes_the_counted_cash_on_the_same_cash_point(cl
     s = open_(client, x.cas_h, x.cp, amount="31000.00").json()
     closed = dclose(client, x.cas_h, s["id"], N30, x.nxt, note="Faltan 1000 en el conteo").json()
     sh = closed["session_handover"]
-    assert closed["state"] == "closing" and closed["handover"] is None  # the capital handover field stays capital-only
+    assert closed["state"] == "closing" and closed["handover"] is None  # there is no capital handover any more
     assert (closed["closing_expected"], closed["counted"], closed["difference"]) == ("31000.00", "30000.00", "-1000.00")
     assert (sh["state"], sh["amount"], sh["from_user_id"], sh["to_user_id"], sh["cash_point_id"]) == (
         "pending",
@@ -300,7 +300,7 @@ def test_the_declaration_names_a_valid_receiver_of_the_same_cash_point_or_nothin
         (999_999, "invalid_receiver"),
     ):
         assert code(dclose(client, x.cas_h, s["id"], N30, receiver, expect=422)) == expected
-    assert code(dclose(client, x.cas_h, s["id"], {"1000": 0}, x.nxt, expect=422)) == "next_session_requires_cash"
+    assert code(dclose(client, x.cas_h, s["id"], {"1000": 0}, x.nxt, expect=422)) == "observation_required"
     assert dclose(client, x.cas_h, s["id"], N30, x.nxt, destination="elsewhere", expect=422)
     assert money() == before and session_row(s["id"])["state"] == "open"  # not a single row written by the refusals
     assert dclose(client, x.cas_h, s["id"], N30, x.nxt).json()["state"] == "closing"
@@ -473,12 +473,12 @@ def test_a_suspended_cash_point_refuses_the_acceptance_but_not_the_recovery(clie
     assert money() == before and handover_row(hid)["state"] == "pending"
     assert client.post(f"{V2}/cash-points/{x.cp}/resume", headers=x.adm).status_code == 200
     assert daccept(client, x.nxt_h, hid, N30).json()["session_handover"]["state"] == "confirmed"
-    # recovery while suspended: the redirect to capital is not an opening
+    # recovery while suspended: re-assigning the cash to another receiver is not an opening
     y = hworld(client, sink, tenant_a, "s")
     sid2, hid2, _ = declared(client, y)
     suspend(client, y.adm, y.cp)
-    out = dredirect(client, y.cas_h, hid2, "capital", y.rec).json()
-    assert out["session_handover"]["state"] == "cancelled" and out["replacement"]["type"] == "capital_handover"
+    out = dredirect(client, y.cas_h, hid2, "next_session", y.alt).json()
+    assert out["session_handover"]["state"] == "cancelled" and out["replacement"]["type"] == "session_handover"
 
 
 # ================================ 3. decline ==============================================================
@@ -572,10 +572,7 @@ def test_redirect_authority_chain_and_forward_pointers(client, sink, tenant_a):
     assert code(dredirect(client, x.alt_h, h1, "next_session", x.sup, expect=403)) == "redirect_not_authorized"
     for receiver, why in ((x.cas, "maker"), (x.rec, "no receive/open"), (999_999, "unknown")):
         assert code(dredirect(client, x.cas_h, h1, "next_session", receiver, expect=422)) == "invalid_receiver", why
-    assert (
-        code(dredirect(client, x.cas_h, h1, "capital", x.alt, expect=422)) == "invalid_receiver"
-    )  # not a capital receiver
-    assert code(dredirect(client, x.cas_h, h1, "capital", x.cas, expect=422)) == "invalid_receiver"  # never the maker
+    assert code(dredirect(client, x.cas_h, h1, "capital", x.alt, expect=422)) == "validation_error"  # no capital
     assert (
         code(dredirect(client, x.cas_h, h1, "next_session", x.alt, reason="corto", expect=422))
         == "handover_reason_required"
@@ -598,7 +595,6 @@ def test_redirect_authority_chain_and_forward_pointers(client, sink, tenant_a):
     # the new receiver declines: from now on the maker ALONE may not redirect the disputed cash
     ddecline(client, x.alt_h, h2, k=shared)  # decline and redirect keys live in independent namespaces
     assert code(dredirect(client, x.cas_h, h2, "next_session", x.nxt, expect=403)) == "redirect_not_authorized"
-    assert code(dredirect(client, x.cas_h, h2, "capital", x.rec, expect=403)) == "redirect_not_authorized"
     assert handover_row(h2)["state"] == "pending"
     # supervision (cash.handovers.redirect) may: back to the FIRST receiver, as a NEW immutable row (chain h1 -> h2 -> h3)
     out = dredirect(client, x.sup_h, h2, "next_session", x.nxt).json()
@@ -627,56 +623,6 @@ def test_redirect_authority_chain_and_forward_pointers(client, sink, tenant_a):
     assert len(events_redirect) == 2 and all("reason" not in e.details for e in events_redirect)
 
 
-def test_a_direct_handover_may_leave_for_capital_and_never_comes_back(client, sink, tenant_a):
-    x = hworld(client, sink, tenant_a)
-    sid, h1, _ = declared(client, x)
-    ddecline(client, x.nxt_h, h1)
-    capital_before = money()["capital_movements"]
-    out = dredirect(client, x.sup_h, h1, "capital", x.rec).json()
-    cap = out["replacement"]["handover"]
-    assert (
-        out["replacement"]["type"] == "capital_handover" and cap["state"] == "pending" and cap["amount"] == "30000.00"
-    )
-    old = handover_row(h1)
-    assert (old["state"], old["redirected_to_session_handover_id"], old["redirected_to_capital_handover_id"]) == (
-        "cancelled",
-        None,
-        cap["id"],
-    )
-    kind = q(
-        "SELECT kind, session_id, to_user_id, from_user_id, provenance FROM cash_custody_transfers WHERE id = :i",
-        i=cap["id"],
-    )[0]
-    assert tuple(kind) == (
-        "closing_capital",
-        sid,
-        x.rec,
-        x.cas,
-        "v2",
-    )  # an ordinary T-021 row: same session, same frozen cash
-    session = client.get(f"{CASH}/sessions/{sid}", headers=x.cas_h).json()
-    assert session["handover"]["id"] == cap["id"] and session["session_handover"] is None
-    assert session["next_action"]["action"] == "accept_closing_handover"
-    # no route back: the cancelled row and its detail cannot be redirected / accepted again, and T-021 rules apply from here
-    assert code(dredirect(client, x.sup_h, h1, "next_session", x.nxt, expect=409)) == "session_handover_not_pending"
-    assert code(daccept(client, x.nxt_h, h1, N30, expect=409)) == "session_handover_not_pending"
-    assert (
-        code(client.post(f"{CASH}/handovers/{cap['id']}/accept", headers=x.nxt_h, json={"idempotency_key": key("t23")}))
-        == "permission_denied"
-    )
-    done = accept_(client, x.rec_h, cap["id"]).json()  # the existing T-021 endpoint: named receiver, no recount
-    assert done["state"] == "closed" and done["handover"]["state"] == "confirmed"
-    refused(
-        *insert_handover(x, sid, to_user_id=x.alt)[:1],
-        match="closing session",
-        **insert_handover(x, sid, to_user_id=x.alt)[1],
-    )
-    assert money()["capital_movements"] == capital_before + 1 and len(capital_rows("from_cash")) == 1
-    assert handover_row(h1)["state"] == "cancelled"  # the historical direct row stays exactly as redirected
-    listed = client.get(f"{CASH}/handovers", headers=x.rec_h, params={"state": "confirmed"}).json()["items"]
-    assert [i["id"] for i in listed] == [cap["id"]]  # the capital list is still capital-only
-
-
 # ================================ 5. snapshot, active slot, history ========================================
 def test_a_handover_opened_session_closes_with_the_right_snapshot(client, sink, tenant_a):
     x = hworld(client, sink, tenant_a)
@@ -685,7 +631,7 @@ def test_a_handover_opened_session_closes_with_the_right_snapshot(client, sink, 
     closed = client.post(
         f"{CASH}/sessions/{new['id']}/close",
         headers=x.nxt_h,
-        json={"idempotency_key": key("t23"), "denominations": N30, "receiver_user_id": x.rec},
+        json={"idempotency_key": key("t23"), "denominations": N30, "receiver_user_id": x.alt},
     )
     assert closed.status_code == 200 and closed.json()["state"] == "closing"
     snap = q("SELECT snapshot FROM cash_sessions WHERE id = :i", i=new["id"])[0][0]
@@ -697,7 +643,8 @@ def test_a_handover_opened_session_closes_with_the_right_snapshot(client, sink, 
         "30000.00",
     )
     assert snap["movement_ids"] == []
-    assert accept_(client, x.rec_h, closed.json()["handover"]["id"]).json()["state"] == "closed"
+    final = daccept(client, x.alt_h, closed.json()["session_handover"]["id"], N30).json()
+    assert final["source_session"]["state"] == "closed"
 
 
 def test_close_then_open_ordering_the_active_slot_is_held_end_to_end(client, sink, tenant_a):
@@ -750,14 +697,7 @@ def test_ordinary_open_can_never_create_a_handover_opening_and_the_database_agre
         )
     assert type(bad.value).__name__ == "InvalidOpening"
     new = daccept(client, x.nxt_h, hid, N30).json()["receiving_session"]
-    shut = client.post(
-        f"{CASH}/sessions/{new['id']}/close",
-        headers=x.nxt_h,
-        json={"idempotency_key": key("t23"), "denominations": N30, "receiver_user_id": x.rec},
-    ).json()
-    accept_(
-        client, x.rec_h, shut["handover"]["id"]
-    )  # the slot is free again: only the unique index can refuse a 2nd session
+    dclose(client, x.nxt_h, new["id"], {"1000": 0}, None, note="Se entrega todo, caja en cero")  # direct close: slot free
     # database backstops of the `handover` opening source
     bad_sessions = (
         (insert_session(x, hid=None), "handover opening needs its confirmed"),  # source handover without its handover
@@ -1023,12 +963,7 @@ def test_forward_pointers_form_a_chain_never_a_tree_and_never_point_to_another_s
     sid, h1, _ = declared(client, x)
     # an OLDER confirmed handover of the same cash point and amount is not a replacement for a later session
     new = daccept(client, x.nxt_h, h1, N30).json()["receiving_session"]
-    shut = client.post(
-        f"{CASH}/sessions/{new['id']}/close",
-        headers=x.nxt_h,
-        json={"idempotency_key": key("t23"), "denominations": N30, "receiver_user_id": x.rec},
-    ).json()
-    accept_(client, x.rec_h, shut["handover"]["id"])
+    dclose(client, x.nxt_h, new["id"], {"1000": 0}, None, note="Se entrega todo, caja en cero")  # direct close: slot free
     sid3, h3, _ = declared(client, x)
 
     def cancel(handover, k):
@@ -1206,9 +1141,6 @@ def test_a_forward_pointer_must_lead_to_the_same_cash_session_and_cash_point(cli
     cp2 = mk_cp(client, x.adm, x.b, "OTRA", currencies=["DOP"])["id"]
     other_sid = open_(client, x.cas_h, cp2, amount="30000.00").json()["id"]
     other_h = dclose(client, x.cas_h, other_sid, N30, x.alt).json()["session_handover"]["id"]
-    cp3 = mk_cp(client, x.adm, x.b, "TERCERA", currencies=["DOP"])["id"]
-    third_sid = open_(client, x.cas_h, cp3, amount="30000.00").json()["id"]
-    cap_other = dclose(client, x.cas_h, third_sid, N30, x.rec, destination="capital").json()["handover"]["id"]
     cancel = (
         "UPDATE cash_session_handovers SET state = 'cancelled', redirect_idempotency_key = :k, "
         "redirect_request_digest = 'sha256:x', redirected_by = :u, redirected_at = now(), "
@@ -1220,16 +1152,10 @@ def test_a_forward_pointer_must_lead_to_the_same_cash_session_and_cash_point(cli
         {"o": other_h, "h": h1},
     )
     to_self = ("UPDATE cash_session_handovers SET redirected_to_session_handover_id = :h WHERE id = :h", {"h": h1})
-    to_capital = (
-        "UPDATE cash_session_handovers SET redirected_to_capital_handover_id = :o WHERE id = :h",
-        {"o": cap_other, "h": h1},
-    )
     with pytest.raises(DBAPIError, match="redirected to a direct handover of the same cash, session and cash point"):
         tx(cancel, to_direct)  # a direct row of ANOTHER session / cash point is not a replacement
     with pytest.raises(DBAPIError, match="redirected to a direct handover of the same cash, session and cash point"):
         tx(cancel, to_self)
-    with pytest.raises(DBAPIError, match="redirected to a capital handover of the same cash and session"):
-        tx(cancel, to_capital)  # a capital row of ANOTHER session is not a replacement either
     assert handover_row(h1)["state"] == "pending" and sid
 
 
@@ -1305,14 +1231,12 @@ def test_a_user_with_cash_responsibility_cannot_be_disabled(client, sink, tenant
     assert code(disable(x.nxt, 409)) == "user_has_cash_responsibility"  # pending, non-declined direct receiver
     ddecline(client, x.nxt_h, hid)
     disable(x.nxt, 200)  # a receiver who declined has discharged the acceptance responsibility
-    dredirect(client, x.sup_h, hid, "capital", x.rec)
-    assert code(disable(x.rec, 409)) == "user_has_cash_responsibility"  # named receiver of a pending CAPITAL handover
+    new_hid = dredirect(client, x.sup_h, hid, "next_session", x.alt).json()["replacement"]["handover"]["id"]
+    assert code(disable(x.alt, 409)) == "user_has_cash_responsibility"  # the new pending direct receiver
     assert code(disable(x.cas, 409)) == "user_has_cash_responsibility"  # the source is still closing
-    new_cap = client.get(f"{CASH}/sessions/{s['id']}", headers=x.cas_h).json()["handover"]["id"]
-    accept_(client, x.rec_h, new_cap)
+    daccept(client, x.alt_h, new_hid, N30)
     disable(x.cas, 200)  # everything closed: disables normally, responsibility is never transferred silently
     disable(x.rec, 200)
-    assert disable(x.alt, 200)  # a user without any responsibility disables normally
     # a receiver who OWNS the session that a direct accept opened is guarded too
     y = hworld(client, sink, tenant_a, "g")
     _sid, h2, _ = declared(client, y)
@@ -1328,35 +1252,8 @@ def legacy_digest(payload):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def test_the_capital_close_digest_is_byte_identical_and_next_session_adds_one_key(client, sink, tenant_a):
+def test_the_close_digest_carries_its_destination_and_the_other_commands_have_their_own(client, sink, tenant_a):
     x = hworld(client, sink, tenant_a)
-    s1 = open_(client, x.cas_h, x.cp, amount="1000.00").json()["id"]
-    k1 = key("t23")
-    plain = client.post(
-        f"{CASH}/sessions/{s1}/close",
-        headers=x.cas_h,
-        json={"idempotency_key": k1, "denominations": {"1000": 1}, "receiver_user_id": x.rec},  # destination omitted
-    )
-    assert plain.status_code == 200
-    expected = legacy_digest(
-        {
-            "operation": "close_cash_session",
-            "session_id": s1,
-            "denominations": {"1000": 1},
-            "observation_note": "",
-            "receiver_user_id": x.rec,
-        }
-    )
-    assert session_row(s1)["close_request_digest"] == expected  # NO "destination" key in the capital / default digest
-    # historical retry: the same key + payload replays, with or without the explicit default
-    again = client.post(
-        f"{CASH}/sessions/{s1}/close",
-        headers=x.cas_h,
-        json={"idempotency_key": k1, "denominations": {"1000": 1}, "receiver_user_id": x.rec, "destination": "capital"},
-    )
-    assert again.status_code == 200 and again.json()["replayed"] is True
-    # next_session: the same canonical payload PLUS destination, a distinct digest
-    accept_(client, x.rec_h, plain.json()["handover"]["id"])
     s2 = open_(client, x.cas_h, x.cp, amount="1000.00").json()["id"]
     k2 = key("t23")
     dclose(client, x.cas_h, s2, {"1000": 1}, x.nxt, k=k2)
@@ -1381,11 +1278,8 @@ def test_the_capital_close_digest_is_byte_identical_and_next_session_adds_one_ke
         }
     )
     assert dclose(client, x.cas_h, s2, {"1000": 1}, x.nxt, k=k2).json()["replayed"] is True
-    # the same key with the OTHER destination is a different request
-    assert (
-        code(dclose(client, x.cas_h, s2, {"1000": 1}, x.rec, k=k2, destination="capital", expect=409))
-        == "idempotency_conflict"
-    )
+    # the same key with ANOTHER receiver is a different request
+    assert code(dclose(client, x.cas_h, s2, {"1000": 1}, x.alt, k=k2, expect=409)) == "idempotency_conflict"
     # command digests of the new commands (own formulas, own namespaces)
     h2 = handover_row(q("SELECT id FROM cash_session_handovers WHERE source_session_id = :s", s=s2)[0][0])
     ka, kd = key("t23"), key("t23")
@@ -1981,24 +1875,3 @@ def test_migration_0022_downgrade_locks_the_history_tables_before_it_looks():
 
 
 # ================================ 12. the earlier flows are untouched ======================================
-def test_the_capital_flow_endpoints_and_defaults_stay_capital_only(client, sink, tenant_a):
-    x = hworld(client, sink, tenant_a)
-    s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
-    closed = client.post(
-        f"{CASH}/sessions/{s['id']}/close",
-        headers=x.cas_h,
-        json={"idempotency_key": key("t23"), "denominations": {"1000": 1}, "receiver_user_id": x.rec},
-    ).json()
-    assert closed["handover"]["id"] and closed["session_handover"] is None
-    assert closed["next_action"]["action"] == "accept_closing_handover"
-    assert count("cash_session_handovers") == 0
-    done = accept_(client, x.rec_h, closed["handover"]["id"]).json()
-    assert done["state"] == "closed" and movements(s["id"], "closing_capital_transfer")[0].amount == Decimal("-1000.00")
-    assert (
-        q("SELECT count(*) FROM cash_movements WHERE kind IN ('session_handover_out', 'opening_handover_fund')")[0][0]
-        == 0
-    )
-    assert (
-        client.get(f"{CASH}/handovers", headers=x.rec_h, params={"state": "confirmed"}).json()["items"][0]["id"]
-        == closed["handover"]["id"]
-    )

@@ -29,7 +29,7 @@ from app.modules.cash import sessions as cash_core
 from app.modules.identity.authorization import Grant, Principal
 from app.modules.identity.catalog import CATALOG_CODES
 from tests import pg_env  # noqa: F401  (must precede app imports)
-from tests.cash_fixtures import close_session_now, open_v2_session
+from tests.cash_fixtures import close_session_now, denominations_for, open_v2_session
 from tests.test_t001_foundation import _alembic, scratch_db  # noqa: F401
 from tests.test_t002_identity import (  # noqa: F401  (fixtures + helpers shared with the earlier suites)
     admin_headers,
@@ -77,10 +77,15 @@ def refused(statement, match=None, **params):
 
 
 def capital_balance(tenant_id):
+    """The Capital ledger is read-only history now: the balance is computed straight from its rows."""
     with SessionLocal() as db:
-        from app.services import capital_service
-
-        return capital_service.balance(db, tenant_id)
+        return db.execute(
+            text(
+                "SELECT COALESCE(SUM(CASE WHEN kind IN ('injection', 'from_cash') THEN amount ELSE -amount END), 0) "
+                "FROM capital_movements WHERE company_id = :t"
+            ),
+            {"t": tenant_id},
+        ).scalar_one()
 
 
 def cworld(client, sink, tenant, tag="a"):
@@ -109,14 +114,60 @@ def cworld(client, sink, tenant, tag="a"):
     rec_h, rec = mkuser(
         client, sink, adm, tenant, f"rec-{tag}@x.com", [ACCEPT, READ, DIFF_READ], scope="branch", branch_id=b
     )
+    # a cashier of the same branch that may RECEIVE and open here: the only kind of receiver a counted close has now
+    rcv_h, rcv = mkuser(
+        client, sink, adm, tenant, f"rcv-{tag}@x.com", [OPEN, CLOSE, READ, "cash.handovers.receive"],
+        scope="branch", branch_id=b,
+    )
     return SimpleNamespace(
-        adm=adm, b=b, box=box_id, cp=cp, cas_h=cas_h, cas=cas, rec_h=rec_h, rec=rec, t=tenant["tenant_id"]
+        adm=adm, b=b, box=box_id, cp=cp, cas_h=cas_h, cas=cas, rec_h=rec_h, rec=rec, rcv_h=rcv_h, rcv=rcv,
+        t=tenant["tenant_id"],
     )
 
 
+class _Direct:
+    """A minimal response for a session built directly in the database (see ``open_``)."""
+
+    text = ""
+
+    def __init__(self, data, status_code=200):
+        self._data = data
+        self.status_code = status_code
+
+    def json(self):
+        return self._data
+
+
 def open_(client, hdr, cp, source="capital", amount="1000.00", denominations=None, note=None, expect=200, k=None):
+    if source == "capital" and expect == 200:
+        # Capital no longer funds a session through the API (the endpoint refuses it). The suites that exercise what
+        # happens AFTER such an opening (differences, handovers, backstops) get the same history built directly.
+        uid = client.get(f"{V2}/auth/me", headers=hdr).json()["user"]["id"]
+        with SessionLocal() as db:
+            box_id = db.execute(
+                text("SELECT b.id FROM cash_boxes b JOIN cash_points p ON p.branch_id = b.branch_id WHERE p.id = :cp"),
+                {"cp": cp},
+            ).scalar_one()
+            counted_map = {str(d): int(q) for d, q in (denominations or {}).items()}
+            counted = sum(Decimal(d) * q for d, q in counted_map.items())
+            differs = bool(counted_map) and counted != Decimal(amount)
+            if differs and len(note or "") < 3:  # an opening whose count differs from the fund needs an observation
+                return _Direct({"error": {"code": "observation_required"}, "detail": "observation_required"}, 422)
+            session = open_v2_session(
+                db, box_id=box_id, cashier_id=uid, balance=amount, cash_point_id=cp,
+                counted=counted if differs else None, counted_denominations=counted_map if differs else None,
+            )
+            if differs:
+                cash_core._record_difference(
+                    db, session, phase="opening", expected=Decimal(amount), counted=counted, note=note,
+                    actor_id=uid, at=datetime.now(UTC),
+                )
+            db.commit()
+            return _Direct(cash_core.session_out(db, session, replayed=False))
+    if source == "capital":
+        source = "initial"  # the API no longer has a capital opening: an attempt is answered like any initial one
     if denominations is None:
-        denominations = {"1000": int(Decimal(amount) // 1000)} if source == "capital" else {}
+        denominations = {}
     body = {
         "idempotency_key": k or key(),
         "cash_point_id": cp,
@@ -140,6 +191,36 @@ def close_(client, hdr, sid, denominations, receiver=None, note=None, expect=200
     r = client.post(f"{CASH}/sessions/{sid}/close", headers=hdr, json=body)
     assert r.status_code == expect, f"close: {r.status_code} {r.text}"
     return r
+
+
+def finish_close(client, x, session_id, denominations, note=None):
+    """Close ``session_id`` with a counted close to ``x.rcv`` and let ``x.rcv`` recount and accept it: the source session
+    ends ``closed`` (the only way a v2 session with cash ends). Returns the closed source session."""
+    closed = close_(client, x.cas_h, session_id, denominations, receiver=x.rcv, note=note).json()
+    handover = closed["session_handover"]
+    exact = {d: q for d, q in denominations.items()}
+    r = client.post(
+        f"{CASH}/session-handovers/{handover['id']}/accept",
+        headers=x.rcv_h,
+        json={"idempotency_key": key(), "denominations": exact},
+    )
+    assert r.status_code == 200, f"accept direct: {r.status_code} {r.text}"
+    out = client.get(f"{CASH}/sessions/{session_id}", headers=x.cas_h).json()
+    assert out["state"] == "closed", out
+    return out
+
+
+def accept_direct(client, x, closed, receiver_h=None):
+    """The next cashier recounts the cash of a counted close (``closed`` is the close answer) and accepts it: the
+    source session ends ``closed``. Returns the source session read back."""
+    handover = closed["session_handover"]
+    r = client.post(
+        f"{CASH}/session-handovers/{handover['id']}/accept",
+        headers=receiver_h or x.rcv_h,
+        json={"idempotency_key": key(), "denominations": denominations_for(handover["amount"])},
+    )
+    assert r.status_code == 200, f"accept direct: {r.status_code} {r.text}"
+    return client.get(f"{CASH}/sessions/{closed['id']}", headers=x.cas_h).json()
 
 
 def accept_(client, hdr, hid, expect=200, k=None):
@@ -167,7 +248,7 @@ def suspend(client, adm, cp, reason="Investigacion de seguridad"):
 
 
 # ================================ opening (D3) ==========================================================
-def test_zero_and_capital_openings_trace_their_origin_and_replay_safely(client, sink, tenant_a):
+def test_zero_and_initial_openings_trace_their_origin_replay_safely_and_capital_is_gone(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
     cp2 = mk_cp(client, x.adm, x.b, "T21-Z")["id"]
     assert (
@@ -187,45 +268,33 @@ def test_zero_and_capital_openings_trace_their_origin_and_replay_safely(client, 
         == "invalid_cash_opening"
     )
     assert open_(client, x.cas_h, x.cp, source="declared", expect=422).status_code == 422  # no anonymous source exists
-    assert (
-        code(open_(client, x.cas_h, x.cp, source="capital", amount="1500.00", denominations={}, expect=422))
-        == "invalid_cash_opening"
+    # the Capital opening is retired: the API only knows ``zero`` and ``initial``
+    refused_capital = client.post(
+        f"{CASH}/sessions/open",
+        headers=x.cas_h,
+        json={"idempotency_key": key(), "cash_point_id": x.cp, "source": "capital", "amount": "1500.00",
+              "denominations": {"1000": 1, "500": 1}},
     )
+    assert refused_capital.status_code == 422
     before = capital_balance(x.t)
     k = key()
-    s = open_(client, x.cas_h, x.cp, amount="1500.00", denominations={"1000": 1, "500": 1}, k=k).json()
+    s = open_(client, x.cas_h, x.cp, source="initial", amount="1500.00", k=k).json()
     assert (s["state"], s["opening_source"], s["balance"], s["opening_counted"], s["cashier_user_id"]) == (
         "open",
-        "capital",
+        "initial",
         "1500.00",
         "1500.00",
         x.cas,
     )
     ((mid, kind, amount),) = movements(s["id"])
-    assert (kind, amount) == ("opening_capital_fund", Decimal("1500.00"))
-    ((_, cap_amount, cap_link),) = capital_rows("to_cash")
-    assert (cap_amount, cap_link) == (Decimal("1500.00"), mid)
-    assert capital_balance(x.t) == before - Decimal("1500.00")  # no double funding, no inflation
-    replay = open_(client, x.cas_h, x.cp, amount="1500.00", denominations={"500": 1, "1000": 1}, k=k).json()
+    assert (kind, amount) == ("opening_initial_fund", Decimal("1500.00"))
+    assert capital_rows("to_cash") == [] and capital_balance(x.t) == before  # Capital is never touched
+    replay = open_(client, x.cas_h, x.cp, source="initial", amount="1500.00", k=k).json()
+    assert replay["replayed"] is True and replay["id"] == s["id"] and len(movements(s["id"])) == 1
     assert (
-        replay["replayed"] is True
-        and replay["id"] == s["id"]
-        and len(movements(s["id"])) == 1
-        and len(capital_rows("to_cash")) == 1
-    )
-    assert (
-        code(open_(client, x.cas_h, x.cp, amount="2000.00", denominations={"1000": 2}, k=k, expect=409))
+        code(open_(client, x.cas_h, x.cp, source="initial", amount="2000.00", k=k, expect=409))
         == "idempotency_conflict"
     )
-    # insufficient capital: nothing persists
-    cp3 = mk_cp(client, x.adm, x.b, "T21-POOR")["id"]
-    sessions = count("cash_sessions")
-    assert (
-        code(open_(client, x.cas_h, cp3, amount="200000.00", denominations={"2000": 100}, expect=409))
-        == "insufficient_capital"
-    )
-    assert count("cash_sessions") == sessions and len(capital_rows("to_cash")) == 1
-
 
 def test_anonymous_opening_cash_is_impossible_even_in_the_database(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
@@ -300,7 +369,9 @@ def test_one_active_session_per_cash_point_and_parallel_points_in_a_branch(clien
 
 
 # ================================ close, handover, closed terminal (D2/D5) ===============================
-def test_close_zero_is_direct_close_with_cash_hands_over_and_closed_is_terminal(client, sink, tenant_a):
+def test_close_zero_is_direct_close_with_cash_hands_over_to_the_next_session_and_closed_is_terminal(
+    client, sink, tenant_a
+):
     x = cworld(client, sink, tenant_a)
     cp2 = mk_cp(client, x.adm, x.b, "T21-Z")["id"]
     zero = open_(client, x.cas_h, cp2, source="zero", amount="0").json()
@@ -308,26 +379,15 @@ def test_close_zero_is_direct_close_with_cash_hands_over_and_closed_is_terminal(
     assert (closed["state"], closed["handover"], closed["counted"]) == ("closed", None, "0.00")
     assert count("cash_custody_transfers") == 0 and movements(zero["id"]) == []  # no zero-value handover or movement
     s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
-    capital = capital_balance(x.t)
     k = key()
-    c = close_(client, x.cas_h, s["id"], {"500": 2}, receiver=x.rec, k=k).json()
-    assert (
-        c["state"],
-        c["difference"],
-        c["handover"]["state"],
-        c["handover"]["amount"],
-        c["handover"]["to_user_id"],
-    ) == ("closing", "0.00", "pending", "1000.00", x.rec)
-    assert c["next_action"] == {
-        "action": "accept_closing_handover",
-        "handover_id": c["handover"]["id"],
-        "receiver_user_id": x.rec,
-        "endpoint": f"/api/v2/cash/handovers/{c['handover']['id']}/accept",
-        "legacy_command": "confirm_closing_transfer",
-    }
-    assert close_(client, x.cas_h, s["id"], {"500": 2}, receiver=x.rec, k=k).json()["replayed"] is True
-    assert code(close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rec, expect=409)) == "cash_session_not_open"
-    # closing still holds the CashPoint slot (the cash is not in capital yet)
+    c = close_(client, x.cas_h, s["id"], {"500": 2}, receiver=x.rcv, k=k).json()
+    assert (c["state"], c["difference"], c["handover"]) == ("closing", "0.00", None)  # never to capital
+    assert c["session_handover"]["state"] == "pending" and c["session_handover"]["amount"] == "1000.00"
+    assert c["session_handover"]["to_user_id"] == x.rcv
+    assert c["next_action"]["action"] == "accept_session_handover" and c["next_action"]["receiver_user_id"] == x.rcv
+    assert close_(client, x.cas_h, s["id"], {"500": 2}, receiver=x.rcv, k=k).json()["replayed"] is True
+    assert code(close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rcv, expect=409)) == "cash_session_not_open"
+    # closing still holds the CashPoint slot (the cash waits for the next cashier)
     assert code(open_(client, x.cas_h, x.cp, expect=409)) == "cash_point_busy"
     assert (
         client.get(f"{CASH}/sessions/current", headers=x.cas_h, params={"cash_point_id": x.cp}).json()["session"][
@@ -335,40 +395,24 @@ def test_close_zero_is_direct_close_with_cash_hands_over_and_closed_is_terminal(
         ]
         == "closing"
     )
-    a = accept_(client, x.rec_h, c["handover"]["id"]).json()
-    assert (a["state"], a["balance"], a["handover"]["state"], a["handover"]["accepted_by"]) == (
-        "closed",
-        "0.00",
-        "confirmed",
-        x.rec,
-    )
-    assert [(m.kind, m.amount) for m in movements(s["id"])] == [
-        ("opening_capital_fund", Decimal("1000.00")),
-        ("closing_capital_transfer", Decimal("-1000.00")),
-    ]
-    (fc,) = capital_rows("from_cash")
-    assert fc.amount == Decimal("1000.00") and fc.cash_movement_id == a["handover"]["cash_movement_id"]
-    assert capital_balance(x.t) == capital + Decimal("1000.00")  # the cash returned to capital exactly once
-    # closed is terminal: no reopen, no edit, no delete, no movement
-    refused("UPDATE cash_sessions SET state = 'open' WHERE id = :s", match="terminal", s=s["id"])
-    refused("UPDATE cash_sessions SET notes = 'x' WHERE id = :s", match="terminal", s=s["id"])
-    refused("DELETE FROM cash_sessions WHERE id = :s", match="history", s=s["id"])
+    assert capital_rows("from_cash") == []
+    # closed is terminal: no reopen, no edit, no delete, no movement (shown on the empty session closed above)
+    refused("UPDATE cash_sessions SET state = 'open' WHERE id = :s", match="terminal", s=zero["id"])
+    refused("UPDATE cash_sessions SET notes = 'x' WHERE id = :s", match="terminal", s=zero["id"])
+    refused("DELETE FROM cash_sessions WHERE id = :s", match="history", s=zero["id"])
     refused(
         "INSERT INTO cash_movements (box_id, session_id, kind, amount, actor_id, notes, reference, created_at) "
         "VALUES (:b, :s, 'expense', -1, :u, 'x', 'x', now())",
         match="admits no movement",
         b=x.box,
-        s=s["id"],
+        s=zero["id"],
         u=x.cas,
     )
-    nxt = open_(client, x.cas_h, x.cp, source="zero", amount="0").json()  # the slot is free again
-    assert nxt["state"] == "open"
-
 
 def test_closing_never_returns_to_open_and_its_record_is_immutable(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
     s = open_(client, x.cas_h, x.cp).json()
-    close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rec)
+    close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rcv)
     refused(
         "UPDATE cash_sessions SET state = 'open' WHERE id = :s", match="cannot move from closing to open", s=s["id"]
     )
@@ -378,17 +422,17 @@ def test_closing_never_returns_to_open_and_its_record_is_immutable(client, sink,
 
 
 # ================================ physical count and differences (D4, DR-007) ============================
-def test_counts_are_exact_differences_are_records_and_never_block_the_next_session(client, sink, tenant_a):
+def test_counts_are_exact_and_differences_are_records_that_never_become_adjustments(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
     s = open_(client, x.cas_h, x.cp, amount="1000.00").json()
     for bad in ({"3": 1}, {"100": -1}, {"100": True}):
-        assert close_(client, x.cas_h, s["id"], bad, receiver=x.rec, expect=422).status_code == 422
+        assert close_(client, x.cas_h, s["id"], bad, receiver=x.rcv, expect=422).status_code == 422
     assert (
-        code(close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, expect=422))
+        code(close_(client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, expect=422))
         == "observation_required"
     )
     c = close_(
-        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rec, note="Faltan 100 sin explicacion aun"
+        client, x.cas_h, s["id"], {"500": 1, "200": 2}, receiver=x.rcv, note="Faltan 100 sin explicacion aun"
     ).json()
     assert (c["state"], c["counted"], c["closing_expected"], c["difference"]) == (
         "closing",
@@ -396,7 +440,7 @@ def test_counts_are_exact_differences_are_records_and_never_block_the_next_sessi
         "1000.00",
         "-100.00",
     )
-    assert c["handover"]["amount"] == "900.00"  # the physical count leaves, never the expected amount
+    assert c["session_handover"]["amount"] == "900.00"  # the physical count leaves, never the expected amount
     (d,) = c["differences"]
     assert (d["phase"], d["status"], d["expected"], d["counted"], d["difference"], d["provenance"]) == (
         "closing",
@@ -409,87 +453,36 @@ def test_counts_are_exact_differences_are_records_and_never_block_the_next_sessi
     assert d["observation_note"] == "Faltan 100 sin explicacion aun" and "resolution_reason" not in d
     listed = client.get(f"{CASH}/differences", headers=x.rec_h, params={"branch_id": x.b}).json()["items"]
     assert [i["id"] for i in listed] == [d["id"]]
-    accept_(client, x.rec_h, c["handover"]["id"])
-    with SessionLocal() as db:
-        closed = db.get(CashSession, s["id"])
-        assert (closed.state, closed.balance) == ("closed", Decimal("100.00"))  # the ledger keeps the shortage visible
-    assert count("cash_movements", "kind = 'closing_adjustment'") == 0
+    assert count("cash_movements", "kind = 'closing_adjustment'") == 0  # a difference is a record, not a movement
     refused("UPDATE cash_session_differences SET status = 'resolved' WHERE id = :d", match="history", d=d["id"])
-    # the pending difference does not block the next session (closed + pending_review frees the slot)
-    nxt = open_(client, x.cas_h, x.cp, amount="1000.00", denominations={"500": 1, "200": 2}, expect=422)
-    assert code(nxt) == "observation_required"  # an opening count different from the fund is also a difference
-    o = open_(
-        client, x.cas_h, x.cp, amount="1000.00", denominations={"500": 1, "200": 2}, note="Fondo incompleto"
-    ).json()
-    assert o["state"] == "open" and o["balance"] == "1000.00" and o["differences"][0]["phase"] == "opening"
-    assert o["differences"][0]["difference"] == "-100.00"
     # DB: a close whose denominations do not add up is refused; a retired adjustment kind is refused
     refused(
         "UPDATE cash_sessions SET state = 'closing', counted = 1000, closing_expected = balance, difference = 1000 - balance, "
         "denominations = '{\"500\": 1}', close_contract = 'v2', closed_by = cashier_id, closed_at = now(), "
         "close_idempotency_key = 'k-123456789012' WHERE id = :s",
-        match="sum of its denominations",
-        s=o["id"],
+        match="immutable|sum of its denominations",
+        s=s["id"],
     )
     refused(
         "INSERT INTO cash_movements (box_id, session_id, kind, amount, actor_id, notes, reference, created_at) "
         "VALUES (:b, :s, 'closing_adjustment', -100, :u, 'x', 'x', now())",
         match="retired",
         b=x.box,
-        s=o["id"],
+        s=s["id"],
         u=x.cas,
     )
 
-
 # ================================ maker-checker (D5) =====================================================
-def test_the_closing_handover_needs_a_named_authorised_different_receiver(client, sink, tenant_a):
+def test_a_counted_close_needs_a_named_authorised_different_direct_receiver(client, sink, tenant_a):
     x = cworld(client, sink, tenant_a)
     reader_h, reader = mkuser(client, sink, x.adm, tenant_a, "reader@x.com", [READ], scope="branch", branch_id=x.b)
-    b2 = mk_branch(client, x.adm, "T21OTHER")["id"]
-    far_h, far = mkuser(client, sink, x.adm, tenant_a, "far@x.com", [ACCEPT, READ], scope="branch", branch_id=b2)
-    rec2_h, rec2 = mkuser(client, sink, x.adm, tenant_a, "rec2@x.com", [ACCEPT, READ], scope="branch", branch_id=x.b)
-    both_h, both = mkuser(
-        client, sink, x.adm, tenant_a, "both@x.com", [OPEN, CLOSE, ACCEPT, READ], scope="branch", branch_id=x.b
-    )
     s = open_(client, x.cas_h, x.cp).json()
     assert code(close_(client, x.cas_h, s["id"], {"1000": 1}, expect=422)) == "receiver_required"
-    for bad in (x.cas, reader, far, 999999):  # self, no permission, other branch scope, unknown
+    for bad in (x.cas, reader, 999999):  # self, no receive/open permission, unknown user
         assert code(close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=bad, expect=422)) == "invalid_receiver"
-    assert code(close_(client, x.rec_h, s["id"], {"1000": 1}, receiver=x.rec, expect=403)) == "permission_denied"
-    assert code(close_(client, both_h, s["id"], {"1000": 1}, receiver=x.rec, expect=403)) == "cash_session_not_owned"
-    h = close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rec).json()["handover"]["id"]
-    assert code(accept_(client, x.cas_h, h, expect=403)) == "permission_denied"  # the cashier has no accept permission
-    assert code(accept_(client, far_h, h, expect=403)) == "permission_denied"  # wrong branch scope
-    assert code(accept_(client, rec2_h, h, expect=403)) == "not_named_receiver"
-    assert code(accept_(client, x.adm, h, expect=403)) == "not_named_receiver"  # no admin bypass
-    k = key()
-    ok = accept_(client, x.rec_h, h, k=k).json()
-    assert ok["state"] == "closed" and accept_(client, x.rec_h, h, k=k).json()["replayed"] is True
-    assert code(accept_(client, x.rec_h, h, expect=409)) == "cash_handover_not_pending"
-    assert len(movements(s["id"], "closing_capital_transfer")) == 1 and len(capital_rows("from_cash")) == 1
-    # the maker never accepts their own cash, even holding the permission
-    cp2 = mk_cp(client, x.adm, x.b, "T21-B")["id"]
-    s2 = open_(client, both_h, cp2).json()
-    h2 = close_(client, both_h, s2["id"], {"1000": 1}, receiver=x.rec).json()["handover"]["id"]
-    assert code(accept_(client, both_h, h2, expect=403)) == "maker_checker_violation"
-    # the receiver can never be the cashier, even one holding the accept permission (D5)
-    assert code(close_(client, both_h, s2["id"], {"1000": 1}, receiver=both, expect=409)) == "cash_session_not_open"
-    cp3 = mk_cp(client, x.adm, x.b, "T21-C")["id"]
-    s3 = open_(client, both_h, cp3).json()
-    assert code(close_(client, both_h, s3["id"], {"1000": 1}, receiver=both, expect=422)) == "invalid_receiver"
-    # an acceptance key already used on another handover is a conflict, never a second acceptance
-    h3 = close_(client, both_h, s3["id"], {"1000": 1}, receiver=x.rec).json()["handover"]["id"]
-    assert code(accept_(client, x.rec_h, h3, k=k, expect=409)) == "idempotency_conflict"
-    assert accept_(client, x.rec_h, h3).json()["state"] == "closed"
-    refused(
-        "UPDATE cash_custody_transfers SET state = 'confirmed', accepted_by = from_user_id, accepted_at = now(), "
-        "accept_idempotency_key = 'k-123456789012' WHERE id = :h",
-        match="maker",
-        h=h2,
-    )
-    refused("UPDATE cash_custody_transfers SET amount = 1 WHERE id = :h", match="immutable", h=h2)
-    refused("UPDATE cash_custody_transfers SET state = 'pending' WHERE id = :h", match="terminal", h=h)
-
+    assert count("cash_session_handovers") == 0 and count("cash_custody_transfers") == 0
+    ok = close_(client, x.cas_h, s["id"], {"1000": 1}, receiver=x.rcv).json()
+    assert ok["state"] == "closing" and ok["session_handover"]["to_user_id"] == x.rcv
 
 # ================================ suspension (D6) + T-019 / T-020 ========================================
 def test_suspension_blocks_new_openings_only_and_never_strands_an_active_session(client, sink, tenant_a, monkeypatch):
@@ -648,19 +641,19 @@ def test_reads_are_scoped_pure_and_operations_use_a_bounded_number_of_queries(cl
     try:
         assert client.get(f"{CASH}/sessions/{s['id']}", headers=x.cas_h).json()["balance"] == "1030.00"
         client.get(f"{CASH}/sessions/current", headers=x.cas_h, params={"cash_point_id": x.cp})
-        client.get(f"{CASH}/handovers", headers=x.rec_h)
+        client.get(f"{CASH}/session-handovers", headers=x.rec_h)
         client.get(f"{CASH}/differences", headers=x.rec_h)
         assert not [
             q for q in seen if q.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
         ]  # GET never writes
         seen.clear()
-        c = close_(client, x.cas_h, s["id"], {"1000": 1, "10": 3}, receiver=x.rec).json()
+        close_(client, x.cas_h, s["id"], {"1000": 1, "10": 3}, receiver=x.rcv)
         close_queries = len(seen)
+        accept_queries = 0  # there is no handover to capital to accept any more
         seen.clear()
-        accept_(client, x.rec_h, c["handover"]["id"])
-        accept_queries = len(seen)
+        spare = mk_cp(client, x.adm, x.b, "T21-RQ")["id"]  # the closing session still holds its own CashPoint
         seen.clear()
-        open_(client, x.cas_h, x.cp, source="zero", amount="0")
+        open_(client, x.cas_h, spare, source="zero", amount="0")
         open_queries = len(seen)
     finally:
         stop()
@@ -675,8 +668,8 @@ def test_reads_are_scoped_pure_and_operations_use_a_bounded_number_of_queries(cl
         client, sink, x.adm, tenant_a, "farread@x.com", [READ, ACCEPT, DIFF_READ], scope="branch", branch_id=b2
     )
     assert client.get(f"{CASH}/sessions/{s['id']}", headers=far_h).status_code == 403
-    assert client.get(f"{CASH}/handovers", headers=far_h, params={"branch_id": x.b}).status_code == 403
-    assert client.get(f"{CASH}/handovers", headers=far_h, params={"state": "confirmed"}).json()["items"] == []
+    assert client.get(f"{CASH}/handovers", headers=far_h).status_code == 404  # the capital handover routes are gone
+    assert client.get(f"{CASH}/session-handovers", headers=far_h, params={"state": "confirmed"}).json()["items"] == []
     assert client.get(f"{CASH}/sessions/{s['id']}", headers=admin_headers(client, tenant_b)).status_code == 404
 
 
@@ -1045,30 +1038,12 @@ def test_migration_0020_maps_legacy_history_without_rewriting_it_and_downgrades_
     assert [r.id for r in _rows(eng, "SELECT id FROM cash_custody_transfers")] == [w.t_ctp]
     assert _rows(eng, "SELECT id, session_id, kind, amount FROM cash_movements ORDER BY id") == movements_before
     assert _alembic(scratch_db, "upgrade", "head").returncode == 0
-    # the migrated handovers are completed through the T-021 flow; the sessions close and the MIG point stays suspended
-    receiver = Principal(user_id=w.u[4], tenant_id=w.t, person_id=None, session_id=0, grants=(Grant(ACCEPT, "tenant"),))
-    with Session(eng) as db:
-        mh = db.execute(text("SELECT id FROM cash_custody_transfers WHERE provenance = 'migration'")).scalar()
-        maker = Principal(
-            user_id=w.u[3], tenant_id=w.t, person_id=None, session_id=0, grants=(Grant(ACCEPT, "tenant"),)
-        )
-        with pytest.raises(Exception) as err:
-            cash_core.accept_handover(db, maker, mh, idempotency_key="t21-mig-accept-0")
-        assert err.value.code == "maker_checker_violation"
-        db.rollback()
-        out = cash_core.accept_handover(db, receiver, mh, idempotency_key="t21-mig-accept-1")
-        legacy_out = cash_core.accept_handover(db, receiver, w.t_ctp, idempotency_key="t21-mig-accept-2")
-        db.commit()
-    assert (out["state"], out["handover"]["amount"], legacy_out["state"]) == ("closed", "700.00", "closed")
-    assert _rows(eng, "SELECT kind, amount FROM cash_movements WHERE session_id = :s ORDER BY id", s=w.s_cr) == [
-        ("closing_capital_transfer", Decimal("-700.00"))
-    ]
+    # the migrated capital handovers stay as read-only history: nothing completes them through the API any more
+    assert _rows(eng, "SELECT state FROM cash_custody_transfers WHERE provenance = 'migration'") == [("pending",)]
     assert _rows(eng, "SELECT status FROM cash_points WHERE code = :c", c=f"MIG-S{w.s_cr}") == [("suspended",)]
     assert _rows(eng, "SELECT amount FROM cash_movements WHERE id = :m", m=w.adj) == [
         (Decimal("-20.00"),)
     ]  # D7 history intact
-    refused_down = _alembic(scratch_db, "downgrade", "0019")
-    assert refused_down.returncode != 0 and "closing handovers created or accepted under T-021" in refused_down.stderr
     assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0026",)]
     eng.dispose()
 
