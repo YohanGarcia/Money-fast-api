@@ -238,6 +238,21 @@ def login(
     if user.status != "active":  # pending: the activation flow must set the password first
         db.commit()
         raise InvalidCredentials()
+    if user.company_id is not None:
+        tenant = db.get(Company, user.company_id)
+        if tenant is None or tenant.status != "active":
+            # Valid credentials of a deactivated company: no session is issued (it would reject every request anyway).
+            record_event(
+                db,
+                "auth.login.denied",
+                outcome="denied",
+                tenant_id=user.company_id,
+                subject_id=user.id,
+                client_ip=client_ip,
+                details={"reason": "tenant_inactive"},
+            )
+            db.commit()
+            raise TenantInactive()
 
     throttle.reset(db, S_ACCT_IP, acct_ip_key)
     throttle.reset(db, S_ACCT, acct_key)

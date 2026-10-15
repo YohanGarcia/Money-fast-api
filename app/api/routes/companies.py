@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select, delete
 from sqlalchemy.orm import Session
 
@@ -15,9 +15,8 @@ from app.models.customer import Customer
 from app.models.loan import Loan
 from app.models.plan import Plan
 from app.models.subscription import Subscription, SubscriptionStatus
-from app.modules.identity.tenant import unique_slug
-from app.models.user import User, UserRole
-from app.core.security import get_password_hash
+from app.modules.identity.onboarding import create_tenant_owner
+from app.models.user import User
 from app.schemas.subscription import PlatformOverview
 from app.services.plan_limits import subscription_is_current
 
@@ -39,13 +38,13 @@ class CompanyRead(BaseModel):
 
 
 class CompanyCreate(BaseModel):
-    name: str
-    tax_id: str = ""
-    address: str = ""
-    phone: str = ""
-    admin_full_name: str
-    admin_email: str
-    admin_password: str
+    name: str = Field(min_length=2, max_length=160)
+    tax_id: str = Field(default="", max_length=40)
+    address: str = Field(default="", max_length=255)
+    phone: str = Field(default="", max_length=30)
+    admin_full_name: str = Field(min_length=3, max_length=140)
+    admin_email: EmailStr
+    admin_password: str = Field(min_length=8, max_length=128)
 
 
 class CompanyUpdate(BaseModel):
@@ -143,29 +142,20 @@ def create_company(
     db: Session = Depends(get_db),
     _: User = Depends(require_superadmin),
 ) -> dict:
-    # Check admin email not taken
-    existing = db.scalar(select(User).where(User.email == payload.admin_email.lower()))
-    if existing:
-        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese correo.")
-
-    company = Company(
-        name=payload.name.strip(),
-        slug=unique_slug(db, payload.name),
-        tax_id=payload.tax_id.strip(),
-        address=payload.address.strip(),
-        phone=payload.phone.strip(),
+    # The same path as a self-registration (password policy, e-mail uniqueness, Free plan, administrator role and
+    # person): an administrator created here can operate every module, exactly like one who registered.
+    owner = create_tenant_owner(
+        db,
+        full_name=payload.admin_full_name,
+        email=str(payload.admin_email),
+        password=payload.admin_password,
+        company_name=payload.name.strip(),
+        via="platform_owner",
     )
-    db.add(company)
-    db.flush()
-
-    admin = User(
-        full_name=payload.admin_full_name.strip(),
-        email=payload.admin_email.lower().strip(),
-        password_hash=get_password_hash(payload.admin_password),
-        role=UserRole.admin,
-        company_id=company.id,
-    )
-    db.add(admin)
+    company = db.get(Company, owner.company_id)
+    company.tax_id = payload.tax_id.strip()
+    company.address = payload.address.strip()
+    company.phone = payload.phone.strip()
     db.commit()
     db.refresh(company)
 
@@ -226,10 +216,15 @@ def delete_company(
             detail="La empresa tiene datos. Desactívala en vez de borrarla.",
         )
 
+    from app.models.branch import Branch
     from app.modules.customers.models import CustomerProfile
 
     if db.scalar(select(func.count()).select_from(CustomerProfile).where(CustomerProfile.tenant_id == company_id)):
         raise HTTPException(status_code=400, detail="La empresa tiene datos. Desactivala en vez de borrarla.")
+    # Branches (and their cash boxes, shifts and history) are operational data: a company that has set them up is
+    # deactivated, never deleted -- the database refuses to drop that history.
+    if db.scalar(select(func.count()).select_from(Branch).where(Branch.company_id == company_id)):
+        raise HTTPException(status_code=400, detail="La empresa tiene sucursales y caja configuradas. Desactivala en vez de borrarla.")
 
     # Safe to remove: drop its users and subscriptions, then the company.
     # Identity rows hang off the tenant: assignments/tokens first, then users, roles and persons.
