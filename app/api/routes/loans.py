@@ -4,10 +4,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.services import cash_service
 from app.api.pagination import Page, matches, page_params, paginate
+from app.services.branch_scope import scope_customers
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
 from app.models.loan import Loan, LoanStatus
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.schemas.loan import LoanCreate, LoanRead
 from app.services.loan_service import create_loan, refresh_loan_state
 from app.services.plan_limits import enforce_can_create
@@ -32,11 +33,8 @@ def list_loans(
         .options(selectinload(Loan.customer), selectinload(Loan.installments))
         .order_by(Loan.created_at.desc())
     )
-    # Collectors only see loans of customers assigned to them.
-    if current_user.role == UserRole.cashier:
-        statement = statement.where(Loan.customer_id.in_(cash_service.customer_ids(db, current_user)))
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Customer.assigned_collector_id == current_user.id)
+    # Everyone but the administration sees the loans of their branch; a collector, those of their portfolio.
+    statement = scope_customers(statement, current_user)
     loans = list(db.scalars(statement).unique().all())
     changed = any([refresh_loan_state(loan) for loan in loans])  # a loan may have just turned late: filter AFTER it
     if changed and not cash_service.enabled(db, company_id):
@@ -55,9 +53,9 @@ def add_loan(
     current_user: User = Depends(require_admin_manager),
     company_id: int = Depends(get_company_id),
 ) -> Loan:
-    customer = db.scalar(
-        select(Customer).where(Customer.id == payload.customer_id, Customer.company_id == company_id)
-    )
+    customer = db.scalar(scope_customers(
+        select(Customer).where(Customer.id == payload.customer_id, Customer.company_id == company_id), current_user
+    ))
     if customer is None:
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
 
@@ -84,10 +82,7 @@ def get_loan(
         .where(Loan.id == loan_id, Customer.company_id == company_id)
         .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments))
     )
-    if current_user.role == UserRole.cashier:
-        statement = statement.where(Loan.customer_id.in_(cash_service.customer_ids(db, current_user)))
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Customer.assigned_collector_id == current_user.id)
+    statement = scope_customers(statement, current_user)
     loan = db.scalar(statement)
     if loan is None:
         raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
@@ -101,14 +96,15 @@ def get_loan(
 def approve_loan(
     loan_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin_manager),
+    current_user: User = Depends(require_admin_manager),
     company_id: int = Depends(get_company_id),
 ) -> Loan:
-    statement = (
+    statement = scope_customers(
         select(Loan)
         .join(Loan.customer)
         .where(Loan.id == loan_id, Customer.company_id == company_id)
-        .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments))
+        .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments)),
+        current_user,
     )
     loan = db.scalar(statement)
     if loan is None:
@@ -126,14 +122,15 @@ def approve_loan(
 def reject_loan(
     loan_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin_manager),
+    current_user: User = Depends(require_admin_manager),
     company_id: int = Depends(get_company_id),
 ) -> Loan:
-    statement = (
+    statement = scope_customers(
         select(Loan)
         .join(Loan.customer)
         .where(Loan.id == loan_id, Customer.company_id == company_id)
-        .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments))
+        .options(selectinload(Loan.customer), selectinload(Loan.installments), selectinload(Loan.payments)),
+        current_user,
     )
     loan = db.scalar(statement)
     if loan is None:

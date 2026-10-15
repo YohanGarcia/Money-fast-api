@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import get_db, require_admin_manager
 from app.api.pagination import Page, matches, page_params, paginate
+from app.services.branch_scope import customer_branch_expr, customer_in_scope, user_branch
 from app.models.customer import Customer
 from app.models.loan_application import LoanApplication, ApplicationDocument
 from app.models.user import User
@@ -25,9 +26,21 @@ from app.services.customer_profile import sync_application_customer, document_ke
 router = APIRouter()
 
 
+def visible_applications(statement, user):
+    """Applications of the user's branch: created by someone of the branch or about a customer of the branch."""
+    branch = user_branch(user)
+    if branch is None:
+        return statement
+    from sqlalchemy import or_
+
+    creators = select(User.id).where(User.company_id == user.company_id, User.branch_id == branch)
+    customers = select(Customer.id).where(Customer.company_id == user.company_id, customer_branch_expr() == branch)
+    return statement.where(or_(LoanApplication.created_by_id.in_(creators), LoanApplication.customer_id.in_(customers)))
+
+
 def get_application(db, user, application_id):
-    item = db.scalar(select(LoanApplication).where(LoanApplication.id == application_id,
-                      LoanApplication.company_id == user.company_id))
+    item = db.scalar(visible_applications(select(LoanApplication).where(
+        LoanApplication.id == application_id, LoanApplication.company_id == user.company_id), user))
     if item is None:
         raise HTTPException(404, "Solicitud no encontrada.")
     return item
@@ -35,7 +48,7 @@ def get_application(db, user, application_id):
 
 def customer_for(db, user, customer_id):
     customer = db.scalar(select(Customer).where(Customer.id == customer_id, Customer.company_id == user.company_id))
-    if customer is None:
+    if customer is None or not customer_in_scope(db, user, customer):
         raise HTTPException(404, "Cliente no encontrado en esta empresa.")
     return customer
 
@@ -79,7 +92,7 @@ def listing(response: Response, customer_id: int | None = None,
             status_filter: str | None = Query(default=None, alias="status"),
             page: Page = Depends(page_params),
             db: Session = Depends(get_db), user: User = Depends(require_admin_manager)):
-    statement = select(LoanApplication).where(LoanApplication.company_id == user.company_id)
+    statement = visible_applications(select(LoanApplication).where(LoanApplication.company_id == user.company_id), user)
     if customer_id is not None:
         customer_for(db, user, customer_id)
         statement = statement.where(LoanApplication.customer_id == customer_id)

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
+from app.services.branch_scope import is_company_wide, is_field_collector, user_branch
 from app.models.branch import Branch
 from app.models.customer import Customer
 from app.models.route import Route, RouteArea
@@ -106,9 +107,11 @@ def list_routes(
         .options(selectinload(Route.assigned_collector), selectinload(Route.branch))
         .order_by(Route.name)
     )
-    # Collectors only see the routes assigned to them.
-    if current_user.role == UserRole.collector:
+    # A collector sees the routes assigned to them; everyone else but the administration, those of their branch.
+    if is_field_collector(current_user):
         statement = statement.where(Route.assigned_collector_id == current_user.id)
+    elif not is_company_wide(current_user):
+        statement = statement.where(Route.branch_id == user_branch(current_user))
     rows = [r for r in db.scalars(statement).all() if matches(q, r.name, getattr(r, "zone", None))]
     return [_serialize(db, r) for r in paginate(response, rows, page)]
 
@@ -125,8 +128,10 @@ def route_stops(
     Stops without GPS coordinates are returned separately as ``unlocated``.
     """
     statement = select(Route).where(Route.id == route_id, Route.company_id == company_id)
-    if current_user.role == UserRole.collector:
+    if is_field_collector(current_user):
         statement = statement.where(Route.assigned_collector_id == current_user.id)
+    elif not is_company_wide(current_user):
+        statement = statement.where(Route.branch_id == user_branch(current_user))
     route = db.scalar(statement)
     if route is None:
         raise HTTPException(status_code=404, detail="Ruta no encontrada.")
@@ -176,7 +181,10 @@ def create_route(
     company_id: int = Depends(get_company_id),
 ) -> dict:
     collector_id = _validate_collector(db, payload.assigned_collector_id, company_id)
-    branch_id = _validate_branch(db, payload.branch_id, company_id)
+    own_branch = user_branch(current_user)
+    if own_branch is not None and payload.branch_id not in (None, own_branch):
+        raise HTTPException(status_code=403, detail="Solo puedes crear rutas de tu sucursal.")
+    branch_id = _validate_branch(db, payload.branch_id if own_branch is None else own_branch, company_id)
     if cash_service.enabled(db,company_id) and collector_id and (not branch_id or db.get(User,collector_id).branch_id!=branch_id):
         raise HTTPException(409,'Selecciona la sucursal del cobrador para esta ruta.')
     route = Route(
@@ -207,8 +215,11 @@ def update_route(
     company_id: int = Depends(get_company_id),
 ) -> dict:
     route = db.scalar(select(Route).where(Route.id == route_id, Route.company_id == company_id))
-    if route is None:
+    own_branch = user_branch(current_user)
+    if route is None or (own_branch is not None and route.branch_id != own_branch):
         raise HTTPException(status_code=404, detail="Ruta no encontrada.")
+    if own_branch is not None and payload.branch_id not in (None, own_branch):
+        raise HTTPException(status_code=403, detail="No puedes mover la ruta a otra sucursal.")
 
     new_collector_id = _validate_collector(db, payload.assigned_collector_id, company_id)
     if cash_service.enabled(db,company_id) and new_collector_id and (not payload.branch_id or db.get(User,new_collector_id).branch_id!=payload.branch_id):
@@ -247,7 +258,8 @@ def delete_route(
     company_id: int = Depends(get_company_id),
 ) -> None:
     route = db.scalar(select(Route).where(Route.id == route_id, Route.company_id == company_id))
-    if route is None:
+    own_branch = user_branch(current_user)
+    if route is None or (own_branch is not None and route.branch_id != own_branch):
         raise HTTPException(status_code=404, detail="Ruta no encontrada.")
 
     if _customer_count(db, route.id) > 0:

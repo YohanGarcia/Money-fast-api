@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.pagination import Page, matches, page_params, paginate
+from app.api.pagination import Page, page_params, paginate
 from app.services import cash_service
+from app.services.branch_scope import customer_in_scope, scope_customers, user_branch
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
 from app.models.route import Route
@@ -62,11 +63,8 @@ def list_customers(
         .options(selectinload(Customer.assigned_collector), selectinload(Customer.route))
         .order_by(Customer.full_name)
     )
-    # Collectors only see the customers assigned to them (their portfolio).
-    if current_user.role == UserRole.cashier:
-        statement = statement.where(Customer.id.in_(cash_service.customer_ids(db, current_user)))
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Customer.assigned_collector_id == current_user.id)
+    # Everyone but the administration sees their branch only; a collector in the street, their own portfolio.
+    statement = scope_customers(statement, current_user)
     if route_id is not None:
         statement = statement.where(Customer.route_id == route_id)
     if collector_id is not None:
@@ -97,6 +95,17 @@ def create_customer(
     data["document_key"] = check_identity(db, company_id, payload.document_id)
     if "references" not in payload.model_fields_set:
         data["references"] = legacy_references(payload.notes)
+    branch_of_actor = user_branch(current_user)
+    if branch_of_actor is not None:  # what a branch user creates belongs to that branch
+        if route_id is not None:
+            route_branch = db.get(Route, route_id).branch_id
+            if route_branch not in (None, branch_of_actor):
+                raise HTTPException(status_code=404, detail="Ruta no encontrada.")
+        if collector_id is not None:
+            collector_branch = db.get(User, collector_id).branch_id
+            if collector_branch not in (None, branch_of_actor):
+                raise HTTPException(status_code=404, detail="El cobrador asignado no existe.")
+        data["cash_branch_id"] = branch_of_actor
     customer = Customer(
         **data,
         created_by_id=current_user.id,
@@ -111,15 +120,12 @@ def create_customer(
 def _get_scoped_customer(
     customer_id: int, db: Session, current_user: User, company_id: int
 ) -> Customer:
-    statement = (
+    statement = scope_customers(
         select(Customer)
         .where(Customer.id == customer_id, Customer.company_id == company_id)
-        .options(selectinload(Customer.assigned_collector), selectinload(Customer.route))
+        .options(selectinload(Customer.assigned_collector), selectinload(Customer.route)),
+        current_user,
     )
-    if current_user.role == UserRole.cashier:
-        statement = statement.where(Customer.id.in_(cash_service.customer_ids(db, current_user)))
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Customer.assigned_collector_id == current_user.id)
     customer = db.scalar(statement)
     if customer is None:
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
@@ -147,7 +153,7 @@ def update_customer(
     customer = db.scalar(
         select(Customer).where(Customer.id == customer_id, Customer.company_id == company_id)
     )
-    if customer is None:
+    if customer is None or not customer_in_scope(db, current_user, customer):
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
 
     if payload.version != customer.version:

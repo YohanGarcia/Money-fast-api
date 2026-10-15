@@ -4,6 +4,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.api.pagination import Page, page_params, paginate
+from app.services.branch_scope import scope_users
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -106,7 +107,7 @@ def collector_track(
     company_id: int = Depends(get_company_id),
 ) -> dict:
     """The route a collector actually traveled on a given day (breadcrumb trail)."""
-    collector = db.scalar(select(User).where(User.id == user_id, User.company_id == company_id))
+    collector = db.scalar(scope_users(select(User).where(User.id == user_id, User.company_id == company_id), current_user))
     if collector is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
 
@@ -145,15 +146,17 @@ def list_collector_locations(
     current_user: User = Depends(require_admin_manager),
     company_id: int = Depends(get_company_id),
 ) -> list[User]:
-    """Last known position of the company's collectors (for the live map)."""
-    statement = (
+    """Last known position of the collectors (for the live map): the company's for the administration, the
+    branch's for a manager."""
+    statement = scope_users(
         select(User)
         .where(
             User.company_id == company_id,
             User.role == UserRole.collector,
             User.is_active.is_(True),
         )
-        .order_by(User.full_name)
+        .order_by(User.full_name),
+        current_user,
     )
     return list(db.scalars(statement).all())
 
@@ -178,7 +181,7 @@ def list_collectors(
         )
         .order_by(User.full_name)
     )
-    return list(db.scalars(statement).all())
+    return list(db.scalars(scope_users(statement, current_user)).all())
 
 
 @router.get("", response_model=list[UserRead])

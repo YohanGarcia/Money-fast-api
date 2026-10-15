@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_company_id, get_db, require_admin
+from app.api.deps import get_company_id, get_current_user, get_db, require_admin
+from app.services.branch_scope import user_branch
 from app.models.branch import Branch
 from app.models.cash import CashBox, CashSession, CashTransfer, CashDelivery
 from app.services import cash_service
@@ -38,8 +39,13 @@ def list_branches(
     q: str | None = Query(default=None),
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
+    current_user: User = Depends(get_current_user),
 ) -> list[Branch]:
-    branches = db.scalars(select(Branch).where(Branch.company_id == company_id).order_by(Branch.name)).all()
+    query = select(Branch).where(Branch.company_id == company_id)
+    own = user_branch(current_user) if current_user.branch_id is not None or current_user.role == "admin" else None
+    if own is not None:  # a branch user only knows their own branch
+        query = query.where(Branch.id == own)
+    branches = db.scalars(query.order_by(Branch.name)).all()
     if q:
         term = q.lower().strip()
         branches = [b for b in branches if term in b.name.lower() or term in b.manager_name.lower()]

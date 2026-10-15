@@ -6,10 +6,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_company_id, get_current_user, get_db
 from app.api.pagination import Page, page_params, paginate_query
+from app.services.branch_scope import scope_payments
 from app.models.customer import Customer
 from app.models.loan import Loan
 from app.models.payment import Payment
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.schemas.payment import PaymentCreate, PaymentRead
 from app.services import cash_service
 from app.schemas.cash import CashPaymentResult
@@ -37,13 +38,9 @@ def _filtered(db, current_user, company_id, *, loan_id, q, start, end, payment_t
         .options(selectinload(Payment.loan).selectinload(Loan.customer), selectinload(Payment.collected_by))
         .order_by(Payment.paid_at.desc(), Payment.id.desc())
     )
-    # Historical custody follows the original collector, not reassigned customers.
-    if current_user.role == UserRole.collector:
-        statement = statement.where(Payment.collected_by_id == current_user.id)
-    if current_user.role == UserRole.cashier:
-        if not current_user.branch_id:
-            raise HTTPException(403, "Asigna una sucursal al cajero.")
-        statement = statement.where(Payment.branch_id == current_user.branch_id)
+    # Everyone but the administration sees the payments of their branch; historical custody of a collector follows
+    # the collector who took the money, not the customer's current assignment.
+    statement = scope_payments(statement, current_user)
     if loan_id is not None:
         statement = statement.where(Payment.loan_id == loan_id)
     if start and end and start > end:
