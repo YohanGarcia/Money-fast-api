@@ -3,7 +3,7 @@ from typing import Literal
 from app.schemas.cash import Proof
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from app.models.payment import PaymentType
 
@@ -69,3 +69,13 @@ class PaymentRead(BaseModel):
     branch_id: int | None = None
     cash_state: str = 'historical'
     status: str = 'confirmed'
+    customer_id: int | None = None
+    customer_name: str | None = None
+    branch_name: str | None = None
+    reversed: bool = False  # its cash movement was reversed from Caja: it no longer counts as collected
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def receipt(self) -> str:
+        """Receipt number of the collection (cash payments carry no bank reference)."""
+        return f"RC-{self.id:06d}"
