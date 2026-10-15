@@ -21,6 +21,8 @@ class LoanSettings(Base):
     default_grace_days: Mapped[int] = mapped_column(default=5)
     require_route_assignment: Mapped[bool] = mapped_column(Boolean, default=False)
     allow_payment_date_change: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True once the administrator saved the rules; until then the row (if any) is only the product defaults.
+    configured: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

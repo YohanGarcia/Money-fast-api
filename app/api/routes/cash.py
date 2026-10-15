@@ -170,7 +170,7 @@ def build_workspace(db,user,branch_id,history_limit):
           expected_opening='0.00',
           audit=[enrich(a) for a in bounded('audit',CashAudit,[CashAudit.box_id==box.id])])
         candidates=db.scalars(select(LoanApplication).where(LoanApplication.company_id==user.company_id,LoanApplication.status=='signed')).all()
-        data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
+        data['applications']=[dict(id=a.id,version=a.version,name=a.data.get('full_name'),amount=a.data.get('requested_amount'),frequency=a.data.get('payment_frequency')) for a in candidates if a.customer_id and (svc.branch_for_customer(db,db.get(Customer,a.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,a.customer_id)) is None))]
     if not mine:
         # Money the administration asked to send to / take from a cashier's box (the cashier only confirms it).
         from app.models.cash import CashAdditionRequest

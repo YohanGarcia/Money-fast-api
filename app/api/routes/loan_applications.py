@@ -20,6 +20,9 @@ from app.schemas.loan_application import (ApplicationInput, TransitionInput, Doc
     ReviewInput, CustomerLinkInput, SECTIONS, DOCUMENTS, validate_complete)
 from app.schemas.loan import LoanCreate
 from app.services.loan_service import create_loan
+from app.services.loan_rules import (
+    APPLICATION_FREQUENCY, enforce_principal, enforce_route, enforce_term, first_payment_date, get_rules,
+)
 from app.services.plan_limits import enforce_can_create
 from app.services.customer_profile import sync_application_customer, document_key, check_identity
 
@@ -112,6 +115,7 @@ def create(payload: ApplicationInput, db: Session = Depends(get_db), user: User 
         raise HTTPException(403, "Se requiere una empresa.")
     item = LoanApplication(company_id=user.company_id, created_by_id=user.id,
         modality=payload.modality, data=payload.data, history=[])
+    enforce_principal(db, user.company_id, payload.data.get("requested_amount"))
     sync_application_customer(db, user, payload, item)
     record(item, user, "created")
     db.add(item)
@@ -175,6 +179,7 @@ def edit(application_id: int, payload: ApplicationInput, db: Session = Depends(g
     check_version(item, payload.version)
     if item.status != "draft":
         raise HTTPException(409, "Devuelve la solicitud a borrador antes de modificar los datos.")
+    enforce_principal(db, user.company_id, payload.data.get("requested_amount"))
     sync_application_customer(db, user, payload, item)
     if payload.modality != item.modality:
         for document in list(item.documents):
@@ -269,18 +274,34 @@ def transition(application_id: int, payload: TransitionInput,
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         # Documents are optional: evaluating never waits for them (they can be attached and reviewed at any time).
+        if action in ("submit", "approve"):
+            enforce_principal(db, user.company_id, item.data.get("requested_amount"))
         if action == "approve":
             if payload.terms is None:
                 raise HTTPException(422, "Registra las condiciones aprobadas.")
-            item.terms = payload.terms.model_dump(mode="json")
+            enforce_term(db, user.company_id, payload.terms.installment_count,
+                         APPLICATION_FREQUENCY.get(str(item.data.get("payment_frequency")), ""))
+            terms = payload.terms.model_dump(mode="json")
+            rules = get_rules(db, user.company_id)
+            if rules is not None:  # what the approver did not state takes the company's defaults
+                if "late_fee_rate" not in payload.terms.model_fields_set:
+                    terms["late_fee_rate"] = str(rules.default_late_fee_rate)
+                if "grace_days" not in payload.terms.model_fields_set:
+                    terms["grace_days"] = rules.default_grace_days
+            item.terms = terms
         if action == "disburse":
             from app.services.cash_service import enabled, lock_company
             lock_company(db, user.company_id)
             if enabled(db, user.company_id):
                 raise HTTPException(409, "Con Caja habilitada, registra el desembolso desde Caja.")
-            if not payload.first_payment_date or payload.first_payment_date < date.today() or not payload.disbursement_reference.strip():
+            frequency_key = APPLICATION_FREQUENCY.get(str(item.data.get("payment_frequency")), "")
+            first_date = first_payment_date(db, user.company_id, payload.first_payment_date, frequency_key)
+            if not first_date or first_date < date.today() or not payload.disbursement_reference.strip():
                 raise HTTPException(422, "Indica la referencia del desembolso y una primera fecha de pago desde hoy.")
+            payload.first_payment_date = first_date
             enforce_can_create(db, user.company_id, "loan")
+            enforce_principal(db, user.company_id, item.data.get("requested_amount"))
+            enforce_term(db, user.company_id, int(item.terms.get("installment_count", 0)), frequency_key)
             if item.customer_id:
                 customer = customer_for(db, user, item.customer_id)
             else:
@@ -289,6 +310,8 @@ def transition(application_id: int, payload: TransitionInput,
                 if len(matches) > 1:
                     raise HTTPException(409, "Hay varios clientes históricos con esta cédula. Selecciona y vincula la ficha correcta antes de desembolsar.")
                 customer = matches[0] if matches else None
+                if customer is not None:
+                    enforce_route(db, user.company_id, customer)
                 if customer is None:
                     enforce_can_create(db, user.company_id, "customer")
                     customer = Customer(company_id=user.company_id, created_by_id=user.id,

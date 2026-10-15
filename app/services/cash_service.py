@@ -446,16 +446,22 @@ def command(db,user,p):
         bid=branch_for_customer(db,c)
         if bid is not None and bid!=box.branch_id: fail('La solicitud pertenece a otra sucursal.',403)
         if bid is None and user.role!='admin': fail('El administrador debe asignar la sucursal del cliente.')
-        if not p.reference.strip() or not p.first_payment_date or p.first_payment_date<today(): fail('Indica referencia y primera fecha de pago válida.')
+        from app.services.loan_rules import APPLICATION_FREQUENCY,enforce_principal,enforce_route,enforce_term,first_payment_date
+        frequency_key=APPLICATION_FREQUENCY.get(str(item.data.get('payment_frequency')),'')
+        first_date=first_payment_date(db,user.company_id,p.first_payment_date,frequency_key)
+        if not p.reference.strip() or not first_date or first_date<today(): fail('Indica referencia y primera fecha de pago válida.')
+        enforce_principal(db,user.company_id,item.data.get('requested_amount'))
+        enforce_term(db,user.company_id,int(item.terms.get('installment_count',0)),frequency_key)
+        enforce_route(db,user.company_id,c)
         if p.method in ('transfer','check') and not p.proof: fail('Adjunta el comprobante bancario del desembolso.')
         session=operational_session(db,box,user,p.session_id)
         amount=Decimal(item.data['requested_amount'])
         if p.method=='cash' and session.balance<amount: fail('Efectivo insuficiente.',409)
         enforce_can_create(db,user.company_id,'loan')
         c.cash_branch_id=box.branch_id
-        loan=create_loan(db,LoanCreate(customer_id=c.id,principal_amount=amount,payment_frequency={'Semanal':'weekly','Quincenal':'biweekly','Mensual':'monthly'}[item.data['payment_frequency']],start_date=p.first_payment_date,auto_approve=True,requires_promissory_note=True,**{k:item.terms[k] for k in ('interest_rate','installment_count','late_fee_rate','grace_days')}),user.id)
+        loan=create_loan(db,LoanCreate(customer_id=c.id,principal_amount=amount,payment_frequency={'Semanal':'weekly','Quincenal':'biweekly','Mensual':'monthly'}[item.data['payment_frequency']],start_date=first_date,auto_approve=True,requires_promissory_note=True,**{k:item.terms[k] for k in ('interest_rate','installment_count','late_fee_rate','grace_days')}),user.id)
         loan.cash_branch_id=box.branch_id
-        item.loan_id=loan.id;item.status='disbursed';item.terms={**item.terms,'disbursement_reference':p.reference,'disbursement_date':str(today()),'first_payment_date':str(p.first_payment_date),'method':p.method,'branch_id':box.branch_id}
+        item.loan_id=loan.id;item.status='disbursed';item.terms={**item.terms,'disbursement_reference':p.reference,'disbursement_date':str(today()),'first_payment_date':str(first_date),'method':p.method,'branch_id':box.branch_id}
         record(item,user,'disburse',p.notes)
         add_movement(db,box,session,user,'disbursement' if p.method=='cash' else 'bank_disbursement',-amount if p.method=='cash' else ZERO,p.notes or 'Desembolso de préstamo',loan_id=loan.id,reference=p.reference,proof=p.proof.model_dump() if p.proof else None)
         result={'loan_id':loan.id,'application_id':item.id}

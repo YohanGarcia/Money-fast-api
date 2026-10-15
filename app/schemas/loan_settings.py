@@ -30,3 +30,5 @@ class LoanSettingsRead(LoanSettingsUpdate):
 
     id: int
     updated_at: datetime
+    # False while the company has not saved its rules: the values shown are only suggestions and nothing is enforced.
+    is_configured: bool = Field(default=True, validation_alias="configured")

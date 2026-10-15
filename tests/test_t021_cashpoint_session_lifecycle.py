@@ -1044,7 +1044,7 @@ def test_migration_0020_maps_legacy_history_without_rewriting_it_and_downgrades_
     assert _rows(eng, "SELECT amount FROM cash_movements WHERE id = :m", m=w.adj) == [
         (Decimal("-20.00"),)
     ]  # D7 history intact
-    assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0028",)]
+    assert _rows(eng, "SELECT version_num FROM alembic_version") == [("0029",)]
     eng.dispose()
 
 
@@ -1128,5 +1128,5 @@ def test_migration_0020_empty_upgrade_downgrade_reupgrade_and_v2_history_refuses
     out = _alembic(scratch_db, "downgrade", "0019")
     assert out.returncode != 0 and "v2 cash sessions exist" in out.stderr
     with eng.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0028"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0029"
     eng.dispose()

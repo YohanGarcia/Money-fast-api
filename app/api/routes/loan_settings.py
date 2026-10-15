@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -5,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_company_id, get_db, require_admin
 from app.models.loan_settings import LoanSettings
 from app.schemas.loan_settings import LoanSettingsRead, LoanSettingsUpdate
+from app.services.loan_rules import DEFAULT_VALUES, get_rules
 
 router = APIRouter()
 
@@ -23,8 +26,11 @@ def get_or_create(db: Session, company_id: int) -> LoanSettings:
 def read_loan_settings(
     db: Session = Depends(get_db),
     company_id: int = Depends(get_company_id),
-) -> LoanSettings:
-    return get_or_create(db, company_id)
+):
+    saved = get_rules(db, company_id)
+    if saved is None:  # nothing saved yet: suggestions only, nothing is stored or enforced
+        return {**DEFAULT_VALUES, "id": 0, "updated_at": datetime.now(UTC), "configured": False}
+    return saved
 
 
 @router.put("", response_model=LoanSettingsRead)
@@ -37,6 +43,7 @@ def update_loan_settings(
     s = get_or_create(db, company_id)
     for key, value in payload.model_dump().items():
         setattr(s, key, value)
+    s.configured = True
     db.commit()
     db.refresh(s)
     return s
