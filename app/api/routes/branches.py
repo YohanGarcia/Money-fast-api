@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin
 from app.services.branch_scope import user_branch
 from app.models.branch import Branch
+from app.services.plan_limits import enforce_feature
 from app.models.cash import CashBox, CashSession, CashTransfer, CashDelivery
 from app.services import cash_service
 from app.models.route import Route
@@ -62,6 +63,8 @@ def create_branch(
     existing = db.scalar(select(Branch).where(Branch.name == payload.name.strip(), Branch.company_id == company_id))
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe una sucursal con ese nombre.")
+    if db.scalar(select(func.count()).select_from(Branch).where(Branch.company_id == company_id)):
+        enforce_feature(db, company_id, "branches")  # the first branch is included in every plan
 
     branch = Branch(company_id=company_id, name=payload.name.strip(), address=payload.address.strip(),
                     phone=payload.phone.strip())

@@ -37,6 +37,15 @@ def list_plans(
     return paginate(response, list(plans), page)
 
 
+def _features_for(payload) -> list[str]:
+    """Explicit list, else every feature for a paid plan and none for a free one."""
+    from app.services.plan_limits import FEATURES
+
+    if payload.features is not None:
+        return payload.features
+    return list(FEATURES) if payload.monthly_price_usd > 0 else []
+
+
 @router.post("", response_model=PlanRead, status_code=status.HTTP_201_CREATED)
 def create_plan(
     payload: PlanCreate,
@@ -47,7 +56,9 @@ def create_plan(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Ya existe un plan con ese nombre.")
 
-    plan = Plan(**payload.model_dump())
+    data = payload.model_dump()
+    data["features"] = _features_for(payload)
+    plan = Plan(**data)
     plan.name = payload.name.strip()
     db.add(plan)
     db.commit()
@@ -72,7 +83,9 @@ def update_plan(
 
     prices_changed = (plan.monthly_price_usd != payload.monthly_price_usd
                       or plan.annual_price_usd != payload.annual_price_usd)
-    for key, value in payload.model_dump().items():
+    data = payload.model_dump()
+    data["features"] = _features_for(payload) if payload.features is not None else (plan.features or [])
+    for key, value in data.items():
         setattr(plan, key, value)
     plan.name = payload.name.strip()
     if prices_changed:  # a PayPal billing plan has a fixed price: new subscriptions need new ones

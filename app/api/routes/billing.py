@@ -78,7 +78,8 @@ def options(user: User = Depends(require_admin), db: Session = Depends(get_db)) 
         out_plans.append({"id": p.id, "name": p.name, "customer_limit": p.customer_limit, "loan_limit": p.loan_limit,
                           "user_limit": p.user_limit, "monthly_price_usd": str(monthly), "annual_price_usd": str(annual),
                           "annual_saving_percent": saving, "is_current": p.id == company.plan_id,
-                          "recurring_monthly": bool(p.paypal_plan_id), "recurring_annual": bool(p.paypal_annual_plan_id)})
+                          "recurring_monthly": bool(p.paypal_plan_id), "recurring_annual": bool(p.paypal_annual_plan_id),
+                          "features": list(p.features or [])})
     exp = company.subscription_expires_at
     if exp is not None and exp.tzinfo is None:
         exp = exp.replace(tzinfo=UTC)
@@ -95,6 +96,17 @@ def options(user: User = Depends(require_admin), db: Session = Depends(get_db)) 
         "pending_transfer": _sub_view(pending) if pending is not None else None,
         "support": {"email": cfg.get("support_email") or "", "phone": cfg.get("support_phone") or ""},
     }
+
+
+@router.get("/usage")
+def usage(user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Use of the plan limits and the features the company's current plan includes."""
+    from app.services.plan_limits import FEATURES, usage_summary
+
+    company = _company(db, user)
+    out = usage_summary(db, company.id)
+    out["catalog"] = FEATURES
+    return out
 
 
 class QuoteIn(BaseModel):

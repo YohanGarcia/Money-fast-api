@@ -73,7 +73,7 @@ def test_0023_0024_keep_history_add_constraints_and_downgrade_losslessly(scratch
     up = _alembic(scratch_db, "upgrade", "head")
     assert up.returncode == 0, up.stderr[-800:]
     assert _alembic(scratch_db, "check").returncode == 0
-    assert _alembic(scratch_db, "heads").stdout.startswith("0027")
+    assert _alembic(scratch_db, "heads").stdout.startswith("0028")
     assert _payments(eng) == before  # nothing rewritten, nothing backfilled
     with eng.connect() as c:
         assert c.execute(text("SELECT count(*) FROM payroll_payments WHERE reference = '' AND idempotency_key IS NULL "
@@ -103,7 +103,7 @@ def test_0023_0024_keep_history_add_constraints_and_downgrade_losslessly(scratch
         c.execute(text("DELETE FROM payroll_payments WHERE idempotency_key IS NOT NULL"))
 
     at_0024 = _snapshot(eng)
-    assert at_0024 != at_0022 and at_0024["version"] == [("0027",)]
+    assert at_0024 != at_0022 and at_0024["version"] == [("0028",)]
     down = _alembic(scratch_db, "downgrade", "0022")  # through 0023 and 0024, history only
     assert down.returncode == 0, down.stderr[-800:]
     assert _snapshot(eng) == at_0022 | {} or _snapshot(eng)["version"] == [("0022",)]
@@ -132,6 +132,6 @@ def test_0024_downgrade_refuses_once_the_new_contract_was_used(scratch_db, plant
     before = _snapshot(eng)
     out = _alembic(scratch_db, "downgrade", "0023")
     assert out.returncode != 0 and "cannot downgrade 0024" in out.stderr, out.stderr[-500:]
-    assert _snapshot(eng) == before and before["version"] == [("0027",)]
+    assert _snapshot(eng) == before and before["version"] == [("0028",)]
     assert _alembic(scratch_db, "check").returncode == 0
     eng.dispose()

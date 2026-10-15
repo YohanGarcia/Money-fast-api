@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends
+from app.services.plan_limits import enforce_feature
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -34,6 +35,7 @@ def update_print_settings(
     company_id: int = Depends(get_company_id),
     _=Depends(require_admin),
 ) -> PrintSettings:
+    enforce_feature(db, company_id, "print_settings")
     s = get_or_create(db, company_id)
     for key, value in payload.model_dump().items():
         setattr(s, key, value)

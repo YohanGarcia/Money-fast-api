@@ -22,11 +22,24 @@ FREE_PLAN_NAME = "Gratis"
 
 _LABELS = {"customer": "clientes", "loan": "préstamos", "user": "usuarios"}
 
+# Optional capabilities a plan may include. ``priority_support`` is informational (nothing to block).
+FEATURES: dict[str, str] = {
+    "branches": "Varias sucursales",
+    "routes": "Rutas de cobro",
+    "promissory_note": "Pagaré notarial al crear préstamos",
+    "print_settings": "Configuración de impresión",
+    "priority_support": "Soporte prioritario",
+}
+
 _DEFAULT_PLANS = [
     ("Gratis", 5, 5, 3, "0.00"),
     ("Profesional", 200, 200, 10, "25.00"),
     ("Ilimitado", 0, 0, 0, "49.99"),
 ]
+_DEFAULT_FEATURES = {
+    "Profesional": ["branches", "routes", "promissory_note", "print_settings"],
+    "Ilimitado": ["branches", "routes", "promissory_note", "print_settings", "priority_support"],
+}
 
 
 def seed_default_plans(db: Session) -> None:
@@ -34,7 +47,8 @@ def seed_default_plans(db: Session) -> None:
     if db.scalars(select(Plan)).first() is not None:
         return
     db.add_all([
-        Plan(name=n, customer_limit=c, loan_limit=l, user_limit=u, monthly_price_usd=Decimal(p))
+        Plan(name=n, customer_limit=c, loan_limit=l, user_limit=u, monthly_price_usd=Decimal(p),
+             features=_DEFAULT_FEATURES.get(n, []))
         for (n, c, l, u, p) in _DEFAULT_PLANS
     ])
     db.commit()
@@ -82,8 +96,8 @@ def effective_plan(db: Session, company_id: int) -> Plan | None:
 def _count(db: Session, company_id: int, kind: str) -> int:
     if kind == "customer":
         stmt = select(func.count()).select_from(Customer).where(Customer.company_id == company_id)
-    elif kind == "user":
-        stmt = select(func.count()).select_from(User).where(User.company_id == company_id)
+    elif kind == "user":  # a disabled user frees its seat
+        stmt = select(func.count()).select_from(User).where(User.company_id == company_id, User.status != "disabled")
     else:  # loan — loans belong to a company through their customer
         stmt = select(func.count()).select_from(Loan).join(Loan.customer).where(Customer.company_id == company_id)
     return db.scalar(stmt) or 0
@@ -110,3 +124,41 @@ def enforce_can_create(db: Session, company_id: int, kind: str) -> None:
                 f"({limit} {_LABELS[kind]}). Actualiza tu plan para agregar más."
             ),
         )
+
+
+def plan_has_feature(db: Session, company_id: int, feature: str) -> bool:
+    plan = effective_plan(db, company_id)
+    if plan is None:
+        return True  # no catalog at all: do not block
+    return feature in (plan.features or [])
+
+
+def enforce_feature(db: Session, company_id: int, feature: str) -> None:
+    """Raise HTTP 402 when the company's effective plan does not include ``feature``."""
+    if plan_has_feature(db, company_id, feature):
+        return
+    plan = effective_plan(db, company_id)
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=f"{FEATURES[feature]} no está incluido en tu plan {plan.name}. Actualiza tu plan para usarlo.",
+    )
+
+
+def usage_summary(db: Session, company_id: int) -> dict:
+    """Limits, current usage and included features of the company's effective plan."""
+    from app.models.branch import Branch
+
+    plan = effective_plan(db, company_id)
+    items = {}
+    for key, kind, attr in (("customers", "customer", "customer_limit"), ("loans", "loan", "loan_limit"), ("users", "user", "user_limit")):
+        limit = getattr(plan, attr) if plan is not None else 0
+        used = _count(db, company_id, kind)
+        items[key] = {"used": used, "limit": limit or None, "percent": None if not limit else min(100, round(used * 100 / limit))}
+    branches = db.scalar(select(func.count()).select_from(Branch).where(Branch.company_id == company_id)) or 0
+    included = (plan.features or []) if plan is not None else []
+    return {
+        "plan": plan.name if plan is not None else None,
+        "usage": items,
+        "branches": branches,
+        "features": {k: {"label": v, "included": k in included} for k, v in FEATURES.items()},
+    }

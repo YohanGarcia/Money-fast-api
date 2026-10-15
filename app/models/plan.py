@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import Boolean, DateTime, Numeric, String
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -19,6 +20,8 @@ class Plan(Base):
     # Yearly price (a discount for paying a whole year); None = 12 x monthly minus the platform annual discount.
     annual_price_usd: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Optional capabilities included (keys of ``plan_limits.FEATURES``).
+    features: Mapped[list] = mapped_column(JSONB, default=list)
     # PayPal billing plan id (P-XXXX) for recurring subscriptions; None until set up.
     paypal_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # PayPal billing plan id of the yearly recurring charge (P-XXXX).

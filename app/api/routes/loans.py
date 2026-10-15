@@ -11,7 +11,7 @@ from app.models.loan import Loan, LoanStatus
 from app.models.user import User
 from app.schemas.loan import LoanCreate, LoanRead
 from app.services.loan_service import create_loan, refresh_loan_state
-from app.services.plan_limits import enforce_can_create
+from app.services.plan_limits import enforce_can_create, enforce_feature
 
 router = APIRouter()
 
@@ -63,6 +63,8 @@ def add_loan(
     if cash_service.enabled(db, company_id):
         raise HTTPException(409, "Con Caja habilitada, desembolsa una solicitud firmada desde Caja.")
     enforce_can_create(db, company_id, "loan")
+    if payload.requires_promissory_note:
+        enforce_feature(db, company_id, "promissory_note")
     loan = create_loan(db=db, payload=payload, created_by_id=current_user.id)
     db.commit()
     db.refresh(loan)

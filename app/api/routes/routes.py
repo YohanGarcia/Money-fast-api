@@ -7,6 +7,7 @@ from app.api.deps import get_company_id, get_current_user, get_db, require_admin
 from app.services.branch_scope import is_company_wide, is_field_collector, user_branch
 from app.models.branch import Branch
 from app.models.customer import Customer
+from app.services.plan_limits import enforce_feature
 from app.models.route import Route, RouteArea
 from app.models.user import User, UserRole
 from app.schemas.route import (
@@ -180,6 +181,7 @@ def create_route(
     current_user: User = Depends(require_admin_manager),
     company_id: int = Depends(get_company_id),
 ) -> dict:
+    enforce_feature(db, company_id, "routes")
     collector_id = _validate_collector(db, payload.assigned_collector_id, company_id)
     own_branch = user_branch(current_user)
     if own_branch is not None and payload.branch_id not in (None, own_branch):
