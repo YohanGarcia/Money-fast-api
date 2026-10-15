@@ -1,7 +1,9 @@
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+
+from app.api.pagination import Page, page_params, paginate
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -181,8 +183,11 @@ def list_collectors(
 
 @router.get("", response_model=list[UserRead])
 def list_users(
+    response: Response,
     q: str | None = Query(default=None),
     role: UserRole | None = Query(default=None),
+    branch_id: int | None = Query(default=None),
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
     company_id: int = Depends(get_company_id),
@@ -192,13 +197,15 @@ def list_users(
 
     if role is not None:
         users = [user for user in users if user.role == role]
+    if branch_id is not None:
+        users = [user for user in users if user.branch_id == branch_id]
     if q:
         term = q.lower().strip()
         users = [
             user for user in users
             if term in user.full_name.lower() or term in user.email.lower()
         ]
-    return users
+    return paginate(response, users, page)
 
 
 def _validate_branch(db: Session, branch_id: int | None, company_id: int) -> int | None:

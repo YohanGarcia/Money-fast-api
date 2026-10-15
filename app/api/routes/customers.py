@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.api.pagination import Page, matches, page_params, paginate
 from app.services import cash_service
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
@@ -45,7 +46,12 @@ def _resolve_route_and_collector(
 
 @router.get("", response_model=list[CustomerRead])
 def list_customers(
+    response: Response,
     q: str | None = None,
+    route_id: int | None = None,
+    collector_id: int | None = None,
+    has_route: bool | None = None,
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     company_id: int = Depends(get_company_id),
@@ -61,13 +67,19 @@ def list_customers(
         statement = statement.where(Customer.id.in_(cash_service.customer_ids(db, current_user)))
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
+    if route_id is not None:
+        statement = statement.where(Customer.route_id == route_id)
+    if collector_id is not None:
+        statement = statement.where(Customer.assigned_collector_id == collector_id)
+    if has_route is not None:
+        statement = statement.where(Customer.route_id.is_not(None) if has_route else Customer.route_id.is_(None))
 
     customers = db.scalars(statement).all()
     if q:
         term = q.lower()
         customers = [c for c in customers if term in c.full_name.lower() or
                      (document_key(q) and document_key(q) in (document_key(c.document_id) or ""))]
-    return list(customers)
+    return paginate(response, list(customers), page)
 
 
 @router.post("", response_model=CustomerRead, status_code=status.HTTP_201_CREATED)

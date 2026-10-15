@@ -1,12 +1,13 @@
 from datetime import UTC, datetime
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_current_user, get_db, require_admin, require_superadmin
 from app.core.config import settings
 from app.models.company import Company
@@ -23,6 +24,10 @@ router = APIRouter()
 
 @router.get("", response_model=list[SubscriptionRead])
 def list_subscriptions(
+    response: Response,
+    q: str | None = Query(default=None, description="Empresa o plan"),
+    status: str | None = Query(default=None, max_length=30),
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     _: User = Depends(require_superadmin),
 ) -> list[Subscription]:
@@ -32,7 +37,10 @@ def list_subscriptions(
         .options(selectinload(Subscription.company), selectinload(Subscription.plan))
         .order_by(Subscription.created_at.desc())
     )
-    return list(db.scalars(statement).all())
+    rows = [s for s in db.scalars(statement).all()
+            if matches(q, s.company.name if s.company else None, s.plan.name if s.plan else None)
+            and (status is None or s.status.value == status)]
+    return paginate(response, rows, page)
 
 PAYPAL_BASE = {
     "sandbox": "https://api-m.sandbox.paypal.com",

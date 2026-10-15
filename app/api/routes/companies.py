@@ -1,11 +1,14 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy import func, select, delete
 from sqlalchemy.orm import Session
 
+from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_db, require_superadmin
 from app.models.company import Company
 from app.models.customer import Customer
@@ -71,11 +74,17 @@ def _user_count(db: Session, company_id: int) -> int:
 
 @router.get("", response_model=list[CompanyRead])
 def list_companies(
+    response: Response,
+    q: str | None = None,
+    status: Literal["active", "inactive"] | None = None,
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     _: User = Depends(require_superadmin),
 ) -> list[dict]:
-    companies = db.scalars(select(Company).order_by(Company.name)).all()
-    return [_company_dict(c, _user_count(db, c.id)) for c in companies]
+    companies = [c for c in db.scalars(select(Company).order_by(Company.name)).all()
+                 if matches(q, c.name, c.tax_id)
+                 and (status is None or c.is_active == (status == "active"))]
+    return [_company_dict(c, _user_count(db, c.id)) for c in paginate(response, companies, page)]
 
 
 @router.get("/overview", response_model=PlatformOverview)

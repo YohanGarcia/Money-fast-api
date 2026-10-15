@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
+from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.branch import Branch
 from app.models.customer import Customer
@@ -92,6 +93,9 @@ def _serialize(db: Session, route: Route) -> dict:
 
 @router.get("", response_model=list[RouteRead])
 def list_routes(
+    response: Response,
+    q: str | None = None,
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     company_id: int = Depends(get_company_id),
@@ -105,7 +109,8 @@ def list_routes(
     # Collectors only see the routes assigned to them.
     if current_user.role == UserRole.collector:
         statement = statement.where(Route.assigned_collector_id == current_user.id)
-    return [_serialize(db, r) for r in db.scalars(statement).all()]
+    rows = [r for r in db.scalars(statement).all() if matches(q, r.name, getattr(r, "zone", None))]
+    return [_serialize(db, r) for r in paginate(response, rows, page)]
 
 
 @router.get("/{route_id}/stops", response_model=RouteStops)

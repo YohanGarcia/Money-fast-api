@@ -4,13 +4,14 @@ from datetime import UTC, date, datetime
 from urllib.parse import quote
 from html import escape
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import get_db, require_admin_manager
+from app.api.pagination import Page, matches, page_params, paginate
 from app.models.customer import Customer
 from app.models.loan_application import LoanApplication, ApplicationDocument
 from app.models.user import User
@@ -73,13 +74,23 @@ def form(_: User = Depends(require_admin_manager)):
 
 
 @router.get("")
-def listing(customer_id: int | None = None, db: Session = Depends(get_db), user: User = Depends(require_admin_manager)):
+def listing(response: Response, customer_id: int | None = None,
+            q: str | None = Query(default=None, description="Nombre, cédula o número de solicitud"),
+            status_filter: str | None = Query(default=None, alias="status"),
+            page: Page = Depends(page_params),
+            db: Session = Depends(get_db), user: User = Depends(require_admin_manager)):
     statement = select(LoanApplication).where(LoanApplication.company_id == user.company_id)
     if customer_id is not None:
         customer_for(db, user, customer_id)
         statement = statement.where(LoanApplication.customer_id == customer_id)
-    rows = db.scalars(statement.order_by(LoanApplication.id.desc())).all()
-    return [serialize(row) for row in rows]
+    items = [serialize(row) for row in db.scalars(statement.order_by(LoanApplication.id.desc())).all()]
+    if status_filter:
+        wanted = {x.strip() for x in status_filter.split(",") if x.strip()}
+        items = [i for i in items if i.get("status") in wanted]
+    if q:
+        items = [i for i in items
+                 if matches(q, (i.get("data") or {}).get("full_name"), (i.get("data") or {}).get("document_id"), i.get("id"))]
+    return paginate(response, items, page)
 
 
 @router.post("", status_code=201)

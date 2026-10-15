@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.services import cash_service
+from app.api.pagination import Page, matches, page_params, paginate
 from app.api.deps import get_company_id, get_current_user, get_db, require_admin_manager
 from app.models.customer import Customer
 from app.models.loan import Loan, LoanStatus
@@ -16,7 +17,10 @@ router = APIRouter()
 
 @router.get("", response_model=list[LoanRead])
 def list_loans(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
+    q: str | None = Query(default=None, description="Cliente, cédula o número de préstamo"),
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     company_id: int = Depends(get_company_id),
@@ -34,12 +38,14 @@ def list_loans(
     if current_user.role == UserRole.collector:
         statement = statement.where(Customer.assigned_collector_id == current_user.id)
     loans = list(db.scalars(statement).unique().all())
-    if status_filter is not None:
-        loans = [loan for loan in loans if loan.status.value == status_filter]
-    changed = any([refresh_loan_state(loan) for loan in loans])
+    changed = any([refresh_loan_state(loan) for loan in loans])  # a loan may have just turned late: filter AFTER it
     if changed and not cash_service.enabled(db, company_id):
         db.commit()
-    return loans
+    if status_filter is not None:
+        loans = [loan for loan in loans if loan.status.value == status_filter]
+    if q:
+        loans = [ln for ln in loans if matches(q, ln.customer.full_name, ln.customer.document_id, ln.id)]
+    return paginate(response, loans, page)
 
 
 @router.post("", response_model=LoanRead, status_code=status.HTTP_201_CREATED)

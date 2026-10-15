@@ -9,7 +9,7 @@ import base64
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -98,6 +98,7 @@ def _payment_dict(p: PayrollPayment, users: dict, banks: dict, reversed_ids: set
 
 @router.get("/payments")
 def list_payments(start: date | None = None, end: date | None = None, user_id: int | None = None,
+                  q: str | None = Query(default=None, max_length=80, description="Empleado, referencia o nota"),
                   page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
                   format: Literal["json", "xlsx", "print"] = "json",
                   db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
@@ -113,6 +114,11 @@ def list_payments(start: date | None = None, end: date | None = None, user_id: i
         where.append(PayrollPayment.created_at < payroll_service._window(end, end)[1])
     if user_id:
         where.append(PayrollPayment.user_id == user_id)
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        by_name = select(User.id).where(User.company_id == company_id, User.full_name.ilike(term))
+        where.append(or_(PayrollPayment.user_id.in_(by_name), PayrollPayment.reference.ilike(term),
+                         PayrollPayment.notes.ilike(term)))
     reversed_sub = payroll_service.reversed_payroll_ids()
     total_rows = db.scalar(select(func.count()).select_from(PayrollPayment).where(*where)) or 0
     total_amount = db.scalar(select(func.coalesce(func.sum(PayrollPayment.amount), 0))

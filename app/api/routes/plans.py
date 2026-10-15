@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.api.pagination import Page, page_params, paginate
 from app.api.deps import get_current_user, get_db, require_superadmin
 from app.models.company import Company
 from app.models.plan import Plan
@@ -18,8 +19,10 @@ def _seed_defaults(db: Session) -> None:
 
 @router.get("", response_model=list[PlanRead])
 def list_plans(
+    response: Response,
     q: str | None = Query(default=None),
     active_only: bool = Query(default=False),
+    page: Page = Depends(page_params),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[Plan]:
@@ -30,7 +33,7 @@ def list_plans(
     if q:
         term = q.lower().strip()
         plans = [plan for plan in plans if term in plan.name.lower()]
-    return plans
+    return paginate(response, list(plans), page)
 
 
 @router.post("", response_model=PlanRead, status_code=status.HTTP_201_CREATED)
