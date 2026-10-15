@@ -14,6 +14,7 @@ from app.api.deps import get_db, get_current_user
 from app.models.user import User
 from app.models.branch import Branch
 from app.models.customer import Customer
+from app.models.route import Route
 from app.models.loan import Loan
 from app.models.payment import Payment
 from app.models.loan_application import LoanApplication
@@ -144,8 +145,21 @@ def workspace(branch_id:int|None=None,history_limit:int=Query(200,ge=20,le=1000)
         branch_users=[dict(id=u.id,name=u.full_name,role=u.role) for u in users.values()
             if (u.branch_id==box.branch_id or u.role=='admin' or u.id in historical_users)
             and not (u.id not in historical_users and 'Notario' in u.branch_roles)]
-        candidates_loans=db.scalars(select(Loan).join(Customer).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late']))).all()
-        loans=[dict(id=l.id,name=db.get(Customer,l.customer_id).full_name,balance=str(l.principal_balance+l.interest_balance+l.late_fee_balance),installment_amount=str(min(l.installment_amount,l.principal_balance+l.interest_balance+l.late_fee_balance))) for l in candidates_loans if svc.branch_for_customer(db,db.get(Customer,l.customer_id))==box.branch_id or (user.role=='admin' and svc.branch_for_customer(db,db.get(Customer,l.customer_id)) is None)]
+        # One query for the loans with their customers and one each for routes / collectors: no per-loan lookups.
+        rows=db.execute(select(Loan,Customer).join(Customer,Customer.id==Loan.customer_id).where(Customer.company_id==user.company_id,Loan.status.in_(['active','late'])).order_by(Loan.id)).all()
+        route_branch={r.id:r.branch_id for r in db.scalars(select(Route).where(Route.company_id==user.company_id)).all()}
+        collector_branch={u.id:u.branch_id for u in users.values()}
+        def customer_branch(c):
+            if c.cash_branch_id: return c.cash_branch_id
+            if c.route_id and route_branch.get(c.route_id): return route_branch[c.route_id]
+            if c.assigned_collector_id: return collector_branch.get(c.assigned_collector_id)
+            return None
+        loans=[]
+        for l,c in rows:
+            owed=l.principal_balance+l.interest_balance+l.late_fee_balance
+            where=customer_branch(c)
+            if where==box.branch_id or (user.role=='admin' and where is None):
+                loans.append(dict(id=l.id,name=c.full_name,balance=str(owed),installment_amount=str(min(l.installment_amount,owed))))
         data.update(users=branch_users,loans=loans,session=enrich(session) if session else None,active_sessions=[enrich(s) for s in sessions if s.state in ('open','closing')],sessions=[enrich(s) for s in sessions],movements=[enrich(m) for m in movements],custody_transfers=[enrich(t) for t in custody_transfers],
           # The next opening is independent. This field is retained for API compatibility,
           # but is informational only and never becomes an opening obligation.
