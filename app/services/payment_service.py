@@ -191,3 +191,58 @@ def apply_payment(db: Session, payload: PaymentCreate, collected_by_id: int) -> 
     )
     db.add(payment)
     return payment
+
+
+def revert_payment(db: Session, payment: Payment) -> Loan:
+    """Undo what a payment applied to its loan (used when its cash movement is reversed from Caja).
+
+    The principal / interest / late fee it covered leave the installments (the latest installments first, which keeps
+    the earliest ones paid) and go back to the loan balances, so the loan, its installments, the collected totals and
+    the finance report agree again. The payment row itself stays as history."""
+    loan = db.get(Loan, payment.loan_id)
+    if loan is None:
+        raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
+    installments = list(loan.installments)
+
+    def take_back(attribute: str, amount: Decimal) -> None:
+        remaining_amount = q(amount)
+        for installment in reversed(installments):
+            if remaining_amount == 0:
+                break
+            paid = getattr(installment, attribute)
+            cut = min(paid, remaining_amount)
+            if cut > 0:
+                setattr(installment, attribute, q(paid - cut))
+                remaining_amount = q(remaining_amount - cut)
+
+    take_back("principal_paid", payment.principal_applied)
+    take_back("interest_paid", payment.interest_applied)
+    take_back("fee_paid", payment.late_fee_applied)
+
+    loan.principal_balance = q(min(loan.principal_amount, loan.principal_balance + payment.principal_applied))
+    loan.interest_balance = q(min(sum((i.interest_due for i in installments), Decimal("0.00")),
+                                  loan.interest_balance + payment.interest_applied))
+    loan.late_fee_balance = q(min(sum((i.fee_due for i in installments), Decimal("0.00")),
+                                  loan.late_fee_balance + payment.late_fee_applied))
+
+    today = datetime.now(UTC).date()
+    for installment in installments:
+        pending = (remaining_due(installment.fee_due, installment.fee_paid),
+                   remaining_due(installment.interest_due, installment.interest_paid),
+                   remaining_due(installment.principal_due, installment.principal_paid))
+        if all(value == 0 for value in pending):
+            installment.status = "paid"
+        elif installment.due_date < today:
+            installment.status = "late"
+        else:
+            installment.status = "partial" if any(
+                (installment.fee_paid, installment.interest_paid, installment.principal_paid)) else "pending"
+
+    if loan.status in {LoanStatus.paid, LoanStatus.active, LoanStatus.late}:
+        if loan.principal_balance == 0 and loan.interest_balance == 0 and loan.late_fee_balance == 0:
+            loan.status = LoanStatus.paid
+        elif any(installment.status == "late" for installment in installments):
+            loan.status = LoanStatus.late
+        else:
+            loan.status = LoanStatus.active
+    return loan

@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.context import get_context
@@ -79,7 +80,37 @@ async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResp
     return JSONResponse(body, status_code=422)
 
 
+INVALID_INPUT_MESSAGE = "Algún dato está fuera de rango o contiene caracteres no válidos."
+
+
+def invalid_input_response() -> JSONResponse:
+    body = error_body("invalid_input", INVALID_INPUT_MESSAGE)
+    return JSONResponse(body, status_code=422)
+
+
+async def _data_error(_: Request, exc: DataError) -> JSONResponse:
+    # Out-of-range numbers / dates or NUL characters reached the database: the client's input is wrong, not the server.
+    log.info("invalid_input", extra={"kind": type(exc).__name__})
+    return invalid_input_response()
+
+
+async def _overflow_error(_: Request, exc: OverflowError) -> JSONResponse:
+    log.info("invalid_input", extra={"kind": "OverflowError"})
+    return invalid_input_response()
+
+
+async def _value_error(_: Request, exc: ValueError) -> JSONResponse:
+    # Only the NUL-in-text case is the client's fault; any other ValueError stays an internal error.
+    if "NUL" in str(exc):
+        return invalid_input_response()
+    log.error("unhandled_value_error", exc_info=exc)
+    return internal_error_response()
+
+
 def register_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(DataError, _data_error)
+    app.add_exception_handler(OverflowError, _overflow_error)
+    app.add_exception_handler(ValueError, _value_error)
     app.add_exception_handler(AppError, _app_error)
     app.add_exception_handler(StarletteHTTPException, _http_error)
     app.add_exception_handler(RequestValidationError, _validation_error)

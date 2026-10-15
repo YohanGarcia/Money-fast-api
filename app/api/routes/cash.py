@@ -79,7 +79,10 @@ def command(p:CashCommand,db:Session=Depends(get_db),user:User=Depends(get_curre
 
 @router.get('/workspace')
 def workspace(branch_id:int|None=None,history_limit:int=Query(200,ge=20,le=1000),db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    """Branch cash workspace. The historical lists (payments, deliveries, transfers, sessions, movements, custody, audit)
+    return build_workspace(db,user,branch_id,history_limit)
+
+def build_workspace(db,user,branch_id,history_limit):
+    """Branch cash workspace (``history_limit=None`` = the whole history, used by the date-range report). The historical lists (payments, deliveries, transfers, sessions, movements, custody, audit)
     carry the ``history_limit`` most recent rows PLUS everything still active (pending, open or closing), so the day-to-day
     screens are complete while the payload stays bounded. ``truncated`` tells the web how many rows each list holds in all;
     older history is read through the paged ``/cash/report``."""
@@ -87,8 +90,9 @@ def workspace(branch_id:int|None=None,history_limit:int=Query(200,ge=20,le=1000)
     truncated={}
     def bounded(name,model,where,active=None):
         base=select(model).where(*where)
-        rows=list(db.scalars(base.order_by(model.id.desc()).limit(history_limit)).all())
-        if active is not None:
+        newest=base.order_by(model.id.desc())
+        rows=list(db.scalars(newest.limit(history_limit) if history_limit is not None else newest).all())
+        if active is not None and history_limit is not None:
             have={r.id for r in rows}
             rows=sorted(rows+[r for r in db.scalars(base.where(active)).all() if r.id not in have],key=lambda r:-r.id)
         total=db.scalar(select(func.count()).select_from(model).where(*where)) or 0
@@ -196,7 +200,8 @@ def workspace(branch_id:int|None=None,history_limit:int=Query(200,ge=20,le=1000)
 def filtered_report(db,user,branch_id,start,end,collector_id,actor_id,kind,state):
     svc.require_role(user,'admin','cashier','manager')
     if start>end: svc.fail('Rango de fechas inválido.')
-    data=workspace(branch_id,db,user)
+    if not (1900<=start.year<=2200 and 1900<=end.year<=2200): svc.fail('La fecha está fuera del rango permitido (1900-2200).',422)
+    data=build_workspace(db,user,branch_id,None)  # the report reads the whole history, not the bounded view
     low=datetime.combine(start,time.min,svc.TZ).astimezone(UTC)
     high=datetime.combine(end+timedelta(days=1),time.min,svc.TZ).astimezone(UTC)
     def included(row,field):

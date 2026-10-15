@@ -28,6 +28,16 @@ router = APIRouter()
 EMPLOYEE_ROLES = ("admin", "manager", "cashier", "collector")
 
 
+def _own_branch(actor: User) -> int | None:
+    """None = the whole company (administrator). A branch manager only sees the staff and the payments of its own
+    branch: salaries of other branches (and of the administration) are not theirs to read."""
+    if str(getattr(actor.role, "value", actor.role)) == "admin":
+        return None
+    if actor.branch_id is None:
+        raise HTTPException(403, "Asigna una sucursal al gerente para ver la nómina.")
+    return actor.branch_id
+
+
 def _config_for(db, company_id, user_id):
     return db.scalar(select(PayrollConfig).where(PayrollConfig.company_id == company_id, PayrollConfig.user_id == user_id))
 
@@ -40,9 +50,12 @@ def _config_dict(c: PayrollConfig | None):
 
 @router.get("")
 def list_payroll(db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
-                 _=Depends(require_admin_manager)):
-    users = db.scalars(select(User).where(User.company_id == company_id, User.role.in_(EMPLOYEE_ROLES),
-                                          User.is_active == True).order_by(User.full_name)).all()
+                 actor: User = Depends(require_admin_manager)):
+    branch = _own_branch(actor)
+    query = select(User).where(User.company_id == company_id, User.role.in_(EMPLOYEE_ROLES), User.is_active == True)
+    if branch is not None:
+        query = query.where(User.branch_id == branch)
+    users = db.scalars(query.order_by(User.full_name)).all()
     configs = {c.user_id: c for c in db.scalars(select(PayrollConfig).where(PayrollConfig.company_id == company_id)).all()}
     # a "Notario" is a legacy collector that never collects: label it by its real role
     return dict(employees=[dict(user_id=u.id, name=u.full_name,
@@ -69,11 +82,12 @@ def set_config(user_id: int, payload: PayrollConfigUpdate, db: Session = Depends
 
 @router.get("/suggest")
 def suggest(user_id: int, start: date, end: date, db: Session = Depends(get_db),
-            company_id: int = Depends(get_company_id), _=Depends(require_admin_manager)):
+            company_id: int = Depends(get_company_id), actor: User = Depends(require_admin_manager)):
     if start > end:
         raise HTTPException(422, "Rango de fechas inválido.")
+    branch = _own_branch(actor)
     user = db.get(User, user_id)
-    if user is None or user.company_id != company_id:
+    if user is None or user.company_id != company_id or (branch is not None and user.branch_id != branch):
         raise HTTPException(404, "Empleado no encontrado.")
     c = _config_for(db, company_id, user_id) or PayrollConfig(company_id=company_id, user_id=user_id,
                                                               salary_amount=Decimal("0"), commissions=[])
@@ -102,12 +116,16 @@ def list_payments(start: date | None = None, end: date | None = None, user_id: i
                   page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
                   format: Literal["json", "xlsx", "print"] = "json",
                   db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
-                  _=Depends(require_admin_manager)):
+                  actor: User = Depends(require_admin_manager)):
     """Payment history, newest first. Filter by date range (company calendar day of the payment) and employee; paged
     (``page``/``page_size``) as JSON, or the WHOLE filtered list (up to 10,000 rows) as ``xlsx`` / ``print``."""
     if start and end and start > end:
         raise HTTPException(422, "Rango de fechas inválido.")
     where = [PayrollPayment.company_id == company_id]
+    branch = _own_branch(actor)
+    if branch is not None:
+        where.append(PayrollPayment.user_id.in_(
+            select(User.id).where(User.company_id == company_id, User.branch_id == branch)))
     if start:
         where.append(PayrollPayment.created_at >= payroll_service._window(start, start)[0])
     if end:
@@ -297,10 +315,15 @@ def pay(payload: PayrollPaymentCreate, db: Session = Depends(get_db), company_id
 
 @router.get("/payments/{payment_id}/proof")
 def payment_proof(payment_id: int, db: Session = Depends(get_db), company_id: int = Depends(get_company_id),
-                  _=Depends(require_admin_manager)):
+                  actor: User = Depends(require_admin_manager)):
     row = db.get(PayrollPayment, payment_id)
     if row is None or row.company_id != company_id or not row.proof:
         raise HTTPException(404, "Comprobante no encontrado.")
+    branch = _own_branch(actor)
+    if branch is not None:
+        employee = db.get(User, row.user_id)
+        if employee is None or employee.branch_id != branch:
+            raise HTTPException(404, "Comprobante no encontrado.")
     return Response(base64.b64decode(row.proof["content_base64"]), media_type=row.proof["media_type"],
                     headers={"Content-Disposition": 'attachment; filename="comprobante-nomina"',
                              "X-Content-Type-Options": "nosniff"})

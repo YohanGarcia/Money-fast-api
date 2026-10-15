@@ -399,6 +399,11 @@ def command(db,user,p):
             fail('Este movimiento quedó vinculado a Capital (historial) y ya no admite reverso.',409)
         session=operational_session(db,box,user,p.session_id);check_version(session,p.version)
         row=add_movement(db,box,session,user,'reversal',-original.amount,p.notes,reverses_id=original.id,collector_id=original.collector_id)
+        if original.kind=='counter_payment' and original.payment_id:
+            # the collected money leaves the loan too: its balances and installments go back to before the payment
+            from app.services.payment_service import revert_payment
+            reverted=db.get(Payment,original.payment_id)
+            if reverted is not None: revert_payment(db,reverted)
         if original.delivery_id:
             delivery=db.get(CashDelivery,original.delivery_id)
             if db.get(User,delivery.collector_id).branch_id!=box.branch_id: fail('El cobrador cambió de sucursal; resuelve su asignación antes de revertir.')

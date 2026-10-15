@@ -3,6 +3,7 @@ configured commissions over the real data they generated."""
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
+from fastapi import HTTPException
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import aliased
 
@@ -39,6 +40,9 @@ def reversed_payroll_ids():
 
 
 def _window(start: date, end: date):
+    for day in (start, end):
+        if not 1900 <= day.year <= 2200:
+            raise HTTPException(422, "La fecha está fuera del rango permitido (1900-2200).")
     low = datetime.combine(start, time.min, svc.TZ).astimezone(UTC)
     high = datetime.combine(end + timedelta(days=1), time.min, svc.TZ).astimezone(UTC)
     return low, high
